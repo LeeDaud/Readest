@@ -1,0 +1,131 @@
+/* WeChat Reading Design Tokens */
+
+:root {
+  /* === Brand Accent (WeChat Green) === */
+  --wr-accent: #07C160;
+  --wr-accent-hover: #06AD56;
+  --wr-accent-active: #05944A;
+  --wr-accent-subtle: rgba(7, 193, 96, 0.08);
+
+  /* === Reading Backgrounds === */
+  --wr-bg-white: #FFFEF5;
+  --wr-bg-white-alt: #FFFFFF;
+  --wr-bg-green: #C7EDCC;
+  --wr-bg-green-alt: #C6E8D1;
+  --wr-bg-yellow: #F1ECD8;
+  --wr-bg-yellow-alt: #F7ECD1;
+  --wr-bg-dark: #1A1A1A;
+
+  /* === Text Colors (light backgrounds) === */
+  --wr-text-primary: #1A1A1A;
+  --wr-text-secondary: #666666;
+  --wr-text-tertiary: #999999;
+  --wr-text-disabled: #CCCCCC;
+
+  /* === Text Colors (dark background) === */
+  --wr-text-dark-primary: rgba(255, 255, 255, 0.87);
+  --wr-text-dark-secondary: rgba(255, 255, 255, 0.60);
+  --wr-text-dark-tertiary: rgba(255, 255, 255, 0.38);
+
+  /* === Typography Scale (7-level, base 18px) === */
+  --wr-font-size-xs: 14px;
+  --wr-font-size-sm: 16px;
+  --wr-font-size-base: 18px;
+  --wr-font-size-md: 20px;
+  --wr-font-size-lg: 22px;
+  --wr-font-size-xl: 24px;
+  --wr-font-size-xxl: 28px;
+
+  /* === Font Stacks === */
+  --wr-font-family-reader: "PingFang SC", "Noto Sans CJK SC", "LXGW WenKai",
+    "Source Han Sans SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "WenQuanYi Micro Hei", system-ui, -apple-system, sans-serif;
+  --wr-font-family-reader-serif: "Noto Serif CJK SC", "Source Han Serif SC",
+    "LXGW WenKai", "STSong", "SimSun", "Songti SC", Georgia, serif;
+  --wr-font-family-ui: "PingFang SC", "Noto Sans CJK SC",
+    "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --wr-font-family-mono: "SF Mono", "Cascadia Code", "Consolas",
+    "PingFang SC", monospace;
+
+  /* === Reading Typography Defaults === */
+  --wr-line-height: 1.8;
+  --wr-letter-spacing: 0.07em;
+
+  /* === Spacing === */
+  --wr-space-xs: 4px;
+  --wr-space-sm: 8px;
+  --wr-space-md: 12px;
+  --wr-space-lg: 16px;
+  --wr-space-xl: 24px;
+  --wr-space-2xl: 32px;
+  --wr-space-3xl: 48px;
+
+  /* === Border Radius === */
+  --wr-radius-sm: 4px;
+  --wr-radius-md: 8px;
+  --wr-radius-lg: 12px;
+  --wr-radius-xl: 16px;
+  --wr-radius-round: 9999px;
+
+  /* === Shadows === */
+  --wr-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --wr-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --wr-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.10);
+
+  /* === Reading Chrome === */
+  --wr-chrome-height: 48px;
+  --wr-chrome-padding-x: 16px;
+  --wr-chrome-blur: blur(20px);
+
+  /* === Transitions === */
+  --wr-transition-fast: 150ms ease;
+  --wr-transition-normal: 250ms ease;
+  --wr-transition-slow: 400ms ease;
+  --wr-transition-page: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* === Reading Background States === */
+
+[data-wr-background="white"] {
+  --wr-current-bg: var(--wr-bg-white);
+  --wr-current-text: var(--wr-text-primary);
+  --wr-current-text-secondary: var(--wr-text-secondary);
+  --wr-current-text-tertiary: var(--wr-text-tertiary);
+}
+
+[data-wr-background="green"] {
+  --wr-current-bg: var(--wr-bg-green);
+  --wr-current-text: var(--wr-text-primary);
+  --wr-current-text-secondary: var(--wr-text-secondary);
+  --wr-current-text-tertiary: var(--wr-text-tertiary);
+}
+
+[data-wr-background="yellow"] {
+  --wr-current-bg: var(--wr-bg-yellow);
+  --wr-current-text: var(--wr-text-primary);
+  --wr-current-text-secondary: var(--wr-text-secondary);
+  --wr-current-text-tertiary: var(--wr-text-tertiary);
+}
+
+[data-wr-background="dark"] {
+  --wr-current-bg: var(--wr-bg-dark);
+  --wr-current-text: var(--wr-text-dark-primary);
+  --wr-current-text-secondary: var(--wr-text-dark-secondary);
+  --wr-current-text-tertiary: var(--wr-text-dark-tertiary);
+}
+
+/* === E-Ink Mode Overrides === */
+
+[data-wr-eink="true"] {
+  --wr-current-bg: #FFFFFF;
+  --wr-current-text: #000000;
+  --wr-current-text-secondary: #000000;
+  --wr-current-text-tertiary: #000000;
+  --wr-transition-fast: 0ms;
+  --wr-transition-normal: 0ms;
+  --wr-transition-slow: 0ms;
+  --wr-transition-page: 0ms;
+  --wr-shadow-sm: none;
+  --wr-shadow-md: none;
+  --wr-shadow-lg: none;
+}

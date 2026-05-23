@@ -1,52 +1,39 @@
+@import './tokens.css';
+@import './animations.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-@font-face {
-  font-family: 'Inter';
-  src: url('/fonts/InterVariable.woff2') format('woff2');
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: 'Inter';
-  src: url('/fonts/InterVariable-Italic.woff2') format('woff2');
-  font-weight: 100 900;
-  font-style: italic;
-  font-display: swap;
-}
 
 :root {
   border-radius: 10px;
   scrollbar-gutter: auto !important;
   overscroll-behavior: none;
   background-color: transparent;
+  font-family: var(--wr-font-family-ui);
 
-  --scroll-bg-color: theme('colors.base-200');
+  --scroll-bg-color: var(--wr-bg-green);
   --safe-area-inset-top: env(safe-area-inset-top);
   --safe-area-inset-right: env(safe-area-inset-right);
   --safe-area-inset-bottom: env(safe-area-inset-bottom);
   --safe-area-inset-left: env(safe-area-inset-left);
 }
 
-/* Fixes the scrollbar gutter issue for DaisyUI */
-/* https://github.com/saadeghi/daisyui/issues/3040#issuecomment-2250530354 */
+/* Fixes the scrollbar gutter issue for modals */
 :root:has(:is(.modal-open, .modal:target, .modal-toggle:checked + .modal, .modal[open])) {
   scrollbar-gutter: unset !important;
 }
 
 html[data-page='default'] {
-  background: theme('colors.base-100');
+  background: var(--wr-bg-white);
 }
 
 html[data-page='library'] {
-  background: theme('colors.base-200');
+  background: var(--wr-bg-white);
 }
 
 html[data-page='reader'] {
-  background: theme('colors.base-100');
+  background: var(--wr-bg-white);
 }
 
 body {
@@ -155,14 +142,14 @@ foliate-fxl {
   left: 0;
   right: 0;
   bottom: 0;
-  border: 1px solid theme('colors.base-300');
+  border: 1px solid var(--wr-bg-green-alt, #cccccc);
   border-radius: 10px;
   pointer-events: none;
 }
 
 .dropdown-content {
   position: relative;
-  @apply bg-base-100;
+  background: var(--wr-bg-white, #ffffff);
   padding: 10px;
   box-shadow: 0 2px 5px rgba(0, 0, 0, 0.15);
   border-radius: 14px;
@@ -180,7 +167,7 @@ foliate-fxl {
 }
 
 .dropdown-content::before {
-  border-bottom: 12px solid theme('colors.base-100');
+  border-bottom: 12px solid var(--wr-bg-white, #ffffff);
   z-index: 1;
 }
 
@@ -191,22 +178,22 @@ foliate-fxl {
 }
 
 .dropdown-content.bgcolor-base-200 {
-  background-color: theme('colors.base-200');
+  background-color: var(--wr-bg-green, #e0e0e0);
 }
 
 .dropdown-content.bgcolor-base-200::before {
-  border-bottom: 12px solid theme('colors.base-200');
+  border-bottom: 12px solid var(--wr-bg-green, #e0e0e0);
   z-index: 1;
 }
 
 .dropdown-content.bordercolor-content::before {
-  border-bottom: 12px solid theme('colors.base-content');
+  border-bottom: 12px solid var(--wr-text-primary, #1a1a1a);
   z-index: 1;
 }
 
 .dropdown-content.bordercolor-content::after {
   top: -11px;
-  border-bottom: 13px solid theme('colors.base-100');
+  border-bottom: 13px solid var(--wr-bg-white, #ffffff);
   z-index: 1;
 }
 
@@ -394,7 +381,7 @@ foliate-fxl {
   transform: translate(-50%, -50%);
   z-index: 50;
   padding: 20px;
-  background-color: theme('colors.base-300');
+  background-color: var(--wr-bg-green-alt, #cccccc);
   border-radius: 8px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
   pointer-events: none;
@@ -486,7 +473,7 @@ input[type='range'].slider-input {
 }
 
 .btn-ghost.btn-active {
-  background-color: theme('colors.base-300');
+  background-color: var(--wr-bg-green-alt, #cccccc);
 }
 
 .animate-reverse-spin {
@@ -498,29 +485,29 @@ input[type='range'].slider-input {
 }
 
 [data-eink='true'] [class*='text-base-content'] {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] [class*='text-blue'] {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
   font-weight: normal;
 }
 
 [data-eink='true'] [class*='text-red'] {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
   font-weight: normal;
 }
 
 [data-eink='true'] [class*='text-neutral-content'] {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] [class*='placeholder']::placeholder {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] [class*='bg-base-content'] {
-  background-color: theme('colors.base-content') !important;
+  background-color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] [class*='font-light'] {
@@ -533,22 +520,22 @@ input[type='range'].slider-input {
 
 [data-eink='true'] .eink-bordered {
   border-width: 1px !important;
-  border-color: theme('colors.base-content') !important;
-  background-color: theme('colors.base-100') !important;
+  border-color: var(--wr-text-primary, #1a1a1a) !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] input.search-input,
 [data-eink='true'] input.search-input:focus {
   border-width: 1px !important;
   border-radius: 9999px;
-  border-color: theme('colors.base-content') !important;
-  background-color: theme('colors.base-100') !important;
+  border-color: var(--wr-text-primary, #1a1a1a) !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] .modal-box {
   box-shadow: none !important;
   border-width: 1px !important;
-  border-color: theme('colors.base-content') !important;
+  border-color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] .dialog-overlay {
@@ -556,26 +543,26 @@ input[type='range'].slider-input {
 }
 
 [data-eink='true'] .menu-container {
-  background-color: theme('colors.base-100') !important;
-  border: 1px solid theme('colors.base-content') !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] hr {
-  border-color: theme('colors.base-content/0.75') !important;
+  border-color: color-mix(in srgb, var(--wr-text-primary, #1a1a1a) 75%, transparent) !important;
 }
 
 [data-eink='true'] button,
 [data-eink='true'] .btn {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 /* btn-contrast — a solid, high-contrast CTA: base-content background with a
    base-100 label. Theme-neutral (unlike the colored btn-primary); fits the
    minimalist themes and is already e-ink-correct. */
 .btn-contrast {
-  background-color: theme('colors.base-content') !important;
-  border: 1px solid theme('colors.base-content') !important;
-  color: theme('colors.base-100') !important;
+  background-color: var(--wr-text-primary, #1a1a1a) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
+  color: var(--wr-bg-white, #ffffff) !important;
 }
 .btn-contrast:hover {
   opacity: 0.9;
@@ -584,51 +571,51 @@ input[type='range'].slider-input {
 [data-eink='true'] .btn-primary,
 [data-eink='true'] .btn-outline,
 [data-eink='true'] .btn-contrast {
-  background-color: theme('colors.base-content') !important;
-  border: 1px solid theme('colors.base-content') !important;
-  color: theme('colors.base-100') !important;
+  background-color: var(--wr-text-primary, #1a1a1a) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
+  color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] .bg-primary {
-  background-color: theme('colors.base-100') !important;
-  border: 1px solid theme('colors.base-content') !important;
-  color: theme('colors.base-content') !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] .dropdown-toggle {
-  background-color: theme('colors.transparent') !important;
+  background-color: transparent !important;
 }
 
 [data-eink='true'] .opds-navigation .card {
-  background-color: theme('colors.base-100') !important;
-  border: 1px solid theme('colors.base-content') !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] .booknote-item {
-  background-color: theme('colors.base-100') !important;
-  border: 1px solid theme('colors.base-content') !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] .booknote-text {
-  background-color: theme('colors.base-100') !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] .bookitem-main,
 [data-eink='true'] .groupitem-main {
-  border: 1px solid theme('colors.base-content') !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] .popup-container {
-  border: 1px solid theme('colors.base-content') !important;
-  background-color: theme('colors.base-100') !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] .popup-triangle-outer {
-  color: theme('colors.base-content') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
 }
 
 [data-eink='true'] .popup-triangle-inner {
-  color: theme('colors.base-100') !important;
+  color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] .annotation-notes {
@@ -637,13 +624,13 @@ input[type='range'].slider-input {
 }
 
 [data-eink='true'] .alert {
-  color: theme('colors.base-content') !important;
-  border: 1px solid theme('colors.base-content') !important;
-  background-color: theme('colors.base-100') !important;
+  color: var(--wr-text-primary, #1a1a1a) !important;
+  border: 1px solid var(--wr-text-primary, #1a1a1a) !important;
+  background-color: var(--wr-bg-white, #ffffff) !important;
 }
 
 [data-eink='true'] input[type='checkbox'] {
-  --tglbg: theme('colors.base-100') !important;
+  --tglbg: var(--wr-bg-white, #ffffff) !important;
 }
 
 .no-transitions * {
@@ -658,7 +645,7 @@ input[type='range'].slider-input {
   }
 
   50% {
-    background-color: theme('colors.primary/0.15');
+    background-color: color-mix(in srgb, var(--wr-accent, #07C160) 15%, transparent);
   }
 }
 
