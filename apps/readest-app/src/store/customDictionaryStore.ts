@@ -10,6 +10,7 @@ import { useSettingsStore } from './settingsStore';
 import { publishReplicaDelete, publishReplicaUpsert } from '@/services/sync/replicaPublish';
 import { DICTIONARY_KIND } from '@/services/sync/adapters/dictionary';
 import { markExplicitProviderOrderPublish } from '@/services/sync/replicaSettingsSync';
+import type { DictionaryPluginControlStore } from '@/services/dictionaries/plugins/controlStore';
 
 const publishDictUpsert = (dict: ImportedDictionary): void => {
   if (!dict.contentId) return;
@@ -30,6 +31,7 @@ const BUILTIN_WEB_ORDER = [
   BUILTIN_WEB_SEARCH_IDS.google,
   BUILTIN_WEB_SEARCH_IDS.urban,
   BUILTIN_WEB_SEARCH_IDS.merriamWebster,
+  BUILTIN_WEB_SEARCH_IDS.goodreads,
 ];
 
 const DEFAULT_DICTIONARY_SETTINGS: DictionarySettings = {
@@ -37,6 +39,7 @@ const DEFAULT_DICTIONARY_SETTINGS: DictionarySettings = {
     BUILTIN_PROVIDER_IDS.systemDictionary,
     BUILTIN_PROVIDER_IDS.wiktionary,
     BUILTIN_PROVIDER_IDS.wikipedia,
+    BUILTIN_PROVIDER_IDS.context,
     ...BUILTIN_WEB_ORDER,
   ],
   providerEnabled: {
@@ -46,11 +49,17 @@ const DEFAULT_DICTIONARY_SETTINGS: DictionarySettings = {
     [BUILTIN_PROVIDER_IDS.systemDictionary]: false,
     [BUILTIN_PROVIDER_IDS.wiktionary]: true,
     [BUILTIN_PROVIDER_IDS.wikipedia]: true,
+    // Opt-in: it needs an OpenAI-compatible custom translator and spends
+    // the user's own API tokens on every lookup.
+    [BUILTIN_PROVIDER_IDS.context]: false,
     [BUILTIN_WEB_SEARCH_IDS.google]: false,
     [BUILTIN_WEB_SEARCH_IDS.urban]: false,
     [BUILTIN_WEB_SEARCH_IDS.merriamWebster]: false,
+    [BUILTIN_WEB_SEARCH_IDS.goodreads]: false,
   },
   webSearches: [],
+  fontScale: 1,
+  autoPlayPronunciation: false,
 };
 
 interface DictionaryStoreState {
@@ -112,6 +121,12 @@ interface DictionaryStoreState {
   setEnabled(id: string, enabled: boolean): void;
   /** Persist the last-used tab id so the popup re-opens on it. */
   setDefaultProviderId(id: string | undefined): void;
+  /** Set the dictionary popup font-size multiplier (#4443). */
+  setFontScale(scale: number): void;
+  /** Auto-play a looked-up word's bundled pronunciation audio (#6265). */
+  setAutoPlayPronunciation(enabled: boolean): void;
+  /** Pick the custom translator the context dictionary asks (#5544). */
+  setContextTranslatorId(id: string): void;
 
   /** Add a custom web search (id is generated). Appended + enabled by default. */
   addWebSearch(name: string, urlTemplate: string): WebSearchEntry;
@@ -411,35 +426,16 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
 
   setEnabled: (id, enabled) => {
     set((state) => {
-      const SYSTEM_ID = BUILTIN_PROVIDER_IDS.systemDictionary;
-      // Exclusivity: enabling the system-dictionary entry disables all
-      // other providers, and enabling any non-system provider disables
-      // the system entry. The settings UI relies on this so the lookup
-      // path either ALWAYS opens the in-app popup or NEVER does — no
-      // mixed states. Disabling never cascades (toggling system off
-      // doesn't auto-enable the others; the user picks).
-      const isSystem = id === SYSTEM_ID;
-      const next: Record<string, boolean> = { ...state.settings.providerEnabled };
-      if (enabled) {
-        if (isSystem) {
-          // Turn off everything else.
-          for (const key of Object.keys(next)) {
-            if (key !== SYSTEM_ID) next[key] = false;
-          }
-          // Cover ids that may live in providerOrder without an
-          // explicit `false` entry (built-in defaults seed `true`).
-          for (const orderedId of state.settings.providerOrder) {
-            if (orderedId !== SYSTEM_ID) next[orderedId] = false;
-          }
-          next[SYSTEM_ID] = true;
-        } else {
-          // Enabling a non-system provider implicitly turns off system.
-          next[SYSTEM_ID] = false;
-          next[id] = true;
-        }
-      } else {
-        next[id] = false;
-      }
+      // System-dictionary exclusivity is enforced at LOOKUP time:
+      // `isSystemDictionaryEnabled` short-circuits to the OS handoff before
+      // any in-app provider runs. Persisting each provider's enabled state
+      // independently lets the user toggle System on/off without losing
+      // their preferred set of in-app providers — every flag is restored
+      // verbatim the moment System is turned back off.
+      const next: Record<string, boolean> = {
+        ...state.settings.providerEnabled,
+        [id]: enabled,
+      };
       return {
         settings: { ...state.settings, providerEnabled: next },
       };
@@ -449,6 +445,24 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
   setDefaultProviderId: (id) => {
     set((state) => ({
       settings: { ...state.settings, defaultProviderId: id },
+    }));
+  },
+
+  setFontScale: (scale) => {
+    set((state) => ({
+      settings: { ...state.settings, fontScale: scale },
+    }));
+  },
+
+  setAutoPlayPronunciation: (enabled) => {
+    set((state) => ({
+      settings: { ...state.settings, autoPlayPronunciation: enabled },
+    }));
+  },
+
+  setContextTranslatorId: (id) => {
+    set((state) => ({
+      settings: { ...state.settings, contextTranslatorId: id },
     }));
   },
 
@@ -524,11 +538,45 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
       const persisted = settings?.customDictionaries ?? [];
       const persistedSettings = settings?.dictionarySettings ?? DEFAULT_DICTIONARY_SETTINGS;
       const appService = await envConfig.getAppService();
+      const pluginDictionaries = persisted.filter(
+        (dict) => !dict.deletedAt && dict.kind === 'plugin',
+      );
+      let pluginControlStore: DictionaryPluginControlStore | undefined;
+      if (pluginDictionaries.length > 0) {
+        try {
+          pluginControlStore = await import('@/services/dictionaries/plugins/controlService').then(
+            (module) => module.getDictionaryPluginControlStore(appService),
+          );
+        } catch (error) {
+          console.warn('Failed to open dictionary plugin control store', error);
+        }
+      }
       const dictionaries = await Promise.all(
         persisted.map(async (dict) => {
           if (dict.deletedAt) return dict;
           const exists = await appService.exists(dict.bundleDir, 'Dictionaries');
-          return exists ? dict : { ...dict, unavailable: true };
+          if (!exists) return { ...dict, unavailable: true };
+          if (dict.kind !== 'plugin' || !dict.plugin) return dict;
+          if (!pluginControlStore) return { ...dict, unavailable: true };
+          const generation = await pluginControlStore.getActiveGeneration(dict.id);
+          if (
+            generation?.pluginId === dict.plugin.pluginId &&
+            generation.indexVersion === dict.plugin.indexVersion
+          ) {
+            return dict;
+          }
+          try {
+            const { materializePluginDictionary } = await import(
+              '@/services/dictionaries/plugins/materialize'
+            );
+            await materializePluginDictionary(appService, dict, {
+              controlStore: pluginControlStore,
+            });
+            return { ...dict, unavailable: undefined };
+          } catch (error) {
+            console.warn('Failed to materialize plugin dictionary', dict.id, error);
+            return { ...dict, unavailable: true };
+          }
         }),
       );
 
@@ -599,6 +647,11 @@ export const useCustomDictionaryStore = create<DictionaryStoreState>((set, get) 
         },
         defaultProviderId: persistedSettings.defaultProviderId,
         webSearches: persistedSettings.webSearches ?? [],
+        fontScale: persistedSettings.fontScale ?? DEFAULT_DICTIONARY_SETTINGS.fontScale,
+        autoPlayPronunciation:
+          persistedSettings.autoPlayPronunciation ??
+          DEFAULT_DICTIONARY_SETTINGS.autoPlayPronunciation,
+        contextTranslatorId: persistedSettings.contextTranslatorId,
       };
       set({ dictionaries, settings: settingsMerged });
     } catch (error) {

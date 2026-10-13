@@ -492,4 +492,141 @@ describe('extractTxtFilenameMetadata', () => {
   it('returns empty object for empty input', () => {
     expect(extractTxtFilenameMetadata('')).toEqual({ title: '' });
   });
+
+  // Chinese web-novel TXT files are commonly named with a 【】 title and a
+  // labeled author tacked on, e.g. 【书名】1-129 作者：起落.txt. There are no 《》,
+  // so the whole name stays the title, but the labeled author must still be
+  // extracted. See issue #4390.
+  it('extracts a labeled author from a 【】-titled filename without 《》 (issue #4390)', () => {
+    expect(extractTxtFilenameMetadata('【细雨飘香】1-129 作者：起落.txt')).toEqual({
+      title: '【细雨飘香】1-129 作者：起落',
+      author: '起落',
+    });
+    expect(extractTxtFilenameMetadata('【月如无恨月长圆】（1-154）作者：陈西.txt')).toEqual({
+      title: '【月如无恨月长圆】（1-154）作者：陈西',
+      author: '陈西',
+    });
+  });
+
+  it('does not mistake a leading 【tag】 for the author when no 作者 label is present', () => {
+    expect(extractTxtFilenameMetadata('【完结】斗破苍穹.txt')).toEqual({
+      title: '【完结】斗破苍穹',
+    });
+  });
+});
+
+describe('author resolution during conversion (issue #4390)', () => {
+  const convertAndCaptureMetadata = async (name: string, content: string) => {
+    const converter = new TxtToEpubConverter() as unknown as TxtConverterFlowPrivateAPI;
+    let captured: TestMetadata | undefined;
+    converter.detectEncoding = () => 'utf-8';
+    converter.createEpub = async (_chapters, metadata) => {
+      captured = metadata;
+      return new Blob();
+    };
+    converter.extractChapters = () => [{ title: '第一章', content: '正文', isVolume: false }];
+    const file = new File([content], name);
+    await converter.convert({ file });
+    return captured;
+  };
+
+  it('falls back to the filename author when the header has none (missing author)', async () => {
+    const metadata = await convertAndCaptureMetadata(
+      '【细雨飘香】1-129 作者：起落.txt',
+      '第一章 初见\n正文内容……\n',
+    );
+    expect(metadata?.author).toBe('起落');
+  });
+
+  it('rejects a metadata-blob header author and uses the filename author (irrelevant content)', async () => {
+    const metadata = await convertAndCaptureMetadata(
+      '【月如无恨月长圆】（1-154）作者：陈西.txt',
+      '作者：2024/08/01发表于：是否首发：是字数1023150字116:01\n第一章 初见\n正文内容……\n',
+    );
+    expect(metadata?.author).toBe('陈西');
+  });
+
+  it('keeps a clean labeled author parsed from the file header', async () => {
+    const metadata = await convertAndCaptureMetadata(
+      '【幻灵幽火】1-23未完结 作者：月夜银狐.txt',
+      '作者：月夜银狐\n第一章 初见\n正文内容……\n',
+    );
+    expect(metadata?.author).toBe('月夜银狐');
+  });
+});
+
+describe('Chinese chapter numerals beyond 一二三 (issue #6172)', () => {
+  const zhMetadata: TestMetadata = {
+    bookTitle: 'Test',
+    author: '',
+    language: 'zh',
+    identifier: 'test',
+  };
+  const option = { linesBetweenSegments: 8, fallbackParagraphsPerChapter: 100 };
+
+  it('detects headings that spell two as 两', () => {
+    const converter = new TxtToEpubConverter() as unknown as TxtConverterFlowPrivateAPI;
+    const text = [
+      '第两百一十八章 塞浦路斯领主炙手可热',
+      '这是第二百一十八章的内容。',
+      '第两百一十九章 宴会',
+      '这是第二百一十九章的内容。',
+    ].join('\n');
+
+    const chapters = converter.extractChapters(text, zhMetadata, option);
+
+    expect(chapters.map((c) => c.title)).toEqual([
+      '第两百一十八章 塞浦路斯领主炙手可热',
+      '第两百一十九章 宴会',
+    ]);
+  });
+
+  it('detects headings that use uppercase numerals', () => {
+    const converter = new TxtToEpubConverter() as unknown as TxtConverterFlowPrivateAPI;
+    const text = [
+      '第壹章 开篇',
+      '这是第一章的内容。',
+      '第贰章 承接',
+      '这是第二章的内容。',
+      '第拾叁章 收束',
+      '这是第十三章的内容。',
+    ].join('\n');
+
+    const chapters = converter.extractChapters(text, zhMetadata, option);
+
+    expect(chapters.map((c) => c.title)).toEqual(['第壹章 开篇', '第贰章 承接', '第拾叁章 收束']);
+  });
+
+  it('marks uppercase-numeral volume headings as volumes', () => {
+    const converter = new TxtToEpubConverter() as unknown as TxtConverterFlowPrivateAPI;
+    const text = ['第贰卷 远征', '卷首语。', '第壹章 开篇', '这是第一章的内容。'].join('\n');
+
+    const chapters = converter.extractChapters(text, zhMetadata, option);
+
+    expect(chapters.map((c) => [c.title, c.isVolume])).toEqual([
+      ['第贰卷 远征', true],
+      ['第壹章 开篇', false],
+    ]);
+  });
+
+  it('keeps the whole book split when a long run of 第两百N章 chapters follows (issue #6172)', () => {
+    const converter = new TxtToEpubConverter() as unknown as TxtConverterFlowPrivateAPI;
+    // A single undetected heading style glues its chapters into one oversized
+    // part, which isGoodMatches rejects — dropping the TOC for the entire book.
+    const body = Array.from({ length: 40 }, (_, i) => `段落${i + 1}${'正文内容'.repeat(20)}`).join(
+      '\n',
+    );
+    const lines = ['第一章 开篇', '这是第一章的内容。'];
+    for (let i = 0; i < 60; i++) {
+      lines.push(`第两百${i + 1}章 远征`, body);
+    }
+    const text = lines.join('\n');
+
+    const chapters = converter.extractChapters(text, zhMetadata, option);
+
+    expect(chapters.every((c) => c.title.startsWith('第'))).toBe(true);
+    expect(chapters.length).toBe(61);
+    expect(chapters[0]!.title).toBe('第一章 开篇');
+    expect(chapters[60]!.title).toBe('第两百60章 远征');
+  });
 });

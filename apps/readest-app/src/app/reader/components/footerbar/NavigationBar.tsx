@@ -8,6 +8,7 @@ import { MdOutlineHeadphones as TTSIcon } from 'react-icons/md';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useTranslation } from '@/hooks/useTranslation';
+import { useSidebarStore } from '@/store/sidebarStore';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import Button from '@/components/Button';
 import { Insets } from '@/types/misc';
@@ -17,6 +18,8 @@ interface NavigationBarProps {
   actionTab: string;
   gridInsets: Insets;
   forceMobileLayout: boolean;
+  // Keeps the row clear of iPhone Duo's side status strip (#6307).
+  insetStyle?: React.CSSProperties;
   onSetActionTab: (tab: string) => void;
 }
 
@@ -25,12 +28,15 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
   actionTab,
   gridInsets,
   forceMobileLayout,
+  insetStyle,
   onSetActionTab,
 }) => {
   const isMobile = forceMobileLayout || window.innerWidth < 640 || window.innerHeight < 640;
   const _ = useTranslation();
   const { appService } = useEnv();
   const { getViewState } = useReaderStore();
+  const { isSideBarVisible, isSideBarPinned } = useSidebarStore();
+
   const viewState = getViewState(bookKey);
   const tocIconSize = useResponsiveSize(23);
   const fontIconSize = useResponsiveSize(18);
@@ -47,13 +53,16 @@ export const NavigationBar: React.FC<NavigationBarProps> = ({
         paddingBottom: appService?.isAndroidApp
           ? `calc(env(safe-area-inset-bottom) + 16px)`
           : navPadding,
+        ...insetStyle,
       }}
     >
-      <Button
-        label={_('Table of Contents')}
-        icon={<TOCIcon size={tocIconSize} />}
-        onClick={() => onSetActionTab('toc')}
-      />
+      {isSideBarVisible && isSideBarPinned ? null : (
+        <Button
+          label={_('Table of Contents')}
+          icon={<TOCIcon size={tocIconSize} />}
+          onClick={() => onSetActionTab('toc')}
+        />
+      )}
       <Button
         label={_('Color')}
         icon={<ColorIcon className={clsx(actionTab === 'color' && 'text-blue-500')} />}

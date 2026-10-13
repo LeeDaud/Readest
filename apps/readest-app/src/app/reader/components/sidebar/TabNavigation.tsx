@@ -8,6 +8,8 @@ import { LuMessageSquare } from 'react-icons/lu';
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
+import { useThemeStore } from '@/store/themeStore';
+import { isForcedMobileLayout } from '../../utils/mobileLayout';
 
 const TabNavigation: React.FC<{
   activeTab: string;
@@ -16,8 +18,11 @@ const TabNavigation: React.FC<{
   const _ = useTranslation();
   const { appService } = useEnv();
   const { settings } = useSettingsStore();
+  const isIPhoneDuo = useThemeStore((s) => s.isIPhoneDuo);
   const aiEnabled = settings?.aiSettings?.enabled ?? false;
 
+  const forceMobileLayout = isForcedMobileLayout(appService?.isMobile, isIPhoneDuo);
+  const isMobile = forceMobileLayout || window.innerWidth < 640 || window.innerHeight < 640;
   const tabs = ['toc', 'annotations', 'bookmarks', ...(aiEnabled ? ['history'] : [])];
 
   const getTabLabel = (tab: string) => {
@@ -40,6 +45,7 @@ const TabNavigation: React.FC<{
       className={clsx(
         'bottom-tab border-base-300/50 bg-base-200 flex w-full border-t',
         appService?.hasRoundedWindow && 'rounded-window-bottom-left',
+        isMobile && 'h-[65px]',
       )}
       dir='ltr'
     >
@@ -49,8 +55,9 @@ const TabNavigation: React.FC<{
           tabIndex={0}
           role='button'
           className={clsx(
-            'm-1.5 flex-1 cursor-pointer rounded-lg p-2 transition-colors duration-200',
+            'flex-1 m-1.5 cursor-pointer rounded-lg transition-colors duration-200',
             activeTab === tab && 'bg-base-300/85',
+            isMobile ? 'p-3' : 'p-2',
           )}
           onClick={() => onTabChange(tab)}
           onKeyDown={(e) => {
@@ -62,7 +69,7 @@ const TabNavigation: React.FC<{
           title={getTabLabel(tab)}
           aria-label={getTabLabel(tab)}
         >
-          <div className='m-0 flex h-6 items-center p-0'>
+          <div className={clsx('flex h-6 items-center p-0', isMobile ? 'm-0.5' : 'm-0')}>
             {tab === 'toc' ? (
               <IoIosList className='mx-auto' />
             ) : tab === 'annotations' ? (

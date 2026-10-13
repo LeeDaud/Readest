@@ -20,14 +20,19 @@ import type {
   WebSearchEntry,
 } from './types';
 import { BUILTIN_PROVIDER_IDS } from './types';
+import { isSystemDictionarySupported } from './systemDictionary';
 import { wiktionaryProvider } from './providers/wiktionaryProvider';
 import { wikipediaProvider } from './providers/wikipediaProvider';
+import { contextProvider } from './providers/contextProvider';
 import { createStarDictProvider, type DictionaryFileOpener } from './providers/starDictProvider';
 import { createMdictProvider } from './providers/mdictProvider';
 import { createDictProvider } from './providers/dictProvider';
 import { createSlobProvider } from './providers/slobProvider';
+import { createBglProvider } from './providers/bglProvider';
 import { createWebSearchProvider } from './providers/webSearchProvider';
 import { getBuiltinWebSearch } from './webSearchTemplates';
+import { createPluginDictionaryProvider } from './plugins/provider';
+import type { AppService } from '@/types/system';
 
 const instanceCache = new Map<string, DictionaryProvider>();
 
@@ -45,6 +50,7 @@ interface RegistryArgs {
 const builtinFor = (id: string): DictionaryProvider | undefined => {
   if (id === BUILTIN_PROVIDER_IDS.wiktionary) return wiktionaryProvider;
   if (id === BUILTIN_PROVIDER_IDS.wikipedia) return wikipediaProvider;
+  if (id === BUILTIN_PROVIDER_IDS.context) return contextProvider;
   // System dictionary is a sentinel — it has no in-popup UI. The
   // annotator handles it before reaching the popup; the registry
   // filters it out of `getEnabledProviders` so no empty tab appears.
@@ -105,6 +111,23 @@ const getOrCreate = (
     instanceCache.set(id, provider);
     return provider;
   }
+  if (dict.kind === 'bgl') {
+    const provider = createBglProvider({ dict, fs });
+    instanceCache.set(id, provider);
+    return provider;
+  }
+  if (dict.kind === 'plugin') {
+    const pluginHost = fs as DictionaryFileOpener &
+      Partial<Pick<AppService, 'openDatabase' | 'deleteDatabase'>>;
+    if (!pluginHost.openDatabase || !pluginHost.deleteDatabase) return undefined;
+    const provider = createPluginDictionaryProvider({
+      dict,
+      host: pluginHost as DictionaryFileOpener &
+        Pick<AppService, 'openDatabase' | 'deleteDatabase'>,
+    });
+    instanceCache.set(id, provider);
+    return provider;
+  }
   return undefined;
 };
 
@@ -156,8 +179,16 @@ export const getEnabledProviders = ({
  * of `getEnabledProviders` (which filters the sentinel out so no empty
  * tab appears) so callers don't need to look at order/list shape to
  * make the dispatch decision.
+ *
+ * Gated by platform support: `providerEnabled` is whole-field synced
+ * across devices, so a flag set on (say) macOS would otherwise reach a
+ * Windows device that has no handoff implementation, leaving the
+ * annotator with no way to look up a word. Short-circuiting here keeps
+ * the setting durable on the device where it makes sense while making
+ * it a no-op everywhere else.
  */
 export const isSystemDictionaryEnabled = (settings: DictionarySettings): boolean => {
+  if (!isSystemDictionarySupported()) return false;
   return settings.providerEnabled[BUILTIN_PROVIDER_IDS.systemDictionary] === true;
 };
 

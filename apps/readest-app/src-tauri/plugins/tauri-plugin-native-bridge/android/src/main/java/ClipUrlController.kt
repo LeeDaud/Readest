@@ -4,25 +4,33 @@ import android.app.Activity
 import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.view.WindowManager
+import android.webkit.CookieManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import app.tauri.annotation.InvokeArg
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 
 /**
  * Args decoded from the JS `invoke('clip_url', { ... })` payload.
@@ -40,6 +48,13 @@ class ClipUrlArgs {
     var savedTitle: String? = null
     var background: String? = null
     var foreground: String? = null
+    // Interactive mode: show the page with a Cancel/Capture bar instead
+    // of the opaque overlay so the user can sign in before capturing.
+    var interactive: Boolean? = null
+    var backgroundCapture: Boolean? = null
+    var signInHint: String? = null
+    var captureLabel: String? = null
+    var cancelLabel: String? = null
 }
 
 /**
@@ -67,10 +82,16 @@ sealed class ClipUrlResult {
  * the page's own hydration can't wipe).
  */
 class ClipUrlController(
-    private val activity: Activity,
+    activity: Activity,
     private val args: ClipUrlArgs,
     private val completion: (ClipUrlResult) -> Unit,
 ) {
+    // Hold the Activity weakly: the controller outlives the synchronous
+    // command call (it waits up to 30 s for the page), and a strong ref
+    // would leak the Activity (and its WebView) if it is destroyed while
+    // a clip is in flight.
+    private val activityRef = WeakReference(activity)
+
     companion object {
         private const val TAG = "ClipUrl"
 
@@ -109,14 +130,23 @@ class ClipUrlController(
         private const val DEFAULT_CAPTURING_STATUS = "Capturing article…"
         private const val DEFAULT_BACKGROUND = "#1f2024"
         private const val DEFAULT_FOREGROUND = "#f5f5f7"
+        private const val DEFAULT_SIGN_IN_HINT = "Sign in if needed, then capture"
+        private const val DEFAULT_CAPTURE_LABEL = "Capture"
+        private const val DEFAULT_CANCEL_LABEL = "Cancel"
+
+        // Shared cancel vocabulary with `ClipUrlController.swift` — the JS
+        // side matches this string to stay quiet on user-initiated cancels.
+        const val CANCELLED_MESSAGE = "Capture cancelled"
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val interactiveMode = args.interactive == true
     private var dialog: Dialog? = null
     private var webView: WebView? = null
     private var statusLabel: TextView? = null
     private var didFinishOrFail = false
     private var captureFired = false
+    private var completed = false
     private var settled = false
     private val timeoutRunnable = Runnable { onTimeout() }
 
@@ -126,44 +156,105 @@ class ClipUrlController(
             completion(ClipUrlResult.Failure("Invalid URL"))
             return
         }
-        mainHandler.post { presentDialog(urlStr) }
+        val act = activityRef.get()
+        if (act == null || act.isFinishing || act.isDestroyed) {
+            completion(ClipUrlResult.Failure("Activity is no longer available"))
+            return
+        }
+        mainHandler.post { presentDialog(act, urlStr) }
     }
 
-    private fun presentDialog(urlStr: String) {
+    private fun presentDialog(act: Activity, urlStr: String) {
+        if (args.backgroundCapture == true && !interactiveMode) {
+            // Keep a real viewport behind the app for layout and lazy loading.
+            // The React import sheet stays visible, focused, and interactive.
+            val wv = WebView(act)
+            configureWebView(wv)
+            wv.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            wv.isFocusable = false
+            val host = act.findViewById<ViewGroup>(android.R.id.content)
+            host.addView(wv, 0, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+            webView = wv
+            wv.loadUrl(urlStr)
+            mainHandler.postDelayed(timeoutRunnable, HARD_TIMEOUT_MS)
+            return
+        }
         val bg = parseHexColor(args.background ?: DEFAULT_BACKGROUND) ?: Color.BLACK
         val fg = parseHexColor(args.foreground ?: DEFAULT_FOREGROUND) ?: Color.WHITE
 
-        // Full-screen dialog with no chrome — we draw our own overlay
-        // on top so the underlying app doesn't peek through during the
-        // brief capture window.
-        val dlg = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-        dlg.setCancelable(false)
+        // Headless: full-screen dialog with no chrome — we draw our own
+        // overlay on top so the underlying app doesn't peek through during
+        // the brief capture window. Interactive: keep the status bar (the
+        // fullscreen theme breaks adjustResize, and the user has to type
+        // credentials) and let the user drive the page.
+        val theme = if (interactiveMode) {
+            android.R.style.Theme_Black_NoTitleBar
+        } else {
+            android.R.style.Theme_Black_NoTitleBar_Fullscreen
+        }
+        val dlg = Dialog(act, theme)
+        dlg.setCancelable(true)
+        dlg.setOnCancelListener { finish(ClipUrlResult.Failure(CANCELLED_MESSAGE)) }
         dlg.setCanceledOnTouchOutside(false)
         dlg.window?.also { window ->
             window.setBackgroundDrawable(ColorDrawable(bg))
         }
 
-        val root = FrameLayout(activity)
-        root.setBackgroundColor(bg)
-
-        val wv = WebView(activity)
-        // Reserve a logical size for layout; the WebView is hidden
-        // behind the opaque overlay anyway, but it still needs a
-        // non-zero rect for the page to fire its viewport-based
-        // lazy-loaders.
-        wv.layoutParams = FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        )
+        val wv = WebView(act)
         configureWebView(wv)
-        root.addView(wv)
 
-        val overlay = buildOverlay(bg, fg)
-        overlay.layoutParams = FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        )
-        root.addView(overlay)
+        val root: View
+        if (interactiveMode) {
+            dlg.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            // Back navigates the page history first — sign-in flows hop
+            // through several redirects — and only cancels once exhausted.
+            dlg.setOnKeyListener { _, keyCode, event ->
+                if (keyCode == KeyEvent.KEYCODE_BACK &&
+                    event.action == KeyEvent.ACTION_UP && wv.canGoBack()
+                ) {
+                    wv.goBack()
+                    true
+                } else {
+                    false
+                }
+            }
+            val column = LinearLayout(act)
+            column.orientation = LinearLayout.VERTICAL
+            column.setBackgroundColor(bg)
+            column.addView(
+                buildActionBar(act, bg, fg),
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            column.addView(
+                wv,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
+            )
+            root = column
+        } else {
+            val frame = FrameLayout(act)
+            frame.setBackgroundColor(bg)
+            // Reserve a logical size for layout; the WebView is hidden
+            // behind the opaque overlay anyway, but it still needs a
+            // non-zero rect for the page to fire its viewport-based
+            // lazy-loaders.
+            wv.layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            frame.addView(wv)
+            val overlay = buildOverlay(act, bg, fg)
+            overlay.layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            frame.addView(overlay)
+            root = frame
+        }
 
         dlg.setContentView(
             root,
@@ -181,13 +272,12 @@ class ClipUrlController(
         dialog = dlg
         webView = wv
 
-        // Inject the fingerprint mask before the first navigation so
-        // navigator.webdriver and friends look right when the page's
-        // own scripts run.
-        wv.evaluateJavascript(FINGERPRINT_MASK_JS, null)
         wv.loadUrl(urlStr)
 
-        mainHandler.postDelayed(timeoutRunnable, HARD_TIMEOUT_MS)
+        // Interactive capture waits for the user's tap — no deadline.
+        if (!interactiveMode) {
+            mainHandler.postDelayed(timeoutRunnable, HARD_TIMEOUT_MS)
+        }
     }
 
     private fun configureWebView(wv: WebView) {
@@ -200,9 +290,25 @@ class ClipUrlController(
         settings.mediaPlaybackRequiresUserGesture = true
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         wv.setBackgroundColor(parseHexColor(args.background ?: DEFAULT_BACKGROUND) ?: Color.BLACK)
+        // Register for every document, including login redirects. Evaluating on
+        // the initial about:blank page loses the mask at the first navigation.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            WebViewCompat.addDocumentStartJavaScript(wv, FINGERPRINT_MASK_JS, setOf("*"))
+        }
+
+        // The CookieManager is app-wide and persistent, so a session the
+        // user establishes in the interactive capture flow authenticates
+        // every later headless clip. Third-party cookies are required by
+        // most SSO redirects (#5262).
+        val cookies = CookieManager.getInstance()
+        cookies.setAcceptCookie(true)
+        cookies.setAcceptThirdPartyCookies(wv, true)
 
         wv.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
+                // Interactive capture is user-driven: the page keeps
+                // navigating (login redirects) until Capture is tapped.
+                if (interactiveMode) return
                 if (didFinishOrFail) return
                 didFinishOrFail = true
                 mainHandler.post {
@@ -218,6 +324,10 @@ class ClipUrlController(
                 request: WebResourceRequest?,
                 error: WebResourceError?,
             ) {
+                // A failed hop mid-sign-in shouldn't tear the flow down —
+                // the page renders its own error and the user can retry
+                // or cancel.
+                if (interactiveMode) return
                 // Only honour main-frame errors. Subresource failures
                 // (a single missing image, a blocked tracker) shouldn't
                 // abort the capture — they were noise the desktop flow
@@ -231,28 +341,80 @@ class ClipUrlController(
         }
     }
 
-    private fun buildOverlay(bg: Int, fg: Int): View {
-        val column = LinearLayout(activity)
+    /** Interactive-mode top bar: hint text + Cancel + a solid Capture
+     *  button, all drawn with the caller's theme colours. */
+    private fun buildActionBar(act: Activity, bg: Int, fg: Int): View {
+        val bar = LinearLayout(act)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setBackgroundColor(bg)
+        bar.setPadding(dp(act, 16), dp(act, 10), dp(act, 12), dp(act, 10))
+
+        val hint = TextView(act)
+        hint.text = args.signInHint ?: DEFAULT_SIGN_IN_HINT
+        hint.setTextColor(
+            Color.argb((0.7f * 255).toInt(), Color.red(fg), Color.green(fg), Color.blue(fg)),
+        )
+        hint.textSize = 13f
+        hint.maxLines = 2
+        hint.ellipsize = TextUtils.TruncateAt.END
+        val hintParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        hintParams.marginEnd = dp(act, 12)
+        hint.layoutParams = hintParams
+        bar.addView(hint)
+
+        val cancel = TextView(act)
+        cancel.text = args.cancelLabel ?: DEFAULT_CANCEL_LABEL
+        cancel.setTextColor(fg)
+        cancel.textSize = 14f
+        cancel.setPadding(dp(act, 12), dp(act, 8), dp(act, 12), dp(act, 8))
+        cancel.setOnClickListener { finish(ClipUrlResult.Failure(CANCELLED_MESSAGE)) }
+        bar.addView(cancel)
+
+        val capture = TextView(act)
+        capture.text = args.captureLabel ?: DEFAULT_CAPTURE_LABEL
+        capture.setTextColor(bg)
+        capture.textSize = 14f
+        capture.setTypeface(capture.typeface, android.graphics.Typeface.BOLD)
+        capture.setPadding(dp(act, 16), dp(act, 8), dp(act, 16), dp(act, 8))
+        val pill = GradientDrawable()
+        pill.setColor(fg)
+        pill.cornerRadius = dp(act, 18).toFloat()
+        capture.background = pill
+        val captureParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        captureParams.marginStart = dp(act, 4)
+        capture.layoutParams = captureParams
+        capture.setOnClickListener { captureOuterHtml() }
+        bar.addView(capture)
+
+        return bar
+    }
+
+    private fun buildOverlay(act: Activity, bg: Int, fg: Int): View {
+        val column = LinearLayout(act)
         column.orientation = LinearLayout.VERTICAL
         column.gravity = Gravity.CENTER
         column.setBackgroundColor(bg)
-        val pad = dp(24)
+        val pad = dp(act, 24)
         column.setPadding(pad, pad, pad, pad)
 
-        val spinner = ProgressBar(activity)
+        val spinner = ProgressBar(act)
         // Tint with foreground at ~85% — same idea as the iOS overlay.
         val spinTint = Color.argb(
             (0.85f * 255).toInt(),
             Color.red(fg), Color.green(fg), Color.blue(fg),
         )
         spinner.indeterminateDrawable?.setTint(spinTint)
-        val spinSize = dp(36)
+        val spinSize = dp(act, 36)
         val spinParams = LinearLayout.LayoutParams(spinSize, spinSize)
-        spinParams.bottomMargin = dp(14)
+        spinParams.bottomMargin = dp(act, 14)
         spinner.layoutParams = spinParams
         column.addView(spinner)
 
-        val title = TextView(activity)
+        val title = TextView(act)
         title.text = args.overlayTitle ?: DEFAULT_OVERLAY_TITLE
         title.setTextColor(fg)
         title.textSize = 15f
@@ -260,7 +422,7 @@ class ClipUrlController(
         title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
         column.addView(title)
 
-        val status = TextView(activity)
+        val status = TextView(act)
         status.text = args.loadingStatus ?: DEFAULT_LOADING_STATUS
         // 70% alpha for the secondary line — matches the desktop overlay.
         status.setTextColor(
@@ -277,20 +439,31 @@ class ClipUrlController(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         )
-        statusParams.topMargin = dp(4)
+        statusParams.topMargin = dp(act, 4)
         status.layoutParams = statusParams
         column.addView(status)
         statusLabel = status
+        val cancel = Button(act)
+        cancel.text = args.cancelLabel ?: "Cancel"
+        cancel.setTextColor(fg)
+        cancel.background = GradientDrawable().apply {
+            setColor(bg)
+            setStroke(dp(act, 1), fg)
+            cornerRadius = dp(act, 6).toFloat()
+        }
+        cancel.minHeight = dp(act, 44)
+        cancel.setOnClickListener { finish(ClipUrlResult.Failure(CANCELLED_MESSAGE)) }
+        column.addView(cancel)
 
         return column
     }
 
     private fun captureOuterHtml() {
-        if (captureFired) return
+        if (captureFired || completed) return
         captureFired = true
         settled = true
         val wv = webView ?: return finish(ClipUrlResult.Failure("WebView vanished before capture"))
-        wv.evaluateJavascript("document.documentElement.outerHTML") { result ->
+        wv.evaluateJavascript("(function() { var root = document.documentElement.cloneNode(true); root.setAttribute('data-readest-url', location.href); return root.outerHTML; })()") { result ->
             // `evaluateJavascript` returns the value JSON-encoded, so
             // an HTML string comes back wrapped in quotes with escapes.
             // Parse via JSONObject to recover the raw HTML.
@@ -316,11 +489,24 @@ class ClipUrlController(
     }
 
     private fun finish(result: ClipUrlResult) {
+        if (completed) return
+        completed = true
         mainHandler.removeCallbacks(timeoutRunnable)
+        try {
+            // Persist any session the page established (interactive
+            // sign-in) so later headless clips reuse it.
+            CookieManager.getInstance().flush()
+        } catch (e: Exception) {
+            Log.w(TAG, "error flushing cookies after clip_url", e)
+        }
         try {
             webView?.stopLoading()
             webView?.webViewClient = WebViewClient()  // detach our delegate
             dialog?.dismiss()
+            webView?.let { wv ->
+                (wv.parent as? ViewGroup)?.removeView(wv)
+                wv.destroy()
+            }
         } catch (e: Exception) {
             Log.w(TAG, "error tearing down clip_url dialog", e)
         }
@@ -328,9 +514,6 @@ class ClipUrlController(
         webView = null
         completion(result)
     }
-
-    private fun dp(units: Int): Int =
-        (units * activity.resources.displayMetrics.density + 0.5f).toInt()
 
     /** Parse `#rrggbb` into an Android ARGB int; null on malformed input. */
     private fun parseHexColor(s: String): Int? {

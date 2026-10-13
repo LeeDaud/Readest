@@ -1,4 +1,5 @@
 import { SystemSettings } from './settings';
+import type { RssFeed } from '@/types/rss';
 import { Book, BookConfig, BookContent, ImportBookOptions, ViewSettings } from './book';
 import { BookMetadata } from '@/libs/document';
 import type { BookNav } from '@/services/nav';
@@ -15,9 +16,17 @@ export type AppPlatform = 'web' | 'tauri' | 'node';
 export type OsPlatform = 'android' | 'ios' | 'macos' | 'windows' | 'linux' | 'unknown';
 // biome-ignore format: keep the union members compact on a single line
 export type BaseDir = | 'Books' | 'Settings' | 'Data' | 'Fonts' | 'Images' | 'Dictionaries' | 'Log' | 'Cache' | 'Temp' | 'None';
-export type DeleteAction = 'cloud' | 'local' | 'both';
+export type DeleteAction = 'cloud' | 'local' | 'both' | 'purge';
 export type SelectDirectoryMode = 'read' | 'write';
 export type DistChannel = 'readest' | 'playstore' | 'appstore' | 'unknown';
+
+export interface DictionaryImportProgress {
+  stage: string;
+  completed: number;
+  total?: number;
+}
+
+export type DictionaryImportProgressHandler = (progress: DictionaryImportProgress) => void;
 
 export type ResolvedPath = {
   baseDir: number;
@@ -41,7 +50,7 @@ export type FileInfo = {
 };
 
 export type NativeTouchEventType = {
-  type: 'touchstart' | 'touchcancel' | 'touchend';
+  type: 'touchstart' | 'touchmove' | 'touchcancel' | 'touchend';
   pointerId: number;
   x: number;
   y: number;
@@ -55,17 +64,27 @@ export interface FileSystem {
   getURL(path: string): string;
   getBlobURL(path: string, base: BaseDir): Promise<string>;
   getImageURL(path: string): Promise<string>;
-  openFile(path: string, base: BaseDir, filename?: string): Promise<File>;
+  openFile(path: string, base: BaseDir, filename?: string, fetcher?: typeof fetch): Promise<File>;
   copyFile(srcPath: string, srcBase: BaseDir, dstPath: string, dstBase: BaseDir): Promise<void>;
   readFile(path: string, base: BaseDir, mode: 'text' | 'binary'): Promise<string | ArrayBuffer>;
   writeFile(path: string, base: BaseDir, content: string | ArrayBuffer | File): Promise<void>;
   removeFile(path: string, base: BaseDir): Promise<void>;
-  readDir(path: string, base: BaseDir): Promise<FileItem[]>;
+  readDir(path: string, base: BaseDir, extensions?: string[]): Promise<FileItem[]>;
   createDir(path: string, base: BaseDir, recursive?: boolean): Promise<void>;
   removeDir(path: string, base: BaseDir, recursive?: boolean): Promise<void>;
   exists(path: string, base: BaseDir): Promise<boolean>;
   stats(path: string, base: BaseDir): Promise<FileInfo>;
   getPrefix(base: BaseDir): Promise<string>;
+}
+
+export interface SaveLibraryBooksOptions {
+  /**
+   * Overwrite `library.json` with exactly the given set, allowing it to shrink.
+   * Reserved for deliberate, authoritative rewrites (tombstone GC, explicit
+   * "clear library", account reset). Routine saves must NOT set this — the
+   * default merge-floor protects against silently dropping books on disk.
+   */
+  replace?: boolean;
 }
 
 export interface AppService {
@@ -81,6 +100,8 @@ export interface AppService {
   hasUpdater: boolean;
   hasOrientationLock: boolean;
   hasScreenBrightness: boolean;
+  /** True when a hardware ambient light sensor can drive Ambient Mode. */
+  hasAmbientLightSensor: boolean;
   hasIAP: boolean;
   isMobile: boolean;
   isAppDataSandbox: boolean;
@@ -89,18 +110,33 @@ export interface AppService {
   isIOSApp: boolean;
   isMacOSApp: boolean;
   isLinuxApp: boolean;
+  isWindowsApp: boolean;
   isPortableApp: boolean;
   isDesktopApp: boolean;
   isAppImage: boolean;
   isEink: boolean;
   canCustomizeRootDir: boolean;
   canReadExternalDir: boolean;
+  supportsCoverThumbnailOptimization: boolean;
   supportsCanvasContext2DFilter: boolean;
+  supportsViewTransitionsAPI: boolean;
+  supportsViewTransitionGroup: boolean;
   distChannel: DistChannel;
   storefrontRegionCode: string | null;
   isOnlineCatalogsAccessible: boolean;
 
+  /**
+   * The configured library root when it turned out to be unreachable this
+   * session (deleted, unplugged, or sandbox-denied); null when the root is
+   * fine. Set during `init` so the UI can name the folder in an error instead
+   * of failing silently. The setting itself is left untouched, so a drive that
+   * comes back is picked up on the next launch.
+   */
+  unavailableRootDir: string | null;
+
   init(): Promise<void>;
+  /** Probe the configured library root. Resolves false instead of throwing. */
+  isRootDirUsable(): Promise<boolean>;
   openFile(path: string, base: BaseDir): Promise<File>;
   copyFile(srcPath: string, srcBase: BaseDir, dstPath: string, dstBase: BaseDir): Promise<void>;
   readFile(path: string, base: BaseDir, mode: 'text' | 'binary'): Promise<string | ArrayBuffer>;
@@ -110,6 +146,7 @@ export interface AppService {
   deleteDir(path: string, base: BaseDir, recursive?: boolean): Promise<void>;
   exists(path: string, base: BaseDir): Promise<boolean>;
   isDirectory(path: string, base: BaseDir): Promise<boolean>;
+  stats(path: string, base: BaseDir): Promise<FileInfo>;
   getImageURL(path: string): Promise<string>;
 
   setCustomRootDir(customRootDir: string): Promise<void>;
@@ -117,7 +154,7 @@ export interface AppService {
   getCachedImageUrl(pathOrUrl: string): Promise<string>;
   selectDirectory(mode: SelectDirectoryMode): Promise<string>;
   selectFiles(name: string, extensions: string[]): Promise<string[]>;
-  readDirectory(path: string, base: BaseDir): Promise<FileItem[]>;
+  readDirectory(path: string, base: BaseDir, extensions?: string[]): Promise<FileItem[]>;
   /**
    * Best-effort: extend the Tauri `fs_scope` and `asset_protocol_scope`
    * to cover the given paths. No-op on web. Used after a directory or
@@ -127,9 +164,12 @@ export interface AppService {
    * the current session.
    */
   allowPathsInScopes?(paths: string[], isDirectory: boolean): Promise<void>;
+  // Pass `null` for `content` when `options.filePath` already points to the
+  // file on disk you want to save/share — the native share path reads it
+  // directly instead of buffering an in-memory copy.
   saveFile(
     filename: string,
-    content: string | ArrayBuffer,
+    content: string | ArrayBuffer | null,
     options?: {
       filePath?: string;
       mimeType?: string;
@@ -141,6 +181,9 @@ export interface AppService {
       sharePosition?: { x: number; y: number; preferredEdge?: 'top' | 'bottom' | 'left' | 'right' };
     },
   ): Promise<boolean>;
+  // Save an image into the system photo gallery (Android MediaStore). Returns
+  // false on platforms without a gallery (web/desktop) or on failure.
+  saveImageToGallery(filename: string, content: ArrayBuffer, mimeType: string): Promise<boolean>;
 
   getDefaultViewSettings(): ViewSettings;
   loadSettings(): Promise<SystemSettings>;
@@ -152,12 +195,14 @@ export interface AppService {
   importDictionaries(
     files: SelectedFile[],
     existingDictionaries?: ImportedDictionary[],
+    onProgress?: DictionaryImportProgressHandler,
   ): Promise<ImportDictionariesResult>;
   deleteDictionary(dict: ImportedDictionary): Promise<void>;
   importBook(file: string | File, books: Book[], options?: ImportBookOptions): Promise<Book | null>;
   refreshBookMetadata(book: Book): Promise<boolean>;
   deleteBook(book: Book, deleteAction: DeleteAction): Promise<void>;
   uploadBook(book: Book, onProgress?: ProgressHandler): Promise<void>;
+  uploadBookCover(book: Book, onProgress?: ProgressHandler): Promise<void>;
   downloadBook(
     book: Book,
     onlyCover?: boolean,
@@ -171,6 +216,7 @@ export interface AppService {
     handleProgress: ProgressHandler,
     hash: string,
     temp?: boolean,
+    media?: string,
   ): Promise<string | undefined>;
   uploadReplicaFile(
     kind: string,
@@ -199,12 +245,17 @@ export interface AppService {
   loadBookNav(book: Book): Promise<BookNav | null>;
   saveBookNav(book: Book, nav: BookNav): Promise<void>;
   loadBookContent(book: Book): Promise<BookContent>;
+  resolveNativeBookFilePath(book: Book): Promise<string | null>;
+  loadFeeds(): Promise<RssFeed[]>;
+  saveFeeds(feeds: RssFeed[]): Promise<void>;
   loadLibraryBooks(): Promise<Book[]>;
-  saveLibraryBooks(books: Book[]): Promise<void>;
+  requestCoverThumbnail(book: Book): void;
+  saveLibraryBooks(books: Book[], options?: SaveLibraryBooksOptions): Promise<void>;
   getCoverImageUrl(book: Book): string;
   getCoverImageBlobUrl(book: Book): Promise<string>;
   generateCoverImageUrl(book: Book): Promise<string>;
   updateCoverImage(book: Book, imageUrl?: string, imageFile?: string): Promise<void>;
+  computeCoverHash(book: Book): Promise<string | null>;
   ask(message: string): Promise<boolean>;
   openDatabase(
     schema: SchemaType,
@@ -212,4 +263,7 @@ export interface AppService {
     base: BaseDir,
     opts?: DatabaseOpts,
   ): Promise<DatabaseService>;
+  installDatabase(path: string, base: BaseDir, source: File): Promise<void>;
+  databaseExists(path: string, base: BaseDir): Promise<boolean>;
+  deleteDatabase(path: string, base: BaseDir): Promise<void>;
 }

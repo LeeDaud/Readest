@@ -1,5 +1,5 @@
 import React from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import { MdArrowBack } from 'react-icons/md';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
@@ -9,21 +9,32 @@ import { LibraryGroupByType } from '@/types/settings';
 interface GroupHeaderProps {
   groupBy: LibraryGroupByType;
   groupName: string;
+  /** True when `groupName` is an i18n key (status groups) rather than user text. */
+  localized?: boolean;
 }
 
 /**
- * Header component displayed when viewing books inside a series or author group.
+ * Header component displayed when viewing books inside a virtual group.
  * Shows the group type, group name, and a back button to return to the main bookshelf.
  */
-const GroupHeader: React.FC<GroupHeaderProps> = ({ groupBy, groupName }) => {
+const GroupHeader: React.FC<GroupHeaderProps> = ({ groupBy, groupName, localized }) => {
   const _ = useTranslation();
   const router = useRouter();
-  const searchParams = useSearchParams();
   const iconSize = useResponsiveSize(20);
 
   const handleBack = () => {
-    const params = new URLSearchParams(searchParams?.toString());
-    params.delete('group');
+    const params = new URLSearchParams(window.location.search);
+    // Set `group` to an empty string instead of deleting it. After a cold start
+    // the URL inside a series/author folder is just `?group=X` (groupBy comes
+    // from settings, not the URL), so deleting `group` would leave an empty
+    // search string — and `router.replace('/library')` with an empty search
+    // silently no-ops under the Next.js 16.2 static export, leaving the back
+    // button dead (#4437). This mirrors the workaround in
+    // `handleLibraryNavigation` (see page.tsx, originally #3782/#3832): the
+    // resulting `/library?group=` does commit, and the trailing empty `group=`
+    // is stripped cosmetically by the cleanup effect in page.tsx.
+    params.set('group', '');
+    params.delete('shelf');
     navigateToLibrary(router, params.toString());
   };
 
@@ -34,6 +45,12 @@ const GroupHeader: React.FC<GroupHeaderProps> = ({ groupBy, groupName }) => {
         return _('Series');
       case LibraryGroupByType.Author:
         return _('Author');
+      case LibraryGroupByType.Tag:
+        return _('Tag');
+      case LibraryGroupByType.Subject:
+        return _('Subject');
+      case LibraryGroupByType.Status:
+        return _('Status');
       default:
         return _('Group');
     }
@@ -50,7 +67,9 @@ const GroupHeader: React.FC<GroupHeaderProps> = ({ groupBy, groupName }) => {
       </button>
       <div className='flex items-center gap-2 overflow-hidden'>
         <span className='text-neutral-content text-sm'>{getGroupTypeLabel()}:</span>
-        <span className='truncate text-base font-medium'>{groupName}</span>
+        <span className='truncate text-base font-medium'>
+          {localized ? _(groupName) : groupName}
+        </span>
       </div>
     </div>
   );

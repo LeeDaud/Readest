@@ -110,6 +110,10 @@ export class NativeFile extends File implements ClosableFile {
     return this.#lastModified;
   }
 
+  getNativeLocation(): { path: string; baseDir: BaseDirectory | null } {
+    return { path: this.#fp, baseDir: this.#baseDir };
+  }
+
   async stat() {
     return this.#handle?.stat();
   }
@@ -279,6 +283,7 @@ export class NativeFile extends File implements ClosableFile {
 
 export class RemoteFile extends File implements ClosableFile {
   url: string;
+  #fetch: typeof fetch;
   #name: string;
   #lastModified: number;
   #size: number = -1;
@@ -286,17 +291,55 @@ export class RemoteFile extends File implements ClosableFile {
   #order: number[] = [];
   #cache: Map<number, ArrayBuffer> = new Map(); // LRU cache
   #pendingFetches: Map<string, Promise<ArrayBuffer>> = new Map();
+  // When true, byte ranges are carried in the URL query (?start=&end=) instead
+  // of a `Range` header — see fromNativePath().
+  #queryRange = false;
 
   static MAX_CACHE_CHUNK_SIZE = 1024 * 128;
   static MAX_CACHE_ITEMS_SIZE: number = 128;
+  static RANGE_SCHEME_ORIGIN = 'http://rangefile.localhost';
+  // Bounded concurrency for multi-chunk fetchRange() reads (see fetchRange).
+  static MAX_PARALLEL_RANGE_FETCHES = 4;
 
-  constructor(url: string, name?: string, type = '', lastModified = Date.now()) {
+  constructor(url: string, name?: string, type = '', lastModified = Date.now(), fetcher = fetch) {
     const basename = url.split('/').pop() || 'remote-file';
     super([], name || basename, { type, lastModified });
     this.url = url;
+    this.#fetch = fetcher;
     this.#name = name || basename;
     this.#type = type;
     this.#lastModified = lastModified;
+  }
+
+  /**
+   * Read a local file path through the `rangefile` custom URI scheme, carrying
+   * the byte range in the URL query (`?path=&start=&end=`) rather than a
+   * `Range` request header.
+   *
+   * On Android the WebView re-applies a `Range` header's offset to the body
+   * returned from an intercepted custom protocol (Chromium 40739128;
+   * tauri-apps/tauri#12019, #3725), corrupting any non-zero-start read — so the
+   * asset protocol can't back `RemoteFile` there. A query-carried range has no
+   * `Range` header, so the WebView delivers the 200 body verbatim while the
+   * bytes still stream through the network stack (not the slow Tauri IPC
+   * bridge). The Rust handler is scope-gated by `asset_protocol_scope`.
+   */
+  static fromNativePath(absolutePath: string, name?: string): RemoteFile {
+    const url = `${RemoteFile.RANGE_SCHEME_ORIGIN}/?path=${encodeURIComponent(absolutePath)}`;
+    const file = new RemoteFile(url, name);
+    file.#queryRange = true;
+    return file;
+  }
+
+  /**
+   * Invoke the fetcher unbound. `this.#fetch(...)` would run the default
+   * `window.fetch` with this File as `this`, which Chromium and WebKit reject
+   * with "Illegal invocation" — the web build and the desktop fast path both
+   * rely on that default.
+   */
+  #call(input: string, init?: RequestInit): Promise<Response> {
+    const fetcher = this.#fetch;
+    return fetcher(input, init);
   }
 
   override get name() {
@@ -316,7 +359,7 @@ export class RemoteFile extends File implements ClosableFile {
   }
 
   async _open_with_head() {
-    const response = await fetch(this.url, { method: 'HEAD' });
+    const response = await this.#call(this.url, { method: 'HEAD' });
     if (!response.ok) {
       throw new Error(`Failed to fetch file size: ${response.status}`);
     }
@@ -326,7 +369,7 @@ export class RemoteFile extends File implements ClosableFile {
   }
 
   async _open_with_range() {
-    const response = await fetch(this.url, { headers: { Range: `bytes=${0}-${1023}` } });
+    const response = await this.#call(this.url, { headers: { Range: `bytes=${0}-${1023}` } });
     if (!response.ok) {
       throw new Error(`Failed to fetch file size: ${response.status}`);
     }
@@ -335,7 +378,22 @@ export class RemoteFile extends File implements ClosableFile {
     return this;
   }
 
+  async _open_with_query() {
+    // No `Range` header — the rangefile handler returns the file size in
+    // `X-Total-Size` and the requested bytes as a plain 200 body.
+    const response = await this.#call(`${this.url}&start=0&end=0`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch file size: ${response.status}`);
+    }
+    this.#size = Number(response.headers.get('x-total-size'));
+    this.#type = response.headers.get('content-type') || '';
+    return this;
+  }
+
   async open() {
+    if (this.#queryRange) {
+      return this._open_with_query();
+    }
     // FIXME: currently HEAD request in asset protocol is not supported on Android
     if (getOSPlatform() === 'android') {
       return this._open_with_range();
@@ -353,7 +411,9 @@ export class RemoteFile extends File implements ClosableFile {
     start = Math.max(0, start);
     end = Math.min(this.size - 1, end);
     // console.log(`Fetching range: ${start}-${end}, size: ${end - start + 1}`);
-    const response = await fetch(this.url, { headers: { Range: `bytes=${start}-${end}` } });
+    const response = this.#queryRange
+      ? await this.#call(`${this.url}&start=${start}&end=${end}`)
+      : await this.#call(this.url, { headers: { Range: `bytes=${start}-${end}` } });
     if (!response.ok) {
       throw new Error(`Failed to fetch range: ${response.status}`);
     }
@@ -366,11 +426,31 @@ export class RemoteFile extends File implements ClosableFile {
     const MAX_RANGE_LEN = 1024 * 1000;
 
     if (rangeSize > MAX_RANGE_LEN) {
-      const buffers: ArrayBuffer[] = [];
+      // The chunks are independent range requests; issue them with bounded
+      // concurrency instead of one-by-one. On Android every chunk is a
+      // scheme round trip through the WebView network stack, so a multi-MB
+      // read (e.g. a large EPUB's central directory) used to serialize N
+      // fetches behind each other. Each result is written into its
+      // preallocated slot so chunk order is preserved.
+      const starts: number[] = [];
       for (let currentStart = start; currentStart <= end; currentStart += MAX_RANGE_LEN) {
-        const currentEnd = Math.min(currentStart + MAX_RANGE_LEN - 1, end);
-        buffers.push(await this.fetchRangePart(currentStart, currentEnd));
+        starts.push(currentStart);
       }
+      const buffers: ArrayBuffer[] = new Array(starts.length);
+      let next = 0;
+      await Promise.all(
+        Array.from(
+          { length: Math.min(RemoteFile.MAX_PARALLEL_RANGE_FETCHES, starts.length) },
+          async () => {
+            while (next < starts.length) {
+              const index = next++;
+              const currentStart = starts[index]!;
+              const currentEnd = Math.min(currentStart + MAX_RANGE_LEN - 1, end);
+              buffers[index] = await this.fetchRangePart(currentStart, currentEnd);
+            }
+          },
+        ),
+      );
       const totalSize = buffers.reduce((sum, buffer) => sum + buffer.byteLength, 0);
       const combinedBuffer = new Uint8Array(totalSize);
       let offset = 0;
@@ -385,7 +465,12 @@ export class RemoteFile extends File implements ClosableFile {
       const cachedChunkStart = Array.from(this.#cache.keys()).find((chunkStart) => {
         const buffer = this.#cache.get(chunkStart)!;
         const bufferSize = buffer.byteLength;
-        return start >= chunkStart && end <= chunkStart + bufferSize;
+        // `end` is inclusive, so the cached chunk's last byte is at
+        // `chunkStart + bufferSize - 1`. Accepting `end === chunkStart +
+        // bufferSize` here would take the cache branch for a range whose last
+        // byte the chunk doesn't hold, and `buffer.slice` clamps rather than
+        // throws — the caller silently gets one byte less than it asked for.
+        return start >= chunkStart && end < chunkStart + bufferSize;
       });
       if (cachedChunkStart !== undefined) {
         this.#updateAccessOrder(cachedChunkStart);

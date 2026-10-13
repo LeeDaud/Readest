@@ -7,6 +7,8 @@ import StoreKit
 import SwiftRs
 import Tauri
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
+import UniformTypeIdentifiers
 import WebKit
 import os
 
@@ -29,10 +31,19 @@ func getLocalizedDisplayName(familyName: String) -> String? {
 
 class SafariAuthRequestArgs: Decodable {
   let authUrl: String
+  // ASWebAuthenticationSession callback scheme. Defaults to "readest" (the
+  // Supabase login); the Google Drive flow passes its reverse-DNS scheme so the
+  // session intercepts that redirect instead.
+  let callbackScheme: String?
 }
 
 class UseBackgroundAudioRequestArgs: Decodable {
   let enabled: Bool
+}
+
+class SetSelectionSuppressedRequestArgs: Decodable {
+  let target: String
+  let suppressed: Bool
 }
 
 class SetSystemUIVisibilityRequestArgs: Decodable {
@@ -51,13 +62,27 @@ class LockScreenOrientationRequestArgs: Decodable {
   let orientation: String?
 }
 
+class SetScreenWakeLockRequestArgs: Decodable {
+  let enabled: Bool
+}
+
 class SetScreenBrightnessRequestArgs: Decodable {
   let brightness: Float?
+  let persist: Bool?
 }
 
 class CopyUriToPathRequestArgs: Decodable {
   let uri: String?
   let dst: String?
+}
+
+class ReadShareClipHtmlArgs: Decodable {
+  let fileName: String
+}
+
+struct ICloudEnsureDownloadedArgs: Decodable {
+  let path: String
+  let timeoutMs: Int?
 }
 
 struct InitializeRequest: Decodable {
@@ -70,6 +95,7 @@ struct FetchProductsRequest: Decodable {
 
 struct PurchaseProductRequest: Decodable {
   let productId: String
+  let appAccountToken: String?
 }
 
 struct ProductData: Codable {
@@ -100,6 +126,56 @@ class VolumeKeyHandler: NSObject {
   private(set) var isIntercepting = false
   private var webView: WKWebView?
   private var volumeSlider: UISlider?
+  private var ttsOwnsAudioSession = false
+  private var ttsSessionObservers: [NSObjectProtocol] = []
+
+  override init() {
+    super.init()
+    // tauri-plugin-native-tts announces claim/release of the shared audio
+    // session (see claimAudioSession/deactivateRemoteCommands there). While
+    // TTS owns it (playing or paused), interception must not reconfigure the
+    // session: flipping the non-mixable .playback claim to .mixWithOthers
+    // makes the app ineligible for the Now Playing slot (lock-screen card
+    // dismissed, AirPod controls fall through to another app). Volume KVO
+    // works on the TTS-held session as-is.
+    let center = NotificationCenter.default
+    ttsSessionObservers.append(
+      center.addObserver(
+        forName: Notification.Name("ReadestTTSAudioSessionClaimed"), object: nil, queue: .main
+      ) { [weak self] _ in
+        self?.ttsOwnsAudioSession = true
+      })
+    ttsSessionObservers.append(
+      center.addObserver(
+        forName: Notification.Name("ReadestTTSAudioSessionReleased"), object: nil, queue: .main
+      ) { [weak self] _ in
+        guard let self = self else { return }
+        self.ttsOwnsAudioSession = false
+        // TTS teardown deactivated the session, and it is unordered relative
+        // to a (re)start of interception. If interception is live, re-own the
+        // session so volume KVO keeps firing.
+        if self.isIntercepting {
+          self.configureAudioSession()
+        }
+      })
+  }
+
+  deinit {
+    for observer in ttsSessionObservers {
+      NotificationCenter.default.removeObserver(observer)
+    }
+  }
+
+  private func configureAudioSession() {
+    // TTS holds an active non-mixable session; leave it untouched (see init).
+    if ttsOwnsAudioSession { return }
+    do {
+      try audioSession?.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+      try audioSession?.setActive(true)
+    } catch {
+      logger.error("Failed to activate audio session: \(error)")
+    }
+  }
 
   func startInterception(webView: WKWebView) {
     if isIntercepting {
@@ -111,12 +187,7 @@ class VolumeKeyHandler: NSObject {
     isIntercepting = true
 
     audioSession = AVAudioSession.sharedInstance()
-    do {
-      try audioSession?.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-      try audioSession?.setActive(true)
-    } catch {
-      logger.error("Failed to activate audio session: \(error)")
-    }
+    configureAudioSession()
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
       guard let self = self else { return }
@@ -229,6 +300,124 @@ class MediaKeyHandler {
       self?.webView?.evaluateJavaScript(
         "try { window.onNativeKeyDown('\(name)', 0); } catch (_) {}", completionHandler: nil)
     }
+  }
+}
+
+// Forwards Apple Pencil gestures to JS as native page-turner keys (#5501).
+// Double tap: Pencil 2 / Pro; squeeze: Pencil Pro on iPadOS 17.5+. The
+// system-level pencil preference is honored when set to Off (.ignore); any
+// other preferred action fires the user's in-app binding, since Readest has
+// no drawing tools the system actions could apply to. Unlike MediaKeyHandler
+// this is passive (no MPRemoteCommandCenter claim, never fires on iPhone),
+// so it stays attached for the app's lifetime.
+class PencilGestureHandler: NSObject, UIPencilInteractionDelegate {
+  private weak var webView: WKWebView?
+
+  init(webView: WKWebView) {
+    self.webView = webView
+  }
+
+  // iOS 15.0-17.4 double tap; on 17.5+ the system calls didReceiveTap instead.
+  @available(iOS, deprecated: 17.5)
+  func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+    guard UIPencilInteraction.preferredTapAction != .ignore else { return }
+    forward("PencilDoubleTap")
+  }
+
+  @available(iOS 17.5, *)
+  func pencilInteraction(
+    _ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap
+  ) {
+    guard UIPencilInteraction.preferredTapAction != .ignore else { return }
+    forward("PencilDoubleTap")
+  }
+
+  @available(iOS 17.5, *)
+  func pencilInteraction(
+    _ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze
+  ) {
+    guard squeeze.phase == .ended else { return }
+    guard UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
+    forward("PencilSqueeze")
+  }
+
+  private func forward(_ name: String) {
+    DispatchQueue.main.async { [weak self] in
+      self?.webView?.evaluateJavaScript(
+        "try { window.onNativeKeyDown('\(name)', 0); } catch (_) {}", completionHandler: nil)
+    }
+  }
+}
+
+// WebKit suppresses DOM touchmove AND touchend near native selection handles
+// (311216@main, iPadOS 27). Observe the UIKit stream without recognizing or
+// preventing a gesture, so the reader can dwell at an edge and cancel on release.
+private final class SelectionTouchObserver: UIGestureRecognizer {
+  private weak var webView: WKWebView?
+  private var trackedTouch: UITouch?
+  private var lastMoveTime: TimeInterval = 0
+
+  init(webView: WKWebView) {
+    self.webView = webView
+    super.init(target: nil, action: nil)
+    cancelsTouchesInView = false
+    delaysTouchesBegan = false
+    delaysTouchesEnded = false
+    allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+  }
+
+  override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+  override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+    false
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    // A second finger is a pinch, not a selection-handle drag.
+    guard trackedTouch == nil, touches.count == 1, let touch = touches.first else {
+      if let touch = trackedTouch { forward("touchcancel", touch: touch) }
+      state = .failed
+      return
+    }
+    trackedTouch = touch
+    lastMoveTime = 0
+    forward("touchstart", touch: touch)
+  }
+
+  override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+    guard let touch = trackedTouch, touches.contains(touch) else { return }
+    // Match Android's ~10/s bridge rate; start/end/cancel are never throttled.
+    guard touch.timestamp - lastMoveTime >= 0.1 else { return }
+    lastMoveTime = touch.timestamp
+    forward("touchmove", touch: touch)
+  }
+
+  override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+    guard let touch = trackedTouch, touches.contains(touch) else { return }
+    forward("touchend", touch: touch)
+    state = .failed
+  }
+
+  override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+    if let touch = trackedTouch { forward("touchcancel", touch: touch) }
+    state = .failed
+  }
+
+  override func reset() {
+    trackedTouch = nil
+    super.reset()
+  }
+
+  private func forward(_ type: String, touch: UITouch) {
+    guard let webView = webView else { return }
+    let point = touch.location(in: webView)
+    // The shared native-touch contract uses device pixels, not UIKit points.
+    let scale = webView.window?.screen.scale ?? UIScreen.main.scale
+    webView.evaluateJavaScript(
+      """
+      window.onNativeTouch?.({type: '\(type)', pointerId: 0,
+        x: \(point.x * scale), y: \(point.y * scale), pressure: \(touch.force),
+        pointerCount: 1, timestamp: \(touch.timestamp * 1000)});
+      """, completionHandler: nil)
   }
 }
 
@@ -459,11 +648,34 @@ extension WebViewLifecycleManager: WKNavigationDelegate {
 
 class NativeBridgePlugin: Plugin {
   private var webView: WKWebView?
+  // Native cover for the two-column page curl (#6106): a snapshot view of a
+  // region, placed as a sibling above the webview so `capture_webview_region`
+  // (which renders the webview's own layer tree) does not see it while the
+  // user keeps seeing the frozen pixels. Tokens keep a stale uncover from an
+  // interrupted turn from removing the next turn's cover.
+  private var turnCoverView: UIView?
+  private var turnCoverToken: Int = 0
   private var authSession: ASWebAuthenticationSession?
   private var currentOrientationMask: UIInterfaceOrientationMask = .all
   private var originalDelegate: UIApplicationDelegate?
   private var webViewLifecycleManager: WebViewLifecycleManager?
+  private var pencilGestureHandler: PencilGestureHandler?
   private var traitChangeRegistered = false
+  // The in-app browser currently presented by `open_web_browser` (#5775);
+  // `set_web_browser_status` pushes import results into its banner.
+  private weak var activeWebBrowser: WebBrowserController?
+
+  // Screen-brightness management. `UIScreen.main.brightness` is a *global*
+  // device setting, not a per-window one: once the app writes to it, iOS
+  // suppresses ambient auto-brightness and the override survives backgrounding,
+  // leaving the system stuck at the app's level until the user nudges it
+  // manually (issue #4885). We remember the value that was there before the
+  // first override so we can hand it back whenever the app leaves the
+  // foreground; on return the override is re-applied over the fresh system
+  // value. A `persist` write (System Screen Brightness mode) is not an override:
+  // it becomes the system brightness and is never handed back (#6374).
+  private var appDesiredBrightness: CGFloat?
+  private var systemBrightnessBeforeOverride: CGFloat?
 
   @objc public override func load(webview: WKWebView) {
     self.webView = webview
@@ -472,6 +684,7 @@ class NativeBridgePlugin: Plugin {
     // Suppress the iOS system text-selection edit menu so it never
     // covers Readest's annotation toolbar. See ContextMenuSuppressor.
     ContextMenuSuppressor.installIfNeeded()
+    webview.addGestureRecognizer(SelectionTouchObserver(webView: webview))
 
     // Register a WKScriptMessageHandler so JS can signal when its
     // share-extension hook has mounted. On `{type: 'ready'}` we run a
@@ -484,6 +697,14 @@ class NativeBridgePlugin: Plugin {
     webViewLifecycleManager = WebViewLifecycleManager()
     webViewLifecycleManager?.startMonitoring(webView: webview)
     logger.log("NativeBridgePlugin: WebView lifecycle monitoring activated")
+
+    // Forward Apple Pencil double-tap / squeeze gestures as native keys for
+    // the hardware page turner (#5501).
+    let pencilHandler = PencilGestureHandler(webView: webview)
+    pencilGestureHandler = pencilHandler
+    let pencilInteraction = UIPencilInteraction()
+    pencilInteraction.delegate = pencilHandler
+    webview.addInteraction(pencilInteraction)
 
     // The WKWebView never fires the `prefers-color-scheme` media query
     // `change` event while the app stays foregrounded, so observe the
@@ -509,6 +730,13 @@ class NativeBridgePlugin: Plugin {
 
     NotificationCenter.default.addObserver(
       self,
+      selector: #selector(appWillResignActive),
+      name: UIApplication.willResignActiveNotification,
+      object: nil
+    )
+
+    NotificationCenter.default.addObserver(
+      self,
       selector: #selector(appWillEnterForeground),
       name: UIApplication.willEnterForegroundNotification,
       object: nil
@@ -520,6 +748,13 @@ class NativeBridgePlugin: Plugin {
     } else {
       Logger.error("NativeBridgePlugin: Failed to get shared application")
     }
+
+    // Re-acquire security-scoped access for every external library
+    // folder the user registered in a previous session. Done here in
+    // `load` so the WebView can issue fs reads against those paths as
+    // soon as the JS layer comes up. See `FolderBookmarkStore`
+    // for the why and how.
+    FolderBookmarkStore.restoreAllPersisted()
   }
 
   @objc func appWillEnterForeground() {
@@ -528,6 +763,13 @@ class NativeBridgePlugin: Plugin {
   }
 
   @objc func appDidBecomeActive() {
+    // Re-capture the system value (the user may have changed it in Control
+    // Center) and re-apply the override. Control Center only resigns active and
+    // never fires `visibilitychange`, so JS can't re-apply it here (#6374).
+    if let desired = appDesiredBrightness {
+      systemBrightnessBeforeOverride = UIScreen.main.brightness
+      UIScreen.main.brightness = desired
+    }
     if volumeKeyHandler != nil {
       activateVolumeKeyInterception()
     }
@@ -592,6 +834,7 @@ class NativeBridgePlugin: Plugin {
           "url": save.url,
           "groupId": save.groupId,
           "groupName": save.groupName,
+          "htmlFile": save.htmlFile,
           "addedAt": save.addedAt,
         ]
       }
@@ -642,6 +885,13 @@ class NativeBridgePlugin: Plugin {
       webView.evaluateJavaScript(
         "try { window.onNativeColorSchemeChange && window.onNativeColorSchemeChange('\(colorScheme)'); } catch (_) {}",
         completionHandler: nil)
+    }
+  }
+
+  // iOS ignores brightness writes once the app has resigned the foreground.
+  @objc func appWillResignActive() {
+    if appDesiredBrightness != nil, let original = systemBrightnessBeforeOverride {
+      UIScreen.main.brightness = original
     }
   }
 
@@ -739,6 +989,10 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  // OBSOLETE for TTS (no JS callers since 2026-07): the native-tts plugin now
+  // claims the audio session itself (non-mixable .playback/.spokenAudio) when
+  // its media session activates. The .mixWithOthers set here disqualifies the
+  // app from Now Playing — do not reintroduce calls around TTS playback.
   @objc public func use_background_audio(_ invoke: Invoke) {
     do {
       let args = try invoke.parseArgs(UseBackgroundAudioRequestArgs.self)
@@ -759,11 +1013,27 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  // Suppress a piece of the OS selection UI. target "gesture": the long-press
+  // text selection for non-editable content, while instant-highlight owns the
+  // hold (see TextSelectionSuppressor). target "menu" is a no-op here — the
+  // iOS selection menu is suppressed unconditionally by ContextMenuSuppressor,
+  // which probes editability natively at menu-build time.
+  @objc public func set_selection_suppressed(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(SetSelectionSuppressedRequestArgs.self)
+    if args.target == "gesture" {
+      DispatchQueue.main.async {
+        TextSelectionSuppressor.setSuppressed(args.suppressed)
+      }
+    }
+    invoke.resolve()
+  }
+
   @objc public func auth_with_safari(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(SafariAuthRequestArgs.self)
     let authUrl = URL(string: args.authUrl)!
+    let callbackScheme = args.callbackScheme ?? "readest"
 
-    authSession = ASWebAuthenticationSession(url: authUrl, callbackURLScheme: "readest") {
+    authSession = ASWebAuthenticationSession(url: authUrl, callbackURLScheme: callbackScheme) {
       [weak self] callbackURL, error in
       guard let strongSelf = self else { return }
 
@@ -794,21 +1064,61 @@ class NativeBridgePlugin: Plugin {
     let darkMode = args.darkMode
 
     DispatchQueue.main.async {
-      UIApplication.shared.setStatusBarHidden(!visible, with: .none)
-
-      let windows = UIApplication.shared.connectedScenes
-        .compactMap { $0 as? UIWindowScene }
-        .flatMap { $0.windows }
-
-      let keyWindow = windows.first(where: { $0.isKeyWindow }) ?? windows.first
-      if let keyWindow = keyWindow {
-        keyWindow.overrideUserInterfaceStyle = darkMode ? .dark : .light
-        keyWindow.layoutIfNeeded()
-      } else {
+      guard let keyWindow = self.appWindow() else {
         logger.error("No key window found")
+        invoke.resolve(["success": false, "error": "No key window found"])
+        return
+      }
+      keyWindow.overrideUserInterfaceStyle = darkMode ? .dark : .light
+      let before = keyWindow.safeAreaInsets
+      // Apps built with the iOS 27 SDK can no longer hide the status bar with
+      // UIApplication.setStatusBarHidden (SDK 26 builds still can), so hide it
+      // through the root view controller. tao's TaoUIViewController implements
+      // prefersStatusBarHidden and setPrefersStatusBarHidden:, which calls
+      // setNeedsStatusBarAppearanceUpdate. Needs
+      // UIViewControllerBasedStatusBarAppearance = YES in Info.plist.
+      let applied = self.setPrefersStatusBarHidden(!visible, on: keyWindow.rootViewController)
+      keyWindow.layoutIfNeeded()
+      // The safe area follows the status bar a moment later (iPhone Duo's side
+      // strip is an 84pt inset on the inner display). Resolve once it has, so
+      // a follow-up get_safe_area_insets reads the insets for the new state.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        let after = keyWindow.safeAreaInsets
+        logger.log(
+          "set_system_ui_visibility visible=\(visible) insets before=\(NSCoder.string(for: before), privacy: .public) after=\(NSCoder.string(for: after), privacy: .public)"
+        )
+        if applied {
+          invoke.resolve(["success": true])
+        } else {
+          invoke.resolve(["success": false, "error": "Root view controller cannot hide the status bar"])
+        }
       }
     }
-    invoke.resolve(["success": true])
+  }
+
+  /// The window that hosts the webview. It exists even before tao's window has
+  /// a UIWindowScene (a CarPlay-first launch), so prefer it over the scene
+  /// lookup, which is the fallback.
+  private func appWindow() -> UIWindow? {
+    if let window = webView?.window { return window }
+    let windows = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+    return windows.first(where: { $0.isKeyWindow }) ?? windows.first
+  }
+
+  /// Returns false when the view controller does not respond to tao's
+  /// `setPrefersStatusBarHidden:`, so the caller can report the failure.
+  private func setPrefersStatusBarHidden(_ hidden: Bool, on viewController: UIViewController?) -> Bool {
+    let selector = NSSelectorFromString("setPrefersStatusBarHidden:")
+    guard let viewController = viewController, viewController.responds(to: selector) else {
+      logger.error("Root view controller cannot hide the status bar: \(String(describing: viewController))")
+      return false
+    }
+    typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+    let setter = unsafeBitCast(viewController.method(for: selector), to: Setter.self)
+    setter(viewController, selector, hidden)
+    return true
   }
 
   @objc public func get_sys_fonts_list(_ invoke: Invoke) throws {
@@ -840,10 +1150,19 @@ class NativeBridgePlugin: Plugin {
         if volumeKeys {
           self.activateVolumeKeyInterception()
         } else {
+          // Stop intercepting but KEEP the handler alive — do NOT nil it. Its
+          // ReadestTTSAudioSessionClaimed/Released observers must survive the
+          // play/pause cycle. usePagination releases interception the instant TTS
+          // starts playing (the `ttsPlaying` gate) — which is exactly when
+          // tauri-plugin-native-tts posts "Claimed" — and re-acquires it on
+          // pause. If the handler is destroyed here, that fire-once "Claimed" is
+          // lost, and the fresh handler built on the next pause has
+          // ttsOwnsAudioSession=false, so it reconfigures the TTS-owned session
+          // to .mixWithOthers. A mixable session is ineligible for Now Playing,
+          // so iOS vacates the slot and AirPods / lock-screen play resumes
+          // whatever app played before us. A single long-lived handler catches
+          // the claim and leaves the TTS session untouched.
           self.volumeKeyHandler?.stopInterception()
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.volumeKeyHandler = nil
-          }
         }
       }
 
@@ -979,7 +1298,9 @@ class NativeBridgePlugin: Plugin {
           return
         }
 
-        StoreKitManager.shared.purchase(product: product) { result in
+        StoreKitManager.shared.purchase(
+          product: product, appAccountToken: args.appAccountToken
+        ) { result in
           switch result {
           case .success(let txn):
             let purchase = PurchaseData(
@@ -1025,6 +1346,16 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  @objc public func set_screen_wake_lock(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(SetScreenWakeLockRequestArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async {
+      UIApplication.shared.isIdleTimerDisabled = args.enabled
+      invoke.resolve()
+    }
+  }
+
   @objc public func get_screen_brightness(_ invoke: Invoke) {
     let brightness = UIScreen.main.brightness
     invoke.resolve(["brightness": brightness])
@@ -1037,20 +1368,54 @@ class NativeBridgePlugin: Plugin {
 
     let brightness = args.brightness ?? 0.5
 
-    if brightness < 0.0 {
-      // Revert to system brightness - iOS doesn't have a direct "system brightness" setting
-      // We will restore the brightness that was set before the app modified it
-      return invoke.resolve(["success": true])
-    }
-
     if brightness > 1.0 {
       return invoke.reject("Brightness must be between 0.0 and 1.0")
     }
 
-    DispatchQueue.main.async {
-      UIScreen.main.brightness = CGFloat(brightness)
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      if brightness < 0.0 {
+        // A negative value means "release control back to the system", mirroring
+        // Android's BRIGHTNESS_OVERRIDE_NONE. Restore the pre-override brightness
+        // so iOS resumes ambient auto-brightness.
+        self.releaseBrightnessControl()
+      } else if args.persist == true {
+        self.appDesiredBrightness = nil
+        self.systemBrightnessBeforeOverride = nil
+        UIScreen.main.brightness = CGFloat(brightness)
+      } else {
+        if self.systemBrightnessBeforeOverride == nil {
+          self.systemBrightnessBeforeOverride = UIScreen.main.brightness
+        }
+        self.appDesiredBrightness = CGFloat(brightness)
+        UIScreen.main.brightness = CGFloat(brightness)
+      }
     }
     invoke.resolve(["success": true])
+  }
+
+  /// No public ambient-light API on iOS; Ambient Mode is Android-only.
+  @objc public func has_ambient_light_sensor(_ invoke: Invoke) {
+    invoke.resolve(["available": false])
+  }
+
+  @objc public func start_ambient_light_updates(_ invoke: Invoke) {
+    invoke.resolve(["success": false, "error": "unsupported"])
+  }
+
+  @objc public func stop_ambient_light_updates(_ invoke: Invoke) {
+    invoke.resolve(["success": true])
+  }
+
+  /// Restore the brightness captured before the app first overrode it so iOS
+  /// resumes ambient auto-brightness, then forget our managed state. Must run
+  /// on the main thread.
+  private func releaseBrightnessControl() {
+    if let original = systemBrightnessBeforeOverride {
+      UIScreen.main.brightness = original
+    }
+    appDesiredBrightness = nil
+    systemBrightnessBeforeOverride = nil
   }
 
   @objc public func copy_uri_to_path(_ invoke: Invoke) {
@@ -1126,15 +1491,48 @@ class NativeBridgePlugin: Plugin {
     }
   }
 
+  // iOS exposes no foldable API and the viewport size cannot identify the
+  // device, so iPhone Duo is recognized by its model identifier.
+  private static let iPhoneDuoModelIdentifiers: Set<String> = ["iPhone19,4"]
+
+  private static let isIPhoneDuo: Bool = {
+    let identifier: String
+    if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] {
+      identifier = simulated
+    } else {
+      var systemInfo = utsname()
+      uname(&systemInfo)
+      identifier = withUnsafePointer(to: &systemInfo.machine) {
+        $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+      }
+    }
+    return iPhoneDuoModelIdentifiers.contains(identifier)
+  }()
+
   @objc public func get_safe_area_insets(_ invoke: Invoke) {
     DispatchQueue.main.async {
-      if let window = UIApplication.shared.windows.first {
+      if let window = self.appWindow() {
         let insets = window.safeAreaInsets
+        // Rounded screen corners are not part of the safe area; report the
+        // bottom radius so the reader footer can keep clear of the curve. The
+        // window's own effective radius is 0, but a window-sized child with a
+        // container-concentric configuration resolves to the display radius.
+        var bottomCornerRadius: CGFloat = 0
+        if #available(iOS 26.0, *) {
+          let probe = UIView(frame: window.bounds)
+          probe.cornerConfiguration = .corners(radius: .containerConcentric())
+          window.addSubview(probe)
+          bottomCornerRadius = probe.effectiveRadius(corner: [.bottomLeft, .bottomRight])
+          probe.removeFromSuperview()
+        }
         invoke.resolve([
           "top": insets.top,
           "left": insets.left,
           "bottom": insets.bottom,
-          "right": insets.right
+          "right": insets.right,
+          "bottomCornerRadius": bottomCornerRadius,
+          "isIPhoneDuo": NativeBridgePlugin.isIPhoneDuo,
+          "statusBarHidden": window.rootViewController?.prefersStatusBarHidden ?? false
         ])
       } else {
         invoke.resolve([
@@ -1223,6 +1621,79 @@ class NativeBridgePlugin: Plugin {
       invoke.resolve(["available": true])
     } else {
       invoke.resolve(["available": false, "error": "OSStatus \(status)"])
+    }
+  }
+
+  // ── Keyed secure key-value store ──────────────────────────────────
+  // Same Keychain backing as the sync passphrase, but a generic keyed
+  // store: one service, the caller's `key` as the account, so secrets
+  // like the Google Drive token set persist the same way.
+
+  private static let secureItemsService = "com.bilingify.readest.secure-items"
+
+  private func secureItemBaseQuery(_ key: String) -> [String: Any] {
+    return [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: NativeBridgePlugin.secureItemsService,
+      kSecAttrAccount as String: key
+    ]
+  }
+
+  @objc public func set_secure_item(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(SecureItemSetArgs.self)
+      guard let data = args.value.data(using: .utf8) else {
+        invoke.resolve(["success": false, "error": "encoding"])
+        return
+      }
+      var query = secureItemBaseQuery(args.key)
+      query[kSecValueData as String] = data
+      // Replace any existing entry. Delete-then-add keeps the
+      // accessibility class consistent across SDK versions.
+      SecItemDelete(query as CFDictionary)
+      let status = SecItemAdd(query as CFDictionary, nil)
+      if status == errSecSuccess {
+        invoke.resolve(["success": true])
+      } else {
+        invoke.resolve(["success": false, "error": "OSStatus \(status)"])
+      }
+    } catch {
+      invoke.resolve(["success": false, "error": "\(error)"])
+    }
+  }
+
+  @objc public func get_secure_item(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(SecureItemGetArgs.self)
+      var query = secureItemBaseQuery(args.key)
+      query[kSecReturnData as String] = true
+      query[kSecMatchLimit as String] = kSecMatchLimitOne
+      var item: CFTypeRef?
+      let status = SecItemCopyMatching(query as CFDictionary, &item)
+      if status == errSecSuccess, let data = item as? Data, let s = String(data: data, encoding: .utf8) {
+        invoke.resolve(["value": s])
+      } else if status == errSecItemNotFound {
+        // No entry: empty response. The TS layer treats this as "not stored".
+        invoke.resolve([:])
+      } else {
+        invoke.resolve(["error": "OSStatus \(status)"])
+      }
+    } catch {
+      invoke.resolve(["error": "\(error)"])
+    }
+  }
+
+  @objc public func clear_secure_item(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(SecureItemGetArgs.self)
+      let status = SecItemDelete(secureItemBaseQuery(args.key) as CFDictionary)
+      if status == errSecSuccess || status == errSecItemNotFound {
+        invoke.resolve(["success": true])
+      } else {
+        invoke.resolve(["success": false, "error": "OSStatus \(status)"])
+      }
+    } catch {
+      invoke.resolve(["success": false, "error": "\(error)"])
     }
   }
 
@@ -1345,8 +1816,589 @@ class NativeBridgePlugin: Plugin {
           invoke.reject(err.message)
         }
       }
+      if args.backgroundCapture == true && args.interactive != true {
+        presenter.addChild(controller)
+        controller.view.frame = presenter.view.bounds
+        controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        controller.view.isUserInteractionEnabled = false
+        controller.view.accessibilityElementsHidden = true
+        presenter.view.insertSubview(controller.view, at: 0)
+        controller.didMove(toParent: presenter)
+      } else {
+        presenter.present(controller, animated: true)
+      }
+    }
+  }
+
+  /// Present the in-app browser (#5775). Resolves `{ openBookHash? }` when
+  /// the user closes it; downloads are forwarded as `web-browser-download`
+  /// plugin events while it is open. See `WebBrowserController.swift`.
+  @objc public func open_web_browser(_ invoke: Invoke) {
+    let args: WebBrowserArgs
+    do {
+      args = try invoke.parseArgs(WebBrowserArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    guard let url = URL(string: args.url), let scheme = url.scheme?.lowercased(),
+      scheme == "http" || scheme == "https"
+    else {
+      invoke.reject("Invalid URL")
+      return
+    }
+    DispatchQueue.main.async {
+      guard let presenter = topmostViewController() else {
+        invoke.reject("Could not find a view controller to present from")
+        return
+      }
+      let controller = WebBrowserController(args: args)
+      controller.onDownload = { [weak self] event in
+        var data: JSObject = [
+          "url": event.url, "path": event.path, "filename": event.filename,
+          "success": event.success,
+        ]
+        if let error = event.error { data["error"] = error }
+        self?.trigger("web-browser-download", data: data)
+      }
+      controller.onFinish = { [weak self] hash, page in
+        self?.activeWebBrowser = nil
+        var ret = JSObject()
+        if let hash = hash { ret["openBookHash"] = hash }
+        if let page = page { ret["page"] = ["url": page.url, "html": page.html] }
+        invoke.resolve(ret)
+      }
+      self.activeWebBrowser = controller
       presenter.present(controller, animated: true)
     }
+  }
+
+  /// Native-only exchange; session cookies never reach the frontend.
+  @objc public func web_browser_cookies(_ invoke: Invoke) {
+    struct Args: Decodable { let url: String; let setCookies: [String] }
+    let args: Args
+    do { args = try invoke.parseArgs(Args.self) }
+    catch { invoke.reject(error.localizedDescription); return }
+    guard let url = URL(string: args.url), let host = url.host,
+      url.scheme == "https" || url.scheme == "http" else { invoke.reject("Invalid URL"); return }
+    func matchesDomain(_ domain: String) -> Bool {
+      if domain.hasPrefix(".") {
+        return host == String(domain.dropFirst()) || host.hasSuffix(domain)
+      }
+      return domain == host
+    }
+    DispatchQueue.main.async {
+      let store = WKWebsiteDataStore.default().httpCookieStore
+      let group = DispatchGroup()
+      for header in args.setCookies {
+        for cookie in HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": header], for: url) where matchesDomain(cookie.domain) {
+          group.enter()
+          store.setCookie(cookie) { group.leave() }
+        }
+      }
+      group.notify(queue: .main) {
+        store.getAllCookies { cookies in
+          let matching = cookies.filter { cookie in
+            let path = cookie.path
+            let requestPath = url.path.isEmpty ? "/" : url.path
+            return matchesDomain(cookie.domain) && (!cookie.isSecure || url.scheme == "https")
+              && (cookie.expiresDate == nil || cookie.expiresDate! > Date())
+              && (requestPath == path || (requestPath.hasPrefix(path) && (path.hasSuffix("/") || requestPath.dropFirst(path.count).hasPrefix("/"))))
+          }.sorted { $0.path.count > $1.path.count }
+          invoke.resolve(["cookies": matching.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")])
+        }
+      }
+    }
+  }
+
+  /// Push an import status (importing / added / failed / unsupported) into
+  /// the open browser's banner. No-op when no browser is presented.
+  @objc public func set_web_browser_status(_ invoke: Invoke) {
+    let args: WebBrowserStatusArgs
+    do {
+      args = try invoke.parseArgs(WebBrowserStatusArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    DispatchQueue.main.async {
+      self.activeWebBrowser?.setStatus(
+        state: args.state, filename: args.filename, bookHash: args.bookHash)
+    }
+    // Acknowledge off the main queue, as `NativeBridgePlugin.kt` does. Resolving
+    // from inside the hop deadlocks any caller that is itself on the main thread
+    // (`run_mobile_plugin` blocks it), which the iOS watchdog kills after 10s.
+    invoke.resolve()
+  }
+
+  /// Read + delete a page-HTML file the Share Extension captured from
+  /// the user's signed-in Safari tab (App Group `SharedClips/`). Resolves
+  /// `{ html }`, or `{}` when the file is missing/unreadable — the JS
+  /// caller falls back to the `clip_url` re-fetch.
+  @objc public func read_share_clip_html(_ invoke: Invoke) {
+    let args: ReadShareClipHtmlArgs
+    do {
+      args = try invoke.parseArgs(ReadShareClipHtmlArgs.self)
+    } catch {
+      invoke.reject(error.localizedDescription)
+      return
+    }
+    if let html = AppGroupBridge.takeSharedClipHtml(fileName: args.fileName) {
+      invoke.resolve(["html": html])
+    } else {
+      invoke.resolve([:])
+    }
+  }
+
+  /// Resolve the default ubiquity container (nil = the first container in the
+  /// entitlements, iCloud.com.bilingify.readest) and ensure Documents/ exists.
+  /// url(forUbiquityContainerIdentifier:) may block, so hop off the main
+  /// thread before touching it.
+  @objc public func icloud_container_status(_ invoke: Invoke) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      guard let container = FileManager.default.url(forUbiquityContainerIdentifier: nil) else {
+        invoke.resolve(["available": false])
+        return
+      }
+      let documents = container.appendingPathComponent("Documents", isDirectory: true)
+      do {
+        try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+      } catch {
+        invoke.reject("Failed to create iCloud Documents: \(error.localizedDescription)")
+        return
+      }
+      invoke.resolve(["available": true, "documentsPath": documents.path])
+    }
+  }
+
+  /// Materialise an evicted item (`.name.icloud` placeholder), then poll for
+  /// the real file. "notFound" = neither file nor placeholder exists; the JS
+  /// provider maps that to the engine's 404-null contract.
+  @objc public func icloud_ensure_downloaded(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(ICloudEnsureDownloadedArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let fm = FileManager.default
+      if fm.fileExists(atPath: args.path) {
+        invoke.resolve(["status": "ready"])
+        return
+      }
+      let url = URL(fileURLWithPath: args.path)
+      let placeholder = url.deletingLastPathComponent()
+        .appendingPathComponent(".\(url.lastPathComponent).icloud")
+      guard fm.fileExists(atPath: placeholder.path) else {
+        invoke.resolve(["status": "notFound"])
+        return
+      }
+      // Either URL form is accepted by the daemon; try the logical path
+      // first, then the placeholder, and let the poll loop below decide.
+      if (try? fm.startDownloadingUbiquitousItem(at: url)) == nil {
+        try? fm.startDownloadingUbiquitousItem(at: placeholder)
+      }
+      let deadline = Date().addingTimeInterval(Double(args.timeoutMs ?? 60000) / 1000)
+      while Date() < deadline {
+        if fm.fileExists(atPath: args.path) {
+          invoke.resolve(["status": "ready"])
+          return
+        }
+        Thread.sleep(forTimeInterval: 0.25)
+      }
+      invoke.resolve(["status": "timeout"])
+    }
+  }
+
+  /// Hold a strong reference to the active folder picker delegate so
+  /// it survives until the user dismisses the picker. `present`
+  /// only retains the controller; the delegate is `weak` from
+  /// `UIDocumentPickerViewController`'s side, so without our retain
+  /// it would deallocate immediately and the callbacks would never
+  /// fire.
+  private var folderPickerDelegate: FolderPickerDelegate?
+
+  /// Bridge for the native-bridge `select_directory` command on iOS.
+  /// Mirrors the Android implementation (ACTION_OPEN_DOCUMENT_TREE)
+  /// but uses `UIDocumentPickerViewController(forOpeningContentTypes:
+  /// [.folder])` — the same picker the system uses for "Files" → choose
+  /// folder. Users can navigate into On My iPhone / iCloud Drive /
+  /// any third-party file provider and pick a directory there.
+  ///
+  /// Caveats around iOS sandbox model (callers should be aware):
+  ///   * Resolving the returned path on a SUBSEQUENT app launch
+  ///     requires a security-scoped bookmark — for now we hold the
+  ///     security-scoped resource open for the lifetime of the app
+  ///     process so the current session works. v2 should persist a
+  ///     bookmark and resolve it on launch; until then a relaunch
+  ///     after picking a non-Documents folder may need the user to
+  ///     re-pick.
+  ///   * The returned `path` is `url.path` — a normal POSIX path.
+  ///     Combined with the resource being open, plain Foundation /
+  ///     stdlib fs reads work against it.
+  @objc public func select_directory(_ invoke: Invoke) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else {
+        invoke.reject("plugin deallocated")
+        return
+      }
+      guard let presenter = topmostViewController() else {
+        invoke.reject("Could not find a view controller to present from")
+        return
+      }
+
+      // `forOpeningContentTypes: [.folder]` tells the picker to surface
+      // folders as the selectable entries (you can't pick individual
+      // files in this mode). `asCopy: false` keeps it a reference into
+      // the original location instead of copying into our sandbox.
+      let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+      picker.allowsMultipleSelection = false
+
+      let delegate = FolderPickerDelegate(invoke: invoke) { [weak self] in
+        // Drop our strong reference once the picker resolves so the
+        // delegate (and thus the closure capture chain) can deallocate.
+        // The security-scoped URL resource stays open via
+        // `FolderBookmarkStore.persist`, which retains the URL
+        // for the rest of the process and writes a bookmark to
+        // UserDefaults so the next launch can re-acquire access
+        // without prompting the user again.
+        self?.folderPickerDelegate = nil
+      }
+      self.folderPickerDelegate = delegate
+      picker.delegate = delegate
+
+      presenter.present(picker, animated: true)
+    }
+  }
+
+  // iOS devices have no e-ink panel; the "Refresh Page" page-turner action is
+  // gated to e-ink Android in the UI, so this is only ever reached defensively.
+  // Resolve as a soft no-op rather than rejecting.
+  @objc public func refresh_eink_screen(_ invoke: Invoke) {
+    invoke.resolve(["success": false])
+  }
+
+  // iOS has no e-ink panel to drive, so the deep refresh is never supported.
+  @objc public func is_eink_refresh_supported(_ invoke: Invoke) {
+    invoke.resolve(["supported": false])
+  }
+
+  @objc public func update_bookshelf_widget(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(UpdateReadingWidgetRequestArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    // The iOS widget shows books only; group tiles are an Android feature.
+    let books = args.items.compactMap { item -> UpdateReadingWidgetBookArgs? in
+      guard item.type == "book", let hash = item.hash, let coverPath = item.coverPath else {
+        return nil
+      }
+      return UpdateReadingWidgetBookArgs(
+        hash: hash, title: item.title ?? "", author: item.author ?? "",
+        percent: item.percent ?? 0, coverPath: coverPath)
+    }
+    DispatchQueue.global(qos: .utility).async {
+      for book in books {
+        ReadingWidgetWriter.writeThumbnail(hash: book.hash, sourcePath: book.coverPath)
+      }
+      let snapshot = ReadingWidgetWriter.Snapshot(
+        books: books.map {
+          .init(hash: $0.hash, title: $0.title, author: $0.author, percent: $0.percent)
+        },
+        sectionTitle: args.sectionTitle,
+        emptyTitle: args.emptyTitle
+      )
+      ReadingWidgetWriter.write(snapshot: snapshot)
+      invoke.resolve()
+    }
+  }
+
+  // iOS has no per-instance configurable widget yet (one default snapshot,
+  // written above); these two resolve as no-ops so a caller gets a clean
+  // empty result instead of a bridge "unknown command" failure.
+  @objc public func get_bookshelf_widget_instances(_ invoke: Invoke) {
+    invoke.resolve(["instances": [] as [Any]])
+  }
+
+  @objc public func set_bookshelf_widget_catalog(_ invoke: Invoke) {
+    invoke.resolve()
+  }
+
+  /// Snapshot a region of the webview for the mesh page-curl texture
+  /// (#555). The rect is in CSS pixels of the JS viewport (== points of
+  /// the WKWebView). Like Android, the snapshot is capped at 2x CSS
+  /// pixels (Pro iPhones render at 3x) and encoded as JPEG — the page is
+  /// opaque and JPEG encodes several times faster than PNG, keeping the
+  /// dead time between the tap and the first curl frame short. Resolved
+  /// as base64 because the plugin boundary is JSON-only; the Rust side
+  /// decodes back to bytes.
+  @objc public func capture_webview_region(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(CaptureWebviewRegionArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let webView = self?.webView else {
+        return invoke.reject("WebView not available")
+      }
+      let config = WKSnapshotConfiguration()
+      config.rect = CGRect(x: args.x, y: args.y, width: args.width, height: args.height)
+      // snapshotWidth is in points and the produced image is snapshotWidth
+      // x screen-scale pixels wide, so width x (2 / scale) points yields a
+      // 2x-CSS-pixel bitmap on 3x screens and native size elsewhere.
+      let scale = webView.window?.screen.scale ?? UIScreen.main.scale
+      if scale > 2 {
+        config.snapshotWidth = NSNumber(value: args.width * 2.0 / scale)
+      }
+      webView.takeSnapshot(with: config) { image, error in
+        guard let image = image else {
+          return invoke.reject(error?.localizedDescription ?? "Snapshot failed")
+        }
+        // Encode and base64 off the main thread; the completion arrives on
+        // main and a full-screen encode is fast but not free.
+        DispatchQueue.global(qos: .userInteractive).async {
+          guard let data = image.jpegData(compressionQuality: 0.9) else {
+            return invoke.reject("JPEG encoding failed")
+          }
+          invoke.resolve(["data": data.base64EncodedString()])
+        }
+      }
+    }
+  }
+
+  /// Freeze the on-screen pixels of a region of the webview (CSS px of the
+  /// JS viewport) behind a snapshot of what is currently presented there,
+  /// for the two-column page curl (#6106). The snapshot view is a sibling
+  /// above the webview: `takeSnapshot` renders the webview's own layer tree,
+  /// so the JS side can expose the incoming column underneath, capture it
+  /// with `capture_webview_region`, and restore its overlay — all while the
+  /// user still sees the frozen old pixels. Resolves a token for
+  /// `uncover_webview_region`.
+  @objc public func cover_webview_region(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(CaptureWebviewRegionArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self, let webView = self.webView, let container = webView.superview else {
+        return invoke.reject("WebView not available")
+      }
+      let rect = CGRect(x: args.x, y: args.y, width: args.width, height: args.height)
+      guard
+        let cover = webView.resizableSnapshotView(
+          from: rect, afterScreenUpdates: false, withCapInsets: .zero)
+      else {
+        return invoke.reject("Snapshot view unavailable")
+      }
+      self.turnCoverView?.removeFromSuperview()
+      cover.frame = webView.convert(rect, to: container)
+      cover.isUserInteractionEnabled = false
+      container.addSubview(cover)
+      self.turnCoverToken += 1
+      self.turnCoverView = cover
+      invoke.resolve(["token": self.turnCoverToken])
+    }
+  }
+
+  /// Remove the cover put up by `cover_webview_region`. A token from an
+  /// earlier, already replaced cover is ignored.
+  @objc public func uncover_webview_region(_ invoke: Invoke) {
+    guard let args = try? invoke.parseArgs(UncoverWebviewRegionArgs.self) else {
+      return invoke.reject("Failed to parse arguments")
+    }
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return invoke.resolve() }
+      if args.token == self.turnCoverToken {
+        self.turnCoverView?.removeFromSuperview()
+        self.turnCoverView = nil
+      }
+      invoke.resolve()
+    }
+  }
+}
+
+/// Persistent store for security-scoped folder bookmarks.
+///
+/// `UIDocumentPickerViewController(forOpeningContentTypes: [.folder])`
+/// hands us a security-scoped URL whose access right is granted only to
+/// the running process. To read the same folder on the *next* launch
+/// (without making the user re-pick it every time) we have to:
+///
+///   1. Right after the pick, call `URL.bookmarkData(.withSecurityScope)`
+///      and stash the bytes in `UserDefaults` keyed by the POSIX path.
+///   2. On every app launch, walk every persisted bookmark, resolve it
+///      back into a URL, and call `startAccessingSecurityScopedResource()`.
+///      Hold the URL alive for the entire process so subsequent
+///      Foundation / POSIX reads against `url.path` succeed.
+///
+/// The TS-visible `path` is unchanged across launches, so the rest of
+/// the app doesn't need to know about bookmarks — they're an iOS
+/// sandbox plumbing detail that lives entirely on the Swift side.
+///
+/// `isStale` recovery: when the source moves (user renamed, system
+/// migrated) `URL(resolvingBookmarkData:..., bookmarkDataIsStale:)`
+/// sets `isStale=true` and the new URL still works. We re-encode and
+/// rewrite. If the bookmark can't be resolved at all (file deleted,
+/// provider gone), we drop the entry — the user will need to re-pick.
+enum FolderBookmarkStore {
+  /// UserDefaults key prefix; the actual key is "<prefix><path>".
+  /// Using the path verbatim keeps debugging straightforward (you can
+  /// see the registered folders in `defaults read`), and UserDefaults
+  /// keys can contain any valid string.
+  private static let keyPrefix = "readest.folderBookmark."
+
+  /// Every URL we've successfully `startAccessingSecurityScopedResource`-ed
+  /// during this process, indexed by the POSIX path the JS layer uses.
+  /// Held forever (until process exit) — calling `stop` would kill any
+  /// subsequent fs read against the path.
+  private static var liveAccess: [String: URL] = [:]
+
+  /// Persist a bookmark for `url` so it can be resolved on next launch,
+  /// and pre-warm `liveAccess` for the current session.
+  static func persist(url: URL) {
+    let path = url.path
+    do {
+      let data = try url.bookmarkData(
+        options: .minimalBookmark,
+        includingResourceValuesForKeys: nil,
+        relativeTo: nil)
+      UserDefaults.standard.set(data, forKey: keyPrefix + path)
+      liveAccess[path] = url
+      logger.log(
+        "FolderBookmarkStore: persisted bookmark for \(path, privacy: .public)")
+    } catch {
+      Logger.error(
+        "FolderBookmarkStore: failed to encode bookmark for \(path): \(error)")
+    }
+  }
+
+  /// Resolve every stored bookmark and start accessing its security-
+  /// scoped resource. Called once from `NativeBridgePlugin.load(webview:)`
+  /// so all previously-registered folders are reachable before
+  /// the WebView begins issuing fs reads.
+  static func restoreAllPersisted() {
+    let defaults = UserDefaults.standard
+    let allKeys = defaults.dictionaryRepresentation().keys.filter {
+      $0.hasPrefix(keyPrefix)
+    }
+    var restored = 0
+    var dropped = 0
+    for key in allKeys {
+      guard let data = defaults.data(forKey: key) else { continue }
+      let storedPath = String(key.dropFirst(keyPrefix.count))
+      var isStale = false
+      do {
+        let url = try URL(
+          resolvingBookmarkData: data,
+          options: [],
+          relativeTo: nil,
+          bookmarkDataIsStale: &isStale)
+        let started = url.startAccessingSecurityScopedResource()
+        if started {
+          liveAccess[url.path] = url
+          restored += 1
+        } else {
+          // The OS denied access (e.g. file provider revoked). Don't
+          // delete the entry — the user may reauthorize the provider
+          // in Settings; we'll pick it up on the next launch.
+          Logger.error(
+            "FolderBookmarkStore: startAccessing denied for \(storedPath)")
+        }
+        if isStale {
+          // Re-encode against the resolved URL so the next launch
+          // doesn't have to walk the stale path again.
+          if let fresh = try? url.bookmarkData(
+            options: .minimalBookmark,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil)
+          {
+            defaults.set(fresh, forKey: key)
+          }
+        }
+      } catch {
+        // Bookmark is unrecoverable — folder gone, provider uninstalled,
+        // disk reformatted. Drop it from UserDefaults so the next launch
+        // doesn't re-attempt it.
+        defaults.removeObject(forKey: key)
+        dropped += 1
+        Logger.error(
+          "FolderBookmarkStore: dropped unresolvable bookmark for \(storedPath): \(error)")
+      }
+    }
+    logger.log(
+      "FolderBookmarkStore: restored \(restored, privacy: .public) folder(s), dropped \(dropped, privacy: .public)"
+    )
+  }
+
+  /// Stop accessing and forget the bookmark for `path`. Used when the
+  /// JS layer removes a folder from `settings.externalLibraryFolders`.
+  /// Currently unused — the v1 UI doesn't expose folder removal — but
+  /// kept here so the cleanup contract is obvious from one place.
+  static func forget(path: String) {
+    if let url = liveAccess.removeValue(forKey: path) {
+      url.stopAccessingSecurityScopedResource()
+    }
+    UserDefaults.standard.removeObject(forKey: keyPrefix + path)
+  }
+}
+
+/// Delegate for `select_directory`'s `UIDocumentPickerViewController`.
+/// We split this out into a dedicated class (rather than making
+/// `NativeBridgePlugin` itself the delegate) so multiple concurrent
+/// picker invocations would each hold their own state — currently we
+/// only allow one at a time, but the wiring is cleaner this way and
+/// `Invoke` is easier to capture by reference.
+///
+/// Lifecycle:
+///   1. Plugin retains us strongly via `folderPickerDelegate`.
+///   2. UIKit holds us as the picker's `delegate` (weak).
+///   3. When the user picks or cancels, we call back into `invoke`
+///      and then run `onComplete`, which clears the plugin's strong
+///      reference. We deallocate at that point.
+///   4. The chosen URL retains its security-scoped access for the
+///      remainder of the process via `FolderBookmarkStore`,
+///      and is also persisted to UserDefaults so the next launch can
+///      re-acquire access without prompting the user again.
+private final class FolderPickerDelegate: NSObject, UIDocumentPickerDelegate {
+  private let invoke: Invoke
+  private let onComplete: () -> Void
+
+  init(invoke: Invoke, onComplete: @escaping () -> Void) {
+    self.invoke = invoke
+    self.onComplete = onComplete
+  }
+
+  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    defer { onComplete() }
+    guard let url = urls.first else {
+      invoke.resolve(["cancelled": true])
+      return
+    }
+
+    // `startAccessingSecurityScopedResource` is required for any URL
+    // returned by the picker that lives outside our sandbox (which is
+    // the only interesting case — anything inside our sandbox we
+    // already have access to without it). Returns false when no scope
+    // is needed or the request was denied; in either case we still
+    // try to use the URL because (a) sandbox-internal paths work
+    // either way, (b) for denied requests `path` access will surface
+    // a normal "permission denied" later, which is a clearer error
+    // than failing here pre-emptively.
+    let started = url.startAccessingSecurityScopedResource()
+    if started {
+      // Persist a security-scoped bookmark so the same path is
+      // reachable on the next launch, without forcing the user to
+      // re-pick it. The store also retains the URL so the resource
+      // stays accessible for the remainder of this process.
+      FolderBookmarkStore.persist(url: url)
+    }
+
+    let result: [String: Any] = [
+      "cancelled": false,
+      "uri": url.absoluteString,
+      "path": url.path,
+    ]
+    invoke.resolve(result)
+  }
+
+  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+    defer { onComplete() }
+    invoke.resolve(["cancelled": true])
   }
 }
 
@@ -1374,8 +2426,51 @@ class SyncPassphraseSetArgs: Decodable {
   let passphrase: String
 }
 
+class SecureItemSetArgs: Decodable {
+  let key: String
+  let value: String
+}
+
+class SecureItemGetArgs: Decodable {
+  let key: String
+}
+
 class ShowLookupPopoverArgs: Decodable {
   let word: String
+}
+
+struct UpdateReadingWidgetBookArgs: Decodable {
+  let hash: String
+  let title: String
+  let author: String
+  let percent: Int
+  let coverPath: String
+}
+// One grid tile from JS: a "book" carries the book fields, a "group" other
+// fields this platform ignores.
+struct UpdateReadingWidgetItemArgs: Decodable {
+  let type: String
+  let hash: String?
+  let title: String?
+  let author: String?
+  let percent: Int?
+  let coverPath: String?
+}
+struct UpdateReadingWidgetRequestArgs: Decodable {
+  let items: [UpdateReadingWidgetItemArgs]
+  let sectionTitle: String
+  let emptyTitle: String
+}
+
+struct CaptureWebviewRegionArgs: Decodable {
+  let x: Double
+  let y: Double
+  let width: Double
+  let height: Double
+}
+
+struct UncoverWebviewRegionArgs: Decodable {
+  let token: Int
 }
 
 @_cdecl("init_plugin_native_bridge")
@@ -1410,7 +2505,26 @@ private final class ShareBridgeMessageHandler: NSObject, WKScriptMessageHandler 
 @available(iOS 13.0, *)
 extension NativeBridgePlugin: ASWebAuthenticationPresentationContextProviding {
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-    return UIApplication.shared.windows.first ?? UIWindow()
+    // `UIApplication.shared.windows` is deprecated since iOS 15 and returns
+    // every window of every scene in an arbitrary order, so it can hand back a
+    // system-owned window: UIRemoteKeyboardWindow and UITextEffectsWindow are
+    // both alive whenever the keyboard is up, which is exactly the state the
+    // sign-in screen is in when the user taps an OAuth provider. Anchoring the
+    // auth sheet to one of those leaves UIKit's remote view controller hosting
+    // without a process handle and it aborts the app
+    // ("Invalid condition not satisfying: processHandle"). The old
+    // `?? UIWindow()` fallback was worse still - a window with no scene can
+    // never host a remote view controller. Keyboard and text-effects windows
+    // sit above `.normal`, so the window level filters them out.
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+    let windows = (scene?.windows ?? []).filter { $0.windowLevel == .normal }
+    if let anchor = windows.first(where: { $0.isKeyWindow }) ?? windows.first {
+      return anchor
+    }
+    // Unreachable while the WebView is on screen; still keep the fallback
+    // attached to a scene so remote view hosting has one.
+    return scene.map { UIWindow(windowScene: $0) } ?? UIWindow()
   }
 }
 

@@ -1,19 +1,23 @@
 import { useCallback, useRef, useState } from 'react';
 import { BookNote } from '@/types/book';
-import { Point, TextSelection, snapRangeToWords } from '@/utils/sel';
+import { NOTE_PREFIX } from '@/types/view';
+import { TextSelection } from '@/utils/sel';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useBookDataStore } from '@/store/bookDataStore';
-
-interface HandlePositions {
-  start: Point;
-  end: Point;
-}
+import { eventDispatcher } from '@/utils/event';
+import { nextBooknoteStamp } from '@/utils/booknoteStamp';
+import {
+  getHandlePositionsFromRange as getHandlePositionsForBook,
+  HandlePositions,
+  removeBookNoteOverlays,
+} from '../utils/annotatorUtil';
 
 interface UseAnnotationEditorProps {
   bookKey: string;
   annotation: BookNote;
+  selection: TextSelection;
   getAnnotationText: (range: Range) => Promise<string>;
   setSelection: React.Dispatch<React.SetStateAction<TextSelection | null>>;
 }
@@ -21,6 +25,7 @@ interface UseAnnotationEditorProps {
 export const useAnnotationEditor = ({
   bookKey,
   annotation,
+  selection,
   getAnnotationText,
   setSelection,
 }: UseAnnotationEditorProps) => {
@@ -31,116 +36,37 @@ export const useAnnotationEditor = ({
 
   const view = getView(bookKey);
   const editingAnnotationRef = useRef(annotation);
+  const rangeRequestRef = useRef(0);
   const [handlePositions, setHandlePositions] = useState<HandlePositions | null>(null);
 
   const getHandlePositionsFromRange = useCallback(
-    (range: Range, isVertical: boolean): HandlePositions | null => {
-      const gridFrame = document.querySelector(`#gridcell-${bookKey}`);
-      if (!gridFrame) return null;
-
-      const rects = Array.from(range.getClientRects());
-      if (rects.length === 0) return null;
-
-      const firstRect = rects[0]!;
-      const lastRect = rects[rects.length - 1]!;
-      const frameElement = range.commonAncestorContainer.ownerDocument?.defaultView?.frameElement;
-      const frameRect = frameElement?.getBoundingClientRect() ?? { top: 0, left: 0 };
-
-      return {
-        start: {
-          x: frameRect.left + (isVertical ? firstRect.right : firstRect.left),
-          y: frameRect.top + firstRect.top,
-        },
-        end: {
-          x: frameRect.left + (isVertical ? lastRect.left : lastRect.right),
-          y: frameRect.top + lastRect.bottom,
-        },
-      };
-    },
+    (range: Range, isVertical: boolean): HandlePositions | null =>
+      getHandlePositionsForBook(bookKey, range, isVertical),
     [bookKey],
   );
 
-  const handleAnnotationRangeChange = useCallback(
-    async (startPoint: Point, endPoint: Point, isVertical: boolean, isDragging: boolean) => {
+  // Apply an already-built range (anchored at the non-dragged end in the editor
+  // component so it survives a corner auto page-turn) to the edited annotation.
+  const applyAnnotationRange = useCallback(
+    async (newRange: Range, targetIndex: number, isVertical: boolean, isDragging: boolean) => {
       if (!editingAnnotationRef.current || !view) return;
-
-      const contents = view.renderer.getContents();
-      if (!contents || contents.length === 0) return;
-
-      // the point is from viewport, need to adjust to each content's coordinate
-      const findPositionAtPoint = (doc: Document, x: number, y: number) => {
-        const frameElement = doc.defaultView?.frameElement;
-        const frameRect = frameElement?.getBoundingClientRect() ?? { top: 0, left: 0 };
-        const adjustedX = x - frameRect.left;
-        const adjustedY = y - frameRect.top;
-
-        if (doc.caretPositionFromPoint) {
-          const pos = doc.caretPositionFromPoint(adjustedX, adjustedY);
-          if (pos) return { node: pos.offsetNode, offset: pos.offset };
-        }
-        if (doc.caretRangeFromPoint) {
-          const range = doc.caretRangeFromPoint(adjustedX, adjustedY);
-          if (range) return { node: range.startContainer, offset: range.startOffset };
-        }
-        return null;
-      };
-
-      let startPos = null;
-      let endPos = null;
-      let targetDoc: Document | null = null;
-      let targetIndex = 0;
-
-      for (const content of contents) {
-        const { doc, index } = content;
-        if (!doc) continue;
-
-        const sp = findPositionAtPoint(doc, startPoint.x, startPoint.y);
-        const ep = findPositionAtPoint(doc, endPoint.x, endPoint.y);
-
-        if (sp && ep) {
-          startPos = sp;
-          endPos = ep;
-          targetDoc = doc;
-          targetIndex = index ?? 0;
-          break;
-        }
-      }
-
-      if (!startPos || !endPos || !targetDoc) return;
-
-      const newRange = targetDoc.createRange();
-      try {
-        const positionComparison = startPos.node.compareDocumentPosition(endPos.node);
-        const needsSwap =
-          positionComparison & Node.DOCUMENT_POSITION_PRECEDING ||
-          (startPos.node === endPos.node && startPos.offset > endPos.offset);
-
-        if (needsSwap) {
-          newRange.setStart(endPos.node, endPos.offset);
-          newRange.setEnd(startPos.node, startPos.offset);
-        } else {
-          newRange.setStart(startPos.node, startPos.offset);
-          newRange.setEnd(endPos.node, endPos.offset);
-        }
-
-        if (newRange.collapsed) {
-          console.warn('Range is collapsed');
-          return;
-        }
-
-        snapRangeToWords(newRange);
-      } catch (e) {
-        console.warn('Failed to create range:', e);
-        return;
-      }
+      const request = ++rangeRequestRef.current;
 
       const newPositions = getHandlePositionsFromRange(newRange, isVertical);
       if (newPositions) {
         setHandlePositions(newPositions);
       }
 
-      const newCfi = view.getCFI(targetIndex, newRange);
+      // A footnote popup range lives in the popup's own document, which only
+      // the popup can map back into the section.
+      const newCfi = selection.popup
+        ? selection.getPopupCfi?.(newRange)
+        : view.getCFI(targetIndex, newRange);
       const newText = await getAnnotationText(newRange);
+      // A later drag or pointer-up commit owns the range. Applying a late
+      // preview could otherwise paint a CFI that no longer matches the saved
+      // record, leaving an orphaned highlight when that record is deleted.
+      if (request !== rangeRequestRef.current) return;
 
       if (newCfi && newText) {
         const config = getConfig(bookKey)!;
@@ -156,12 +82,39 @@ export const useAnnotationEditor = ({
             ...existingAnnotation,
             cfi: newCfi,
             text: newText,
-            updatedAt: Date.now(),
+            updatedAt: nextBooknoteStamp(existingAnnotation),
           };
 
+          // Both overlays of a unified record are keyed by its cfi, so a moved
+          // range must tear down *both* — dropping only the highlight left the
+          // note bubble stranded at the old anchor while a new one was drawn at
+          // the new one, so one highlight showed several note markers (#5538).
+          // Mid-drag the saved record still holds the pre-drag range, and the
+          // reader repaints saved records on every relocate (a corner auto-turn,
+          // a resize). Tear that range down too, or it outlives the record as an
+          // untappable ghost once the highlight is deleted (#6141).
           const views = getViewsById(bookKey.split('-')[0]!);
-          views.forEach((v) => v?.addAnnotation(editingAnnotationRef.current, true));
+          const hasNote = !!existingAnnotation.note?.trim();
+          const previous = editingAnnotationRef.current;
+          views.forEach((v) => {
+            removeBookNoteOverlays(v, previous);
+            if (existingAnnotation.cfi !== previous.cfi) {
+              removeBookNoteOverlays(v, existingAnnotation);
+            }
+          });
           views.forEach((v) => v?.addAnnotation(updatedAnnotation));
+          if (hasNote) {
+            views.forEach((v) =>
+              v?.addAnnotation({ ...updatedAnnotation, value: `${NOTE_PREFIX}${newCfi}` }),
+            );
+          }
+          // The footnote popup draws its overlays in its own view.
+          if (selection.popup) {
+            eventDispatcher.dispatch('footnote-annotation-preview', {
+              key: bookKey,
+              note: updatedAnnotation,
+            });
+          }
           editingAnnotationRef.current = updatedAnnotation;
 
           if (!isDragging) {
@@ -179,19 +132,24 @@ export const useAnnotationEditor = ({
               index: targetIndex,
               range: newRange,
               page: existingAnnotation.page || progress.page,
+              ...(selection.popup && {
+                popup: true,
+                href: selection.href,
+                getPopupCfi: selection.getPopupCfi,
+              }),
             });
           }
         }
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [bookKey, getHandlePositionsFromRange, getAnnotationText, setSelection],
+    [bookKey, selection, getHandlePositionsFromRange, getAnnotationText, setSelection],
   );
 
   return {
     handlePositions,
     setHandlePositions,
     getHandlePositionsFromRange,
-    handleAnnotationRangeChange,
+    applyAnnotationRange,
   };
 };

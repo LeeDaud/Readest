@@ -6,6 +6,7 @@ import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { uniqueId } from '@/utils/misc';
+import { ensureRuleId } from '@/utils/proofread';
 
 export interface CreateProofreadRuleOptions {
   scope: ProofreadScope;
@@ -44,11 +45,22 @@ interface ProofreadStoreState {
     scope: ProofreadScope,
   ) => Promise<void>;
   toggleRule: (envConfig: EnvConfigType, bookKey: string, ruleId: string) => Promise<void>;
+  /**
+   * Persist a drag-to-reorder of one rule category. `orderedIds` is the new
+   * visual order of the category's rules; each matching rule's `order` field
+   * is set to its index. A category can span both stores (book + library), so
+   * book/selection rules are written to the book config and library rules to
+   * the global settings — only the store(s) actually touched are saved.
+   */
+  reorderRules: (envConfig: EnvConfigType, bookKey: string, orderedIds: string[]) => Promise<void>;
 }
 
 function createProofreadRule(opts: CreateProofreadRuleOptions): ProofreadRule {
-  return {
-    id: uniqueId(),
+  const rule: ProofreadRule = {
+    // Selection rules are per-instance unique. Book/library rules get a stable
+    // content-derived id (filled by ensureRuleId below) so the same rule
+    // created on two devices dedupes on sync instead of duplicating.
+    id: opts.scope === 'selection' ? uniqueId() : '',
     scope: opts.scope,
     pattern: opts.pattern,
     replacement: opts.replacement,
@@ -60,7 +72,9 @@ function createProofreadRule(opts: CreateProofreadRuleOptions): ProofreadRule {
     order: opts.order ?? 1000,
     wholeWord: opts.wholeWord ?? true,
     onlyForTTS: opts.onlyForTTS ?? false,
+    updatedAt: Date.now(),
   };
+  return ensureRuleId(rule);
 }
 
 function mergeRules(
@@ -72,19 +86,21 @@ function mergeRules(
   (globalRules ?? []).forEach((r) => map.set(r.id, r));
   (bookRules ?? []).forEach((r) => map.set(r.id, r));
 
-  return [...map.values()].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  return [...map.values()]
+    .filter((r) => !r.deletedAt)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
 
 export const useProofreadStore = create<ProofreadStoreState>(() => ({
   getBookRules: (bookKey: string) => {
     const { getViewSettings } = useReaderStore.getState();
     const viewSettings = getViewSettings(bookKey);
-    return viewSettings?.proofreadRules || [];
+    return (viewSettings?.proofreadRules || []).filter((r) => !r.deletedAt);
   },
 
   getGlobalRules: () => {
     const { settings } = useSettingsStore.getState();
-    return settings.globalViewSettings.proofreadRules || [];
+    return (settings.globalViewSettings.proofreadRules || []).filter((r) => !r.deletedAt);
   },
 
   getMergedRules: (bookKey: string) => {
@@ -132,8 +148,46 @@ export const useProofreadStore = create<ProofreadStoreState>(() => ({
       throw new Error(`Rule not found: ${ruleId}`);
     }
 
+    // `scope` has to ride along: updateRule routes on `updates.scope`, so
+    // dropping it sent library rules down the book branch, where they don't
+    // exist -- the switch wrote nothing and looked dead. And the list reads
+    // `enabled !== false` as on, so an absent flag must flip to false rather
+    // than to `!undefined` (true), which would leave the rule enabled.
     const { updateRule } = useProofreadStore.getState();
-    await updateRule(envConfig, bookKey, ruleId, { enabled: !rule.enabled });
+    await updateRule(envConfig, bookKey, ruleId, {
+      scope: rule.scope,
+      enabled: rule.enabled === false,
+    });
+  },
+
+  reorderRules: async (envConfig, bookKey, orderedIds) => {
+    const orderById = new Map(orderedIds.map((id, index) => [id, index] as const));
+
+    const { getViewSettings } = useReaderStore.getState();
+    const viewSettings = getViewSettings(bookKey);
+    if (viewSettings) {
+      let bookTouched = false;
+      const updated = (viewSettings.proofreadRules || []).map((r) => {
+        const order = orderById.get(r.id);
+        if (order === undefined) return r;
+        bookTouched = true;
+        return { ...r, order, updatedAt: Date.now() };
+      });
+      if (bookTouched) await updateBookViewSettings(envConfig, bookKey, updated);
+    }
+
+    const { settings } = useSettingsStore.getState();
+    const globalRules = settings.globalViewSettings?.proofreadRules;
+    if (globalRules?.length) {
+      let globalTouched = false;
+      const updated = globalRules.map((r) => {
+        const order = orderById.get(r.id);
+        if (order === undefined) return r;
+        globalTouched = true;
+        return { ...r, order, updatedAt: Date.now() };
+      });
+      if (globalTouched) await updateGlobalSettings(envConfig, updated);
+    }
   },
 }));
 
@@ -154,9 +208,15 @@ async function addBookRule(
     // Always add new single-instance rules (each has unique ID)
     existingRules.push(rule);
   } else {
-    // Check for duplicates in book scope
+    // Check for duplicates in book scope (ignore tombstoned rows so a deleted
+    // pattern can be re-added as a fresh live rule rather than reviving the
+    // tombstone in place).
     const existing = existingRules.find(
-      (r) => r.pattern === rule.pattern && r.isRegex === rule.isRegex && r.scope !== 'selection',
+      (r) =>
+        !r.deletedAt &&
+        r.pattern === rule.pattern &&
+        r.isRegex === rule.isRegex &&
+        r.scope !== 'selection',
     );
 
     if (existing) {
@@ -164,6 +224,7 @@ async function addBookRule(
         replacement: rule.replacement,
         enabled: rule.enabled,
         order: rule.order,
+        updatedAt: Date.now(),
       });
     } else {
       existingRules.push(rule);
@@ -187,7 +248,9 @@ async function updateBookRule(
   }
 
   const existingRules = viewSettings.proofreadRules || [];
-  const updatedRules = existingRules.map((r) => (r.id === ruleId ? { ...r, ...updates } : r));
+  const updatedRules = existingRules.map((r) =>
+    r.id === ruleId ? { ...r, ...updates, updatedAt: Date.now() } : r,
+  );
 
   await updateBookViewSettings(envConfig, bookKey, updatedRules);
 }
@@ -204,10 +267,16 @@ async function removeBookRule(
     throw new Error(`No viewSettings found for book: ${bookKey}`);
   }
 
+  // Tombstone instead of hard-removing: book/selection rules ride the per-id
+  // book-config sync (see utils/proofread.ts), so a removed row must survive the
+  // merge with a `deletedAt` marker or the peer's still-live copy resurrects it.
   const existingRules = viewSettings.proofreadRules || [];
-  const filteredRules = existingRules.filter((r) => r.id !== ruleId);
+  const now = Date.now();
+  const tombstonedRules = existingRules.map((r) =>
+    r.id === ruleId ? { ...r, deletedAt: now, updatedAt: now } : r,
+  );
 
-  await updateBookViewSettings(envConfig, bookKey, filteredRules);
+  await updateBookViewSettings(envConfig, bookKey, tombstonedRules);
 }
 
 async function updateBookViewSettings(
@@ -249,7 +318,7 @@ async function addGlobalRule(envConfig: EnvConfigType, rule: ProofreadRule): Pro
   const globalRules = settings.globalViewSettings.proofreadRules || [];
 
   const existing = globalRules.find(
-    (r) => r.pattern === rule.pattern && r.isRegex === rule.isRegex,
+    (r) => !r.deletedAt && r.pattern === rule.pattern && r.isRegex === rule.isRegex,
   );
 
   if (existing) {
@@ -257,6 +326,7 @@ async function addGlobalRule(envConfig: EnvConfigType, rule: ProofreadRule): Pro
       replacement: rule.replacement,
       enabled: rule.enabled,
       order: rule.order,
+      updatedAt: Date.now(),
     });
     await updateGlobalSettings(envConfig, globalRules);
   } else {
@@ -272,7 +342,9 @@ async function updateGlobalRule(
   const { settings } = useSettingsStore.getState();
   const globalRules = settings.globalViewSettings.proofreadRules || [];
 
-  const updatedRules = globalRules.map((r) => (r.id === ruleId ? { ...r, ...updates } : r));
+  const updatedRules = globalRules.map((r) =>
+    r.id === ruleId ? { ...r, ...updates, updatedAt: Date.now() } : r,
+  );
 
   await updateGlobalSettings(envConfig, updatedRules);
 }

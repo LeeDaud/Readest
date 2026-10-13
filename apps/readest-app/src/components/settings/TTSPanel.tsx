@@ -5,10 +5,16 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useResetViewSettings } from '@/hooks/useResetSettings';
 import { useTranslation } from '@/hooks/useTranslation';
 import { saveViewSettings } from '@/helpers/settings';
+import { getLocale } from '@/utils/misc';
 import { SettingsPanelPanelProp } from './SettingsDialog';
-import { TTSMediaMetadataMode } from '@/services/tts/types';
-import { BoxedList, SettingsRow, SettingsSelect } from './primitives';
-import TTSHighlightStyleEditor, { TTSHighlightStyle } from './color/TTSHighlightStyleEditor';
+import {
+  TTSHighlightGranularity,
+  TTSMediaMetadataMode,
+  TTSPlayerStyle,
+} from '@/services/tts/types';
+import { getTTSCacheConfig, setTTSCacheConfig } from '@/services/tts/providers/bookCacheStore';
+import { BoxedList, SettingsRow, SettingsSelect, SettingsSwitchRow } from './primitives';
+import TTSHighlightStyleEditor, { TTSHighlightStyle } from './theme/TTSHighlightStyleEditor';
 
 const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }) => {
   const _ = useTranslation();
@@ -16,9 +22,19 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
   const { getViewSettings } = useReaderStore();
   const { settings, setSettings, saveSettings } = useSettingsStore();
   const viewSettings = getViewSettings(bookKey) || settings.globalViewSettings;
+  const showInlineReadings = ['ja', 'ko'].includes(getLocale().toLowerCase().split('-')[0]!);
 
   const [ttsMediaMetadata, setTtsMediaMetadata] = useState<TTSMediaMetadataMode>(
     viewSettings.ttsMediaMetadata ?? 'sentence',
+  );
+  const [ttsPlayerStyle, setTtsPlayerStyle] = useState<TTSPlayerStyle>(
+    viewSettings.ttsPlayerStyle ?? 'full',
+  );
+  const [ttsHighlightGranularity, setTtsHighlightGranularity] = useState<TTSHighlightGranularity>(
+    viewSettings.ttsHighlightGranularity ?? 'word',
+  );
+  const [ttsSkipInlineAnnotations, setTtsSkipInlineAnnotations] = useState(
+    viewSettings.ttsSkipInlineAnnotations ?? false,
   );
   const [ttsHighlightStyle, setTtsHighlightStyle] = useState(
     viewSettings.ttsHighlightOptions.style,
@@ -30,11 +46,23 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     settings.globalReadSettings.customTtsHighlightColors || [],
   );
 
+  const [ttsCacheConfig, setTtsCacheConfigState] = useState(getTTSCacheConfig());
+
+  const updateTTSCacheConfig = (config: typeof ttsCacheConfig) => {
+    setTtsCacheConfigState(config);
+    setTTSCacheConfig(config);
+  };
+
   const resetToDefaults = useResetViewSettings();
 
   const handleReset = () => {
     resetToDefaults({
       ttsMediaMetadata: setTtsMediaMetadata as React.Dispatch<React.SetStateAction<string>>,
+      ttsPlayerStyle: setTtsPlayerStyle as React.Dispatch<React.SetStateAction<string>>,
+      ttsHighlightGranularity: setTtsHighlightGranularity as React.Dispatch<
+        React.SetStateAction<string>
+      >,
+      ttsSkipInlineAnnotations: setTtsSkipInlineAnnotations,
     });
   };
 
@@ -48,6 +76,38 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     saveViewSettings(envConfig, bookKey, 'ttsMediaMetadata', ttsMediaMetadata, false, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ttsMediaMetadata]);
+
+  useEffect(() => {
+    if (ttsPlayerStyle === viewSettings.ttsPlayerStyle) return;
+    saveViewSettings(envConfig, bookKey, 'ttsPlayerStyle', ttsPlayerStyle, false, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttsPlayerStyle]);
+
+  useEffect(() => {
+    if (ttsHighlightGranularity === viewSettings.ttsHighlightGranularity) return;
+    saveViewSettings(
+      envConfig,
+      bookKey,
+      'ttsHighlightGranularity',
+      ttsHighlightGranularity,
+      false,
+      false,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttsHighlightGranularity]);
+
+  useEffect(() => {
+    if (ttsSkipInlineAnnotations === viewSettings.ttsSkipInlineAnnotations) return;
+    saveViewSettings(
+      envConfig,
+      bookKey,
+      'ttsSkipInlineAnnotations',
+      ttsSkipInlineAnnotations,
+      false,
+      false,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttsSkipInlineAnnotations]);
 
   const handleTTSStyleChange = (style: TTSHighlightStyle) => {
     setTtsHighlightStyle(style);
@@ -76,19 +136,52 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     setTtsMediaMetadata(event.target.value as TTSMediaMetadataMode);
   };
 
+  const handlePlayerStyleChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    setTtsPlayerStyle(event.target.value as TTSPlayerStyle);
+  };
+
+  const handleTTSGranularityChange = (granularity: TTSHighlightGranularity) => {
+    setTtsHighlightGranularity(granularity);
+  };
+
   return (
     <div className='my-4 w-full space-y-6'>
       <TTSHighlightStyleEditor
+        granularity={ttsHighlightGranularity}
         style={ttsHighlightStyle}
         color={ttsHighlightColor}
         customColors={customTtsHighlightColors}
+        onGranularityChange={handleTTSGranularityChange}
         onStyleChange={handleTTSStyleChange}
         onColorChange={handleTTSColorChange}
         onCustomColorsChange={handleCustomTtsColorsChange}
         data-setting-id='settings.tts.ttsHighlightStyle'
       />
 
+      {showInlineReadings && (
+        <BoxedList title={_('Speech')} data-setting-id='settings.tts.speech'>
+          <SettingsSwitchRow
+            label={_('Skip Parenthetical Readings')}
+            description={_('Do not speak readings or Hanja glosses in parentheses after a word')}
+            checked={ttsSkipInlineAnnotations}
+            onChange={() => setTtsSkipInlineAnnotations(!ttsSkipInlineAnnotations)}
+            data-setting-id='settings.tts.skipInlineAnnotations'
+          />
+        </BoxedList>
+      )}
+
       <BoxedList title={_('Media Info')} data-setting-id='settings.tts.mediaMetadata'>
+        <SettingsRow label={_('Player Style')} data-setting-id='settings.tts.playerStyle'>
+          <SettingsSelect
+            value={ttsPlayerStyle}
+            onChange={handlePlayerStyleChange}
+            ariaLabel={_('Player Style')}
+            options={[
+              { value: 'full', label: _('Full') },
+              { value: 'minimal', label: _('Minimal') },
+            ]}
+          />
+        </SettingsRow>
         <SettingsRow label={_('Update Frequency')}>
           <SettingsSelect
             value={ttsMediaMetadata}
@@ -98,6 +191,48 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
               { value: 'sentence', label: _('Every Sentence') },
               { value: 'paragraph', label: _('Every Paragraph') },
               { value: 'chapter', label: _('Every Chapter') },
+            ]}
+          />
+        </SettingsRow>
+      </BoxedList>
+
+      <BoxedList title={_('Audio Cache')} data-setting-id='settings.tts.audioCache'>
+        <SettingsSwitchRow
+          label={_('Cache Synthesized Audio')}
+          description={_('Reuse generated speech across sessions without refetching')}
+          checked={ttsCacheConfig.enabled}
+          onChange={() =>
+            updateTTSCacheConfig({ ...ttsCacheConfig, enabled: !ttsCacheConfig.enabled })
+          }
+          data-setting-id='settings.tts.audioCacheEnabled'
+        />
+        <SettingsSwitchRow
+          label={_('Sync Audio Cache')}
+          description={_('Share section audio between your devices through your file sync service')}
+          checked={ttsCacheConfig.syncEnabled}
+          disabled={!ttsCacheConfig.enabled}
+          onChange={() =>
+            updateTTSCacheConfig({ ...ttsCacheConfig, syncEnabled: !ttsCacheConfig.syncEnabled })
+          }
+          data-setting-id='settings.tts.audioCacheSync'
+        />
+        <SettingsRow label={_('Storage Limit')}>
+          <SettingsSelect
+            value={String(ttsCacheConfig.budgetMB)}
+            onChange={(event) =>
+              updateTTSCacheConfig({
+                ...ttsCacheConfig,
+                budgetMB: Number(event.target.value),
+              })
+            }
+            ariaLabel={_('Storage Limit')}
+            disabled={!ttsCacheConfig.enabled}
+            options={[
+              { value: '50', label: '50 MB' },
+              { value: '100', label: '100 MB' },
+              { value: '200', label: '200 MB' },
+              { value: '500', label: '500 MB' },
+              { value: '1024', label: '1 GB' },
             ]}
           />
         </SettingsRow>

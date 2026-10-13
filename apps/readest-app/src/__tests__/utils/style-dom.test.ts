@@ -20,13 +20,17 @@ import type { ThemeCode } from '@/utils/style';
 import {
   applyThemeModeClass,
   applyScrollModeClass,
+  applyEinkModeAttribute,
   applyScrollbarStyle,
   applyTranslationStyle,
   getThemeCode,
   getStyles,
   applyImageStyle,
+  applyNamespacedAttributes,
   keepTextAlignment,
-  applyTableStyle,
+  applyLinkHitArea,
+  LINK_HIT_AREA_CLASS,
+  MAX_ENLARGED_LINKS,
 } from '@/utils/style';
 import {
   DEFAULT_BOOK_FONT,
@@ -106,6 +110,38 @@ describe('applyScrollModeClass', () => {
     document.body.className = '';
     applyScrollModeClass(document, false);
     expect(document.body.classList.contains('paginated-mode')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyEinkModeAttribute (#5795)
+// ---------------------------------------------------------------------------
+describe('applyEinkModeAttribute', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('data-eink');
+  });
+
+  it("sets data-eink='true' on the book document root when e-ink mode is on", () => {
+    applyEinkModeAttribute(document, true);
+    expect(document.documentElement.getAttribute('data-eink')).toBe('true');
+  });
+
+  it("writes data-eink='false' rather than removing it so LCD-only rules can match", () => {
+    applyEinkModeAttribute(document, true);
+    applyEinkModeAttribute(document, false);
+    expect(document.documentElement.getAttribute('data-eink')).toBe('false');
+    expect(document.body.matches("html[data-eink='false'] body")).toBe(true);
+  });
+
+  it('lets a synced user stylesheet gate rules on the rendering screen', () => {
+    const p = document.createElement('p');
+    document.body.appendChild(p);
+    const einkOnly = "html[data-eink='true'] body *";
+    applyEinkModeAttribute(document, true);
+    expect(p.matches(einkOnly)).toBe(true);
+    applyEinkModeAttribute(document, false);
+    expect(p.matches(einkOnly)).toBe(false);
+    p.remove();
   });
 });
 
@@ -244,6 +280,27 @@ describe('getThemeCode', () => {
     localStorage.setItem('systemIsDarkMode', 'false');
     const code = getThemeCode();
     expect(code.isDarkMode).toBe(false);
+  });
+
+  it('uses ambientIsDarkMode when themeMode is ambient', () => {
+    localStorage.setItem('themeMode', 'ambient');
+    localStorage.setItem('ambientIsDarkMode', 'true');
+    localStorage.setItem('systemIsDarkMode', 'false');
+    expect(getThemeCode().isDarkMode).toBe(true);
+
+    localStorage.setItem('ambientIsDarkMode', 'false');
+    expect(getThemeCode().isDarkMode).toBe(false);
+  });
+
+  // themeStore seeds ambientIsDarkMode from the system appearance until the
+  // first lux reading persists a value. getThemeCode has to agree, or the app
+  // chrome and the book content disagree on the very first launch in ambient
+  // mode.
+  it('falls back to systemIsDarkMode when no ambient reading was persisted', () => {
+    localStorage.setItem('themeMode', 'ambient');
+    localStorage.setItem('systemIsDarkMode', 'true');
+    localStorage.removeItem('ambientIsDarkMode');
+    expect(getThemeCode().isDarkMode).toBe(true);
   });
 
   it('falls back to default theme when custom themeColor not found', () => {
@@ -418,6 +475,33 @@ describe('getStyles', () => {
     expect(css).toContain('background-color: #ffffff !important');
     expect(css).toContain('color: #171717 !important');
   });
+
+  it('scopes the inline-image baseline default to its own class so author values win #4866', () => {
+    const vs = makeViewSettings();
+    const themeCode: ThemeCode = {
+      bg: '#ffffff',
+      fg: '#171717',
+      primary: '#0066cc',
+      palette: {
+        'base-100': '#ffffff',
+        'base-200': '#f2f2f2',
+        'base-300': '#e0e0e0',
+        'base-content': '#171717',
+        neutral: '#cccccc',
+        'neutral-content': '#444444',
+        primary: '#0066cc',
+        secondary: '#3399ff',
+        accent: '#0055aa',
+      },
+      isDarkMode: false,
+    };
+    const css = getStyles(vs, themeCode);
+    // Baseline is opt-in via a dedicated class, not forced on every inline image.
+    expect(css).toMatch(/img\.has-text-siblings-baseline\s*\{[^}]*vertical-align:\s*baseline/);
+    // The size-clamp rule must not carry vertical-align anymore.
+    const clampRule = css.match(/\n\s*img\.has-text-siblings\s*\{[^}]*\}/)![0];
+    expect(clampRule).not.toContain('vertical-align');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -480,6 +564,66 @@ describe('applyImageStyle', () => {
     const img = document.querySelector('img')!;
     expect(img.classList.contains('has-text-siblings')).toBe(false);
   });
+
+  it('applies the baseline default when the image has no author vertical-align', () => {
+    document.body.innerHTML = '<p>Some text <img src="test.png" /> more text</p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+    expect(img.classList.contains('has-text-siblings-baseline')).toBe(true);
+  });
+
+  it('respects an author-set vertical-align (no baseline default) #4866', () => {
+    document.body.innerHTML =
+      '<p>Some text <img src="test.png" style="vertical-align: -0.15em" /> more text</p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+    expect(img.classList.contains('has-text-siblings-baseline')).toBe(false);
+  });
+
+  it('sets pointer-events: none on img[zy-enlarge-src="none"] and keeps the attribute', () => {
+    document.body.innerHTML = '<img zy-enlarge-src="none" src="a.png" />';
+
+    applyImageStyle(document);
+
+    const img = document.querySelector('img')!;
+    expect(img.getAttribute('zy-enlarge-src')).toBe('none');
+    expect(img.style.pointerEvents).toBe('none');
+  });
+
+  it('leaves img[zy-enlarge-src="self"] without pointer-events changes', () => {
+    document.body.innerHTML = `
+      <img zy-enlarge-src="self" src="a.png"/>
+      <img src="b.png"/>
+    `;
+
+    applyImageStyle(document);
+
+    document.querySelectorAll('img').forEach((img) => {
+      expect(img.style.pointerEvents).toBe('');
+    });
+  });
+});
+
+describe('applyLinkHitArea', () => {
+  const links = (n: number) => '<a href="#x">1</a>'.repeat(n);
+
+  beforeEach(() => {
+    document.documentElement.classList.remove(LINK_HIT_AREA_CLASS);
+  });
+
+  it('opts a document with up to MAX_ENLARGED_LINKS links in', () => {
+    document.body.innerHTML = links(MAX_ENLARGED_LINKS);
+    applyLinkHitArea(document);
+    expect(document.documentElement.classList.contains(LINK_HIT_AREA_CLASS)).toBe(true);
+  });
+
+  it('leaves a document with more links than MAX_ENLARGED_LINKS out', () => {
+    document.body.innerHTML = links(MAX_ENLARGED_LINKS + 1);
+    applyLinkHitArea(document);
+    expect(document.documentElement.classList.contains(LINK_HIT_AREA_CLASS)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -539,121 +683,134 @@ describe('keepTextAlignment', () => {
     expect(document.querySelector('div')!.classList.contains('aligned-right')).toBe(true);
     expect(document.querySelector('blockquote')!.classList.contains('aligned-justify')).toBe(true);
   });
+
+  it('skips the hidden placeholders of a chunked section', () => {
+    // A chunk of a huge section keeps one empty placeholder per top-level
+    // element outside it (foliate-js section-chunks.js): tens of thousands
+    // of them in a single-file book, none of which is ever shown.
+    document.body.innerHTML = `
+      <p data-foliate-chunk="0"></p>
+      <p style="text-align: center;">centered</p>
+      <div data-foliate-chunk="2"></div>
+    `;
+    const spy = vi.spyOn(window, 'getComputedStyle');
+    keepTextAlignment(document);
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+    expect(document.querySelector('p:not([data-foliate-chunk])')!.classList).toContain(
+      'aligned-center',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
-// applyTableStyle
-// ---------------------------------------------------------------------------
-describe('applyTableStyle', () => {
-  beforeEach(() => {
-    document.body.innerHTML = '';
+// applyNamespacedAttributes
+
+describe('applyNamespacedAttributes', () => {
+  const OPS = 'http://www.idpf.org/2007/ops';
+
+  // Sections reach the iframe through `srcdoc`, so they are always parsed as
+  // HTML no matter what the EPUB declares.
+  const parseAsSrcdoc = (body: string, root = 'xmlns:epub="http://www.idpf.org/2007/ops"') =>
+    new DOMParser().parseFromString(
+      `<html xmlns="http://www.w3.org/1999/xhtml" ${root}><body>${body}</body></html>`,
+      'text/html',
+    );
+
+  it('re-attaches the declared namespace to a prefixed attribute (#6038)', () => {
+    const doc = parseAsSrcdoc('<div epub:type="chapter">The Swans.</div>');
+    const div = doc.querySelector('div')!;
+    expect(div.getAttributeNS(OPS, 'type')).toBeNull();
+
+    applyNamespacedAttributes(doc);
+
+    expect(div.getAttributeNS(OPS, 'type')).toBe('chapter');
   });
 
-  it('applies scale transform to a table with td width attributes', () => {
-    document.body.innerHTML = `
-      <div>
-        <table>
-          <tr>
-            <td width="100">Cell 1</td>
-            <td width="200">Cell 2</td>
-          </tr>
-        </table>
-      </div>
-    `;
-    applyTableStyle(document);
-    const table = document.querySelector('table')!;
-    // totalTableWidth = 100 + 200 = 300
-    expect(table.style.transform).toContain('scale(');
-    expect(table.style.transform).toContain('300');
-    expect(table.style.transformOrigin).toBe('left top');
+  it('keeps the qualified-name lookup working', () => {
+    const doc = parseAsSrcdoc('<aside epub:type="footnote">note</aside>');
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('aside')!.getAttribute('epub:type')).toBe('footnote');
   });
 
-  it('applies scale transform using px width from td elements', () => {
-    document.body.innerHTML = `
-      <div>
-        <table>
-          <tr>
-            <td width="150px">Cell 1</td>
-            <td width="250px">Cell 2</td>
-          </tr>
-        </table>
-      </div>
-    `;
-    applyTableStyle(document);
-    const table = document.querySelector('table')!;
-    // totalTableWidth = 150 + 250 = 400
-    expect(table.style.transform).toContain('400');
+  it('leaves a prefix the document never declared alone', () => {
+    const doc = parseAsSrcdoc('<div ops:type="chapter">x</div>');
+    applyNamespacedAttributes(doc);
+    const div = doc.querySelector('div')!;
+    expect(div.getAttributeNS(OPS, 'type')).toBeNull();
+    expect(div.getAttribute('ops:type')).toBe('chapter');
   });
 
-  it('uses the widest row when multiple rows exist', () => {
-    document.body.innerHTML = `
-      <div>
-        <table>
-          <tr>
-            <td width="100">A</td>
-            <td width="100">B</td>
-          </tr>
-          <tr>
-            <td width="200">C</td>
-            <td width="300">D</td>
-          </tr>
-        </table>
-      </div>
-    `;
-    applyTableStyle(document);
-    const table = document.querySelector('table')!;
-    // Second row: 200 + 300 = 500
-    expect(table.style.transform).toContain('500');
+  it('matches the namespace URI rather than the prefix the book chose', () => {
+    const doc = parseAsSrcdoc(
+      '<div ops:type="chapter">x</div>',
+      'xmlns:ops="http://www.idpf.org/2007/ops"',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('div')!.getAttributeNS(OPS, 'type')).toBe('chapter');
   });
 
-  it('applies center-top origin when no cell widths are specified', () => {
-    document.body.innerHTML = `
-      <div style="width: 600px;">
-        <table>
-          <tr>
-            <td>Cell 1</td>
-            <td>Cell 2</td>
-          </tr>
-        </table>
-      </div>
-    `;
-    applyTableStyle(document);
-    const table = document.querySelector('table')!;
-    // No cell widths => totalTableWidth = 0
-    // jsdom getComputedStyle may return parentWidth as "" or "0px" so transform may not be set
-    // But if parentContainerWidth > 0 it would use center top
-    // In jsdom getComputedStyle returns "" for inline styles on div so parentContainerWidth = 0
-    // Neither branch applies; verify no crash
-    expect(table).toBeTruthy();
+  it('restores the standard EPUB namespace when a section fragment lost its declaration', () => {
+    const doc = parseAsSrcdoc('<a epub:type="noteref">1</a>', '');
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('a')!.getAttributeNS(OPS, 'type')).toBe('noteref');
   });
 
-  it('handles tables with inline style width on td', () => {
-    document.body.innerHTML = `
-      <div>
-        <table>
-          <tr>
-            <td style="width: 120px;">Cell 1</td>
-            <td style="width: 180px;">Cell 2</td>
-          </tr>
-        </table>
-      </div>
-    `;
-    applyTableStyle(document);
-    const table = document.querySelector('table')!;
-    // totalTableWidth = 120 + 180 = 300
-    expect(table.style.transform).toContain('300');
+  it('uses the EPUB fallback alongside an unrelated namespace declaration', () => {
+    const doc = parseAsSrcdoc(
+      '<section xmlns:svg="http://www.w3.org/2000/svg"><a epub:type="noteref">1</a></section>',
+      '',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('a')!.getAttributeNS(OPS, 'type')).toBe('noteref');
   });
 
-  it('does not crash on a table without parent element', () => {
-    // Table at root level inside body
-    document.body.innerHTML = `
-      <table>
-        <tr><td width="100">A</td></tr>
-      </table>
-    `;
-    // body is the parent, which is an Element, so it proceeds
-    applyTableStyle(document);
-    const table = document.querySelector('table')!;
-    expect(table.style.transform).toContain('100');
+  // The `xml` prefix is bound by the XML spec itself and never declared with
+  // `xmlns:xml`, so a book's `@namespace xml` + `[xml|lang="en"]` rule needs
+  // the implicit binding restored the same way.
+  it('binds the implicit xml prefix so [xml|lang] selectors can match', () => {
+    const doc = parseAsSrcdoc('<div xml:lang="en">x</div>', '');
+    applyNamespacedAttributes(doc);
+    const div = doc.querySelector('div')!;
+    expect(div.getAttributeNS('http://www.w3.org/XML/1998/namespace', 'lang')).toBe('en');
+    expect(div.getAttribute('xml:lang')).toBe('en');
+  });
+
+  it('leaves xmlns declarations untouched', () => {
+    const doc = parseAsSrcdoc('<div>x</div>');
+    applyNamespacedAttributes(doc);
+    const html = doc.documentElement;
+    expect(html.getAttribute('xmlns:epub')).toBe(OPS);
+    expect(html.getAttributeNS('http://www.w3.org/2000/xmlns/', 'epub')).toBeNull();
+  });
+
+  it('does not let a declaration reach a sibling that is out of its scope', () => {
+    const doc = parseAsSrcdoc(
+      '<section xmlns:epub="http://www.idpf.org/2007/ops"><div id="a" epub:type="chapter"></div></section>' +
+        '<section><div id="b" epub:type="chapter"></div></section>',
+      '',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('#a')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+    expect(doc.querySelector('#b')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+  });
+
+  it('restores the outer binding once a rebinding subtree ends', () => {
+    const OTHER = 'http://example.com/ns';
+    const doc = parseAsSrcdoc(
+      `<span xmlns:epub="${OTHER}"><i id="deep" epub:type="note"></i></span>` +
+        '<i id="after" epub:type="chapter"></i>',
+    );
+    applyNamespacedAttributes(doc);
+    expect(doc.querySelector('#deep')!.getAttributeNS(OTHER, 'type')).toBe('note');
+    expect(doc.querySelector('#after')!.getAttributeNS(OPS, 'type')).toBe('chapter');
+    expect(doc.querySelector('#after')!.getAttributeNS(OTHER, 'type')).toBeNull();
+  });
+
+  it('is a no-op for a document that declares no prefix', () => {
+    const doc = parseAsSrcdoc('<div class="chapter">x</div>', '');
+    const before = doc.body.innerHTML;
+    applyNamespacedAttributes(doc);
+    expect(doc.body.innerHTML).toBe(before);
   });
 });

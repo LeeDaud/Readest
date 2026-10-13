@@ -8,7 +8,14 @@ vi.mock('@/utils/misc', async (importOriginal) => {
   };
 });
 
-import { getStyles, ThemeCode } from '@/utils/style';
+import {
+  LINK_HIT_AREA_CLASS,
+  getStyles,
+  LINK_TOUCH_HOLD_CLASS,
+  TEXT_SELECTED_CLASS,
+  ThemeCode,
+} from '@/utils/style';
+import { CustomFont } from '@/styles/fonts';
 import { ViewSettings } from '@/types/book';
 import {
   DEFAULT_BOOK_FONT,
@@ -63,6 +70,22 @@ function makeThemeCode(overrides: Partial<ThemeCode> = {}): ThemeCode {
 // ---------------------------------------------------------------------------
 // getFontStyles branches
 // ---------------------------------------------------------------------------
+describe('oversized-block rules (via getStyles)', () => {
+  it('does not force pre-wrap white-space onto MathML (#480)', () => {
+    // MathML markup is usually pretty-printed; pre-wrap would turn the newlines
+    // and indentation between <mi>/<mo> tokens into rendered line breaks and
+    // spaces, breaking every inline formula onto its own line.
+    const css = getStyles(makeViewSettings(), makeThemeCode());
+    const preWrapSelectors = [...css.matchAll(/([^{}]+)\{[^}]*white-space:\s*pre-wrap/g)].map((m) =>
+      m[1]!.trim(),
+    );
+    expect(preWrapSelectors.length).toBeGreaterThan(0);
+    for (const selector of preWrapSelectors) {
+      expect(selector).not.toMatch(/\bmath\b/);
+    }
+  });
+});
+
 describe('getFontStyles branches (via getStyles)', () => {
   const theme = makeThemeCode();
 
@@ -93,6 +116,35 @@ describe('getFontStyles branches (via getStyles)', () => {
     expect(css).toMatch(/font-family: var\(--serif\)\s*[^!]/);
     // And body block should not have font-family at all
     expect(css).not.toContain('font-family: revert !important');
+  });
+
+  // Regression: the app default font used to be injected as a plain `html`
+  // rule, tying on specificity with ebook CSS that also declares its font on
+  // the html element (Pandoc-style EPUBs) and winning purely by injection
+  // order — the book's embedded font silently never applied with "Override
+  // Book Font" off. :where() drops the rule's specificity to zero so any book
+  // declaration beats it.
+  it('injects the default font at zero specificity via :where(html)', () => {
+    const vs = makeViewSettings({ overrideFont: false, defaultFont: 'Serif' });
+    const css = getStyles(vs, theme);
+    expect(css).toContain(':where(html)');
+    expect(css).toMatch(/:where\(html\)\s*\{\s*font-family: var\(--serif\)/);
+  });
+
+  // The monospace injection is zero-specificity too, so a book's own code font
+  // wins when Override Book Font is off. With the toggle ON the rule has to
+  // swap sides and outrank the book, which !important alone cannot do:
+  // specificity still breaks ties between important author declarations.
+  // The resolved cascade is asserted in code-font-override.browser.test.ts.
+  it('swaps the monospace rule above the book only when overrideFont is on', () => {
+    const off = getStyles(makeViewSettings({ overrideFont: false }), theme);
+    expect(off).toMatch(/:where\(pre, code, kbd\)\s*\{\s*font-family: var\(--monospace\)\s*;/);
+
+    const on = getStyles(makeViewSettings({ overrideFont: true }), theme);
+    expect(on).toMatch(
+      /html body :is\(pre, code, kbd\)\s*\{\s*font-family: var\(--monospace\) !important\s*;/,
+    );
+    expect(on).not.toContain(':where(pre, code, kbd)');
   });
 
   it('sets font-size according to defaultFontSize', () => {
@@ -390,6 +442,9 @@ describe('getLayoutStyles branches (via getStyles)', () => {
     expect(css).not.toContain('text-indent: 2em');
     expect(css).not.toContain('hyphens: auto');
     expect(css).not.toContain('-webkit-hyphens: auto');
+    // the body line-height reset exists to make room for our paragraph rules;
+    // with the book's layout in charge its `body { line-height }` must inherit
+    expect(css).not.toContain('line-height: unset');
     // non-paragraph layout rules must still be emitted
     expect(css).toContain('@namespace epub');
     expect(css).toContain('--margin-top: 50px');
@@ -419,6 +474,7 @@ describe('getLayoutStyles branches (via getStyles)', () => {
     expect(css).toContain('letter-spacing: 2px');
     expect(css).toContain('text-indent: 2em');
     expect(css).toContain('hyphens: auto');
+    expect(css).toContain('line-height: unset');
   });
 });
 
@@ -503,6 +559,52 @@ describe('getColorStyles branches (via getStyles)', () => {
     expect(css).not.toMatch(/^\s*img\s*\{[^}]*mix-blend-mode: multiply/m);
   });
 
+  // #5250: with overrideColor also on, a second filter declaration in the same
+  // img rule silently discarded invert(100%) (last declaration wins), and
+  // mix-blend-mode: multiply erased images against dark page backgrounds
+  // (multiply with black is always black).
+  describe('invert image in dark mode combined with overrideColor (#5250)', () => {
+    // Concatenate every plain `img { ... }` rule in document order: they all
+    // share the same specificity, so this mirrors the cascade the browser
+    // applies (last declaration wins).
+    const getImgBlock = (css: string) => {
+      const blocks = [...css.matchAll(/^\s*img\s*\{([^}]*)\}/gm)].map((m) => m[1]!);
+      expect(blocks.length).toBeGreaterThan(0);
+      return blocks.join('\n');
+    };
+
+    it('keeps invert(100%) as the only filter declaration when overrideColor is on', () => {
+      const vs = makeViewSettings({ invertImgColorInDark: true, overrideColor: true });
+      const theme = makeThemeCode({ isDarkMode: true, bg: '#000000', fg: '#e0e0e0' });
+      const imgBlock = getImgBlock(getStyles(vs, theme));
+      const filters = [...imgBlock.matchAll(/filter:[^;]*;/g)].map((m) => m[0]);
+      expect(filters).toEqual(['filter: invert(100%);']);
+    });
+
+    it('does not multiply-blend inverted images into the dark background', () => {
+      const vs = makeViewSettings({ invertImgColorInDark: true, overrideColor: true });
+      const theme = makeThemeCode({ isDarkMode: true, bg: '#000000', fg: '#e0e0e0' });
+      const imgBlock = getImgBlock(getStyles(vs, theme));
+      expect(imgBlock).not.toContain('mix-blend-mode: multiply');
+    });
+
+    it('keeps the grayscale + multiply treatment when invert is off in dark mode', () => {
+      const vs = makeViewSettings({ invertImgColorInDark: false, overrideColor: true });
+      const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+      const imgBlock = getImgBlock(getStyles(vs, theme));
+      expect(imgBlock).toContain('filter: grayscale(100%) contrast(1.2) brightness(1.2);');
+      expect(imgBlock).toContain('mix-blend-mode: multiply;');
+    });
+
+    it('keeps multiply in light mode when overrideColor is on regardless of invert', () => {
+      const vs = makeViewSettings({ invertImgColorInDark: true, overrideColor: true });
+      const theme = makeThemeCode({ isDarkMode: false });
+      const imgBlock = getImgBlock(getStyles(vs, theme));
+      expect(imgBlock).toContain('mix-blend-mode: multiply;');
+      expect(imgBlock).not.toContain('filter: invert(100%)');
+    });
+  });
+
   it('sets bg-texture-id CSS variable', () => {
     const vs = makeViewSettings({ backgroundTextureId: 'paper' });
     const theme = makeThemeCode();
@@ -532,6 +634,17 @@ describe('getColorStyles branches (via getStyles)', () => {
     const css = getStyles(vs, theme);
     expect(css).not.toContain('::selection');
     expect(css).not.toContain('::-moz-selection');
+  });
+
+  // Chromium's default selection paints near-black text, unreadable on a dark
+  // page (#6503). A background-only rule keeps each element's own text color.
+  it('gives dark mode a theme selection background without forcing a text color', () => {
+    const vs = makeViewSettings({ isEink: false });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#222222', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    const rule = css.match(/::selection\s*{([^}]*)}/);
+    expect(rule?.[1]).toContain('background: color-mix(in srgb, #3366cc 40%, transparent)');
+    expect(rule?.[1]).not.toMatch(/(^|[\s;])color:/);
   });
 
   it('sets text-decoration to underline for links when isEink is true', () => {
@@ -568,6 +681,40 @@ describe('getColorStyles branches (via getStyles)', () => {
     const css = getStyles(vs, theme);
     // body.pbg block should be empty or absent
     expect(css).not.toMatch(/body\.pbg\s*\{[^}]*background-color:[^}]*!important/);
+  });
+
+  it('overrides inline white backgrounds in dark mode when overrideColor is false', () => {
+    const vs = makeViewSettings({ overrideColor: false });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    expect(css).toContain('background-color: #1a1a1a !important');
+    expect(css).toContain('background-color: #fff"]');
+    expect(css).toContain('body.theme-dark');
+  });
+
+  it('keeps body.theme-dark transparent in dark mode so the host background texture is not occluded (#4446)', () => {
+    const vs = makeViewSettings({ overrideColor: false, backgroundTextureId: 'leaves' });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    expect(css).toMatch(/body\.theme-dark\s*\{\s*background-color: transparent !important;/);
+    expect(css).not.toMatch(/body\.theme-dark\s*\{\s*background-color: #1a1a1a !important/);
+    // #4392 inline light-callout overrides must keep forcing the theme bg
+    expect(css).toContain('background-color: #fff"]');
+    expect(css).toContain('background-color: #1a1a1a !important');
+  });
+
+  it('keeps body.theme-dark transparent even without a texture (docBackground is captured once per section load)', () => {
+    const vs = makeViewSettings({ overrideColor: false, backgroundTextureId: 'none' });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    expect(css).toMatch(/body\.theme-dark\s*\{\s*background-color: transparent !important;/);
+  });
+
+  it('does not add inline white background overrides in light mode', () => {
+    const vs = makeViewSettings({ overrideColor: false });
+    const theme = makeThemeCode({ isDarkMode: false });
+    const css = getStyles(vs, theme);
+    expect(css).not.toContain('background-color: #fff"]');
   });
 
   it('applies dark mode link color lightblue when overrideColor is false', () => {
@@ -619,6 +766,33 @@ describe('getColorStyles branches (via getStyles)', () => {
     // blockquote, table * rule should have background with color-mix
     expect(css).toMatch(
       /blockquote,\s*table\s*\*\s*\{[^}]*background:\s*color-mix\(in srgb,\s*#1a1a1a\s*80%,\s*#000\)/,
+    );
+  });
+
+  it('does not tint table descendants in dark mode when overrideColor is false (#4419)', () => {
+    const vs = makeViewSettings({ overrideColor: false });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    // When the user has NOT enabled color override, the `blockquote, table *`
+    // rule must not paint a tinted background on table descendants. Otherwise
+    // plain tables — and the invisible spacer cells some books use for vertical
+    // layout — render with a color different from the page background, and the
+    // spacing between words appears to change in dark mode. Regression from
+    // #4055; the #4028 zebra-row legibility case is now handled by the
+    // light-background rewriters from #4392. See issue #4419.
+    const match = css.match(/blockquote,\s*table\s*\*\s*\{([^}]*)\}/);
+    expect(match).not.toBeNull();
+    expect(match![1]).not.toContain('color-mix');
+  });
+
+  it('still tints blockquotes in dark mode when overrideColor is false', () => {
+    const vs = makeViewSettings({ overrideColor: false });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    // The standalone `blockquote` rule keeps its dark-mode tint regardless of
+    // overrideColor — only the shared `table *` part is gated.
+    expect(css).toMatch(
+      /blockquote\s*\{[^}]*background:\s*color-mix\(in srgb,\s*#1a1a1a\s*80%,\s*#000\)/,
     );
   });
 
@@ -683,6 +857,79 @@ describe('getTranslationStyles branches (via getStyles)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Translated text style (font, style, size, color)
+// ---------------------------------------------------------------------------
+describe('translated text style (via getStyles)', () => {
+  const theme = makeThemeCode();
+  const block = (css: string) => css.match(/\.translation-target-block\s*\{([^}]*)\}/)?.[1] ?? '';
+
+  it('leaves the translation looking like the book by default', () => {
+    const rules = block(getStyles(makeViewSettings(), theme));
+    expect(rules).not.toMatch(/font-size|color|font-family|font-style|font-weight/);
+  });
+
+  it('applies a configured font, style, size and color', () => {
+    const rules = block(
+      getStyles(
+        makeViewSettings({
+          translationFont: 'serif',
+          translationFontStyle: 'bold-italic',
+          translationFontSize: 0.85,
+          translationColor: '#ff0000',
+        }),
+        theme,
+      ),
+    );
+    expect(rules).toMatch(/font-family:\s*var\(--serif\)\s*!important/);
+    expect(rules).toMatch(/font-style:\s*italic\s*!important/);
+    expect(rules).toMatch(/font-weight:\s*bold\s*!important/);
+    expect(rules).toMatch(/font-size:\s*0\.85em\s*!important/);
+    expect(rules).toMatch(/color:\s*#ff0000\s*!important/);
+  });
+
+  it('applies italic without bold, and bold without italic', () => {
+    const italic = block(getStyles(makeViewSettings({ translationFontStyle: 'italic' }), theme));
+    expect(italic).toMatch(/font-style:\s*italic/);
+    expect(italic).not.toMatch(/font-weight/);
+    const bold = block(getStyles(makeViewSettings({ translationFontStyle: 'bold' }), theme));
+    expect(bold).toMatch(/font-weight:\s*bold/);
+    expect(bold).not.toMatch(/font-style/);
+  });
+
+  it('does not style translated TOC entries', () => {
+    const css = getStyles(makeViewSettings({ translationColor: '#ff0000' }), theme);
+    const toc = css.match(/\.translation-target-toc\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(toc).not.toContain('#ff0000');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getRubyStyles branches (Word Lens gloss <rt> size + color)
+// ---------------------------------------------------------------------------
+describe('getRubyStyles branches (via getStyles)', () => {
+  const theme = makeThemeCode();
+  const rtBlock = (css: string) => css.match(/ruby\.wl-gloss\s*>\s*rt\s*\{([^}]*)\}/)?.[1] ?? '';
+
+  it('defaults the gloss to 0.5em and muted (opacity 0.7, no color override)', () => {
+    const block = rtBlock(getStyles(makeViewSettings(), theme));
+    expect(block).toMatch(/font-size:\s*0\.5em/);
+    expect(block).toMatch(/opacity:\s*0\.7/);
+    expect(block).not.toContain('color:');
+  });
+
+  it('applies a configured gloss font size', () => {
+    const block = rtBlock(getStyles(makeViewSettings({ wordLensGlossFontSize: 0.8 }), theme));
+    expect(block).toMatch(/font-size:\s*0\.8em/);
+  });
+
+  it('applies a configured gloss color at full opacity', () => {
+    const block = rtBlock(getStyles(makeViewSettings({ wordLensGlossColor: '#ff0000' }), theme));
+    expect(block).toMatch(/color:\s*#ff0000/);
+    expect(block).toMatch(/opacity:\s*1\b/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getStyles integration: userStylesheet appended
 // ---------------------------------------------------------------------------
 describe('getStyles integration', () => {
@@ -717,5 +964,155 @@ describe('getStyles integration', () => {
     const css = getStyles(vs);
     expect(css).toBeTruthy();
     expect(css).toContain('--theme-bg-color');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// custom @font-face inlining
+// ---------------------------------------------------------------------------
+
+/** Build a loaded CustomFont (blob URL in memory) for testing. */
+function makeCustomFont(overrides: Partial<CustomFont> = {}): CustomFont {
+  return {
+    id: 'my-test-font',
+    name: 'My Test Font',
+    path: '/fonts/my-test-font.ttf',
+    blobUrl: 'blob:http://localhost/my-test-font',
+    ...overrides,
+  };
+}
+
+describe('custom @font-face inlining (via getStyles)', () => {
+  const theme = makeThemeCode();
+
+  it('inlines an @font-face rule for each loaded custom font', () => {
+    const vs = makeViewSettings();
+    const css = getStyles(vs, theme, [makeCustomFont()]);
+    expect(css).toContain('@font-face');
+    expect(css).toContain('font-family: "My Test Font"');
+    expect(css).toContain('blob:http://localhost/my-test-font');
+  });
+
+  it('keeps @namespace epub ahead of every @font-face rule (#4438)', () => {
+    const vs = makeViewSettings();
+    const css = getStyles(vs, theme, [makeCustomFont()]);
+    // A `@namespace` rule is only honored when it precedes all style and
+    // `@font-face` rules; a misplaced one is silently ignored, which drops
+    // the namespaced `aside[epub|type~="footnote"]` selector and reveals the
+    // footnote aside's border as a stray horizontal line (#4438). The custom
+    // `@font-face` rules must therefore come after the namespace declaration.
+    expect(css).toContain('@namespace epub');
+    expect(css).toContain('@font-face');
+    expect(css.indexOf('@namespace epub')).toBeLessThan(css.indexOf('@font-face'));
+  });
+
+  it('still inlines custom @font-face ahead of the font-family declarations', () => {
+    const vs = makeViewSettings();
+    const css = getStyles(vs, theme, [makeCustomFont()]);
+    // Paginator writes this CSS into the iframe before its first paint, so the
+    // custom `@font-face` rules should still precede the `--serif`/`--sans-serif`
+    // font lists that reference them.
+    expect(css.indexOf('@font-face')).toBeLessThan(css.indexOf('--serif:'));
+  });
+
+  it('emits one @font-face per loaded font', () => {
+    const vs = makeViewSettings();
+    const fonts = [
+      makeCustomFont({ id: 'font-a', name: 'Font A', blobUrl: 'blob:http://localhost/a' }),
+      makeCustomFont({ id: 'font-b', name: 'Font B', blobUrl: 'blob:http://localhost/b' }),
+    ];
+    const css = getStyles(vs, theme, fonts);
+    expect(css.split('@font-face').length - 1).toBe(2);
+    expect(css).toContain('font-family: "Font A"');
+    expect(css).toContain('font-family: "Font B"');
+  });
+
+  it('skips fonts that have no blob URL', () => {
+    const vs = makeViewSettings();
+    const css = getStyles(vs, theme, [makeCustomFont({ blobUrl: undefined })]);
+    expect(css).not.toContain('font-family: "My Test Font"');
+  });
+
+  it('emits no custom @font-face when no fonts are passed', () => {
+    const vs = makeViewSettings();
+    const css = getStyles(vs, theme);
+    expect(css).not.toContain('font-family: "My Test Font"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Instant-highlight selection suppression
+// ---------------------------------------------------------------------------
+// The instant-highlight quick action owns the touch long-press. Stylesheet
+// `user-select: none` is NOT used for this: on iOS WebKit it breaks
+// `caretRangeFromPoint` (returns null on non-selectable content), killing the
+// instant highlight itself. The system selection is suppressed natively
+// instead (TextSelectionSuppressor in the native-bridge iOS plugin, driven by
+// setSelectionSuppressed from FoliateViewer); getStyles must stay free of
+// user-select suppression so caret positioning keeps working.
+describe('instant-highlight selection suppression stays out of getStyles', () => {
+  const theme = makeThemeCode();
+
+  it('never makes the content non-selectable, even with instant highlight on', () => {
+    const vs = makeViewSettings({
+      enableAnnotationQuickActions: true,
+      annotationQuickAction: 'highlight',
+    });
+    const css = getStyles(vs, theme);
+    expect(css).not.toContain('user-select: none !important');
+  });
+});
+
+describe('link touch hold (#6242)', () => {
+  it('takes links out of hit testing while a touch is held', () => {
+    // Chromium's touch adjustment snaps a long press onto a link within reach
+    // of the finger, and a long press on a link never starts a text selection.
+    const css = getStyles(makeViewSettings(), makeThemeCode());
+    expect(css).toMatch(
+      new RegExp(
+        `html\\.${LINK_TOUCH_HOLD_CLASS} a\\[href\\]\\s*\\{\\s*pointer-events: none !important;`,
+      ),
+    );
+  });
+});
+
+describe('link hit area during a text selection (#6566)', () => {
+  it('takes the enlarged link hit area out of hit testing while text is selected', () => {
+    // The empty a::before box spreads 10px around each link and swallows the
+    // text there, so dragging a selection onto a footnote's neighbor snapped it.
+    const css = getStyles(makeViewSettings(), makeThemeCode());
+    expect(css).toMatch(
+      new RegExp(`html\\.${TEXT_SELECTED_CLASS} a::before\\s*\\{\\s*pointer-events: none;`),
+    );
+  });
+});
+
+describe('link hit area in link-dense sections', () => {
+  it('enlarges link hit areas only in documents opted in with LINK_HIT_AREA_CLASS', () => {
+    // Positioning every link and its ::before box made a 20 MB concordance
+    // section with 273k links take minutes to lay out, so the enlarged area is
+    // opt-in per document instead of on by default.
+    const css = getStyles(makeViewSettings(), makeThemeCode());
+    expect(css).toMatch(
+      new RegExp(`html\\.${LINK_HIT_AREA_CLASS} a\\s*\\{\\s*position: relative !important;`),
+    );
+    expect(css).toMatch(new RegExp(`html\\.${LINK_HIT_AREA_CLASS} a::before\\s*\\{`));
+    expect(css).not.toMatch(/(^|\n)\s*a\s*\{\s*position: relative !important;/);
+  });
+});
+
+describe('paragraph indent exemption for image-only paragraphs', () => {
+  // A full-width inline image that takes the paragraph indent overhangs the
+  // column by the indent and paints a strip on the next page (#6198). The
+  // exemption must also see an image wrapped in a link, which is how Wikipedia
+  // (and most sites) mark up a figure: <p><span><a><img></a></span></p>.
+  it('drops the indent for an image wrapped in a link, with or without a span', () => {
+    const css = getStyles(makeViewSettings({ textIndent: 2 }));
+    const rule = css
+      .split('}')
+      .find((block) => block.includes('text-indent: initial !important') && block.includes('img'));
+    expect(rule).toBeDefined();
+    expect(rule).toContain('p:has(> a:only-child > img:only-child)');
+    expect(rule).toContain('p:has(> span:only-child > a:only-child > img:only-child)');
   });
 });

@@ -2,7 +2,7 @@ import clsx from 'clsx';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 import { BookNote, HighlightColor } from '@/types/book';
-import { Point, TextSelection } from '@/utils/sel';
+import { Point, rangeFromAnchorToPoint, TextSelection } from '@/utils/sel';
 import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useReaderStore } from '@/store/readerStore';
@@ -23,7 +23,7 @@ interface HandleProps {
   onDragEnd: () => void;
 }
 
-const Handle: React.FC<HandleProps> = ({
+export const Handle: React.FC<HandleProps> = ({
   hidden,
   position,
   isVertical,
@@ -73,6 +73,7 @@ const Handle: React.FC<HandleProps> = ({
 
   return (
     <div
+      data-testid='selection-handle'
       className={clsx(
         'pointer-events-auto absolute z-50 cursor-grab touch-none active:cursor-grabbing',
         hidden && 'hidden',
@@ -102,7 +103,13 @@ const Handle: React.FC<HandleProps> = ({
         width={size}
         height={size + stemHeight}
         viewBox={`0 0 ${size} ${size + stemHeight}`}
-        className={clsx(type === 'start' && 'rotate-180')}
+        // NOTE: no `rotate-*` utility here. Tailwind v4 emits those as the
+        // standalone `rotate` property, which COMPOSES with `transform`
+        // instead of being overridden by it (v3 folded it into `transform`
+        // via --tw-rotate). A `rotate-180` alongside this transform added a
+        // half turn to every start handle: 180+180 = 0 horizontally and
+        // 180+270 = 90 vertically, both leaving the start ball on the same
+        // side as the end ball instead of mirroring it.
         style={{
           transform: isVertical
             ? type === 'start'
@@ -140,6 +147,9 @@ interface AnnotationRangeEditorProps {
   getAnnotationText: (range: Range) => Promise<string>;
   setSelection: React.Dispatch<React.SetStateAction<TextSelection | null>>;
   onStartEdit: () => void;
+  noteAutoTurnPoint: (point: Point | null) => void;
+  cancelAutoTurn: () => void;
+  onAutoTurn: (cb: () => void) => () => void;
 }
 
 const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
@@ -152,6 +162,9 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
   getAnnotationText,
   setSelection,
   onStartEdit,
+  noteAutoTurnPoint,
+  cancelAutoTurn,
+  onAutoTurn,
 }) => {
   const { appService } = useEnv();
   const { settings } = useSettingsStore();
@@ -160,14 +173,21 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
   const viewSettings = getViewSettings(bookKey);
   const isEink = settings.globalViewSettings.isEink;
   const einkFgColor = isDarkMode ? '#ffffff' : '#000000';
-  const { handlePositions, getHandlePositionsFromRange, handleAnnotationRangeChange } =
-    useAnnotationEditor({ bookKey, annotation, getAnnotationText, setSelection });
+  const { handlePositions, getHandlePositionsFromRange, applyAnnotationRange } =
+    useAnnotationEditor({ bookKey, annotation, selection, getAnnotationText, setSelection });
 
   const handleColorHex = getHighlightColorHex(settings, handleColor) ?? '#FFFF00';
   const draggingRef = useRef<'start' | 'end' | null>(null);
   const dragPointerTypeRef = useRef<string>('');
   const startRef = useRef<Point>({ x: 0, y: 0 });
   const endRef = useRef<Point>({ x: 0, y: 0 });
+  // The non-dragged end captured as a DOM position at drag start so the range
+  // survives a corner auto page-turn (a window coordinate would re-target to
+  // whatever scrolls under it, losing the previous page's part).
+  const fixedAnchorRef = useRef<{ node: Node; offset: number } | null>(null);
+  const lastBuiltRef = useRef<{ range: Range; index: number } | null>(null);
+  // Unsubscribe for the after-turn re-emit while a handle is being dragged.
+  const autoTurnUnsubRef = useRef<(() => void) | null>(null);
   const [draggingHandle, setDraggingHandle] = useState<'start' | 'end' | null>(null);
   const [currentStart, setCurrentStart] = useState<Point>({ x: 0, y: 0 });
   const [currentEnd, setCurrentEnd] = useState<Point>({ x: 0, y: 0 });
@@ -184,6 +204,11 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
       startRef.current = positions.start;
       endRef.current = positions.end;
     }
+    // Keep the anchor base in sync with the current annotation range so a fresh
+    // drag anchors against this annotation, not a previously edited one.
+    if (!draggingRef.current) {
+      lastBuiltRef.current = { range: selection.range, index: selection.index };
+    }
   }, [annotation, selection, isVertical, getHandlePositionsFromRange]);
 
   useEffect(() => {
@@ -196,26 +221,68 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
     endRef.current = handlePositions.end;
   }, [handlePositions]);
 
+  // Build the edited range from the DOM-anchored non-dragged end to the dragged
+  // handle position, apply it, and feed the dragged point into the corner
+  // auto-turn so the page can turn mid-edit.
+  const updateFromDraggedPoint = useCallback(
+    (point: Point) => {
+      const anchor = fixedAnchorRef.current;
+      if (!anchor) return;
+      const doc = anchor.node.ownerDocument;
+      const win = doc?.defaultView;
+      if (!doc || !win) return;
+      const feRect = win.frameElement?.getBoundingClientRect();
+      const built = rangeFromAnchorToPoint(
+        doc,
+        anchor.node,
+        anchor.offset,
+        point.x - (feRect?.left ?? 0),
+        point.y - (feRect?.top ?? 0),
+      );
+      if (!built) return;
+      lastBuiltRef.current = { range: built, index: selection.index };
+      noteAutoTurnPoint(viewSettings?.scrolled ? null : point);
+      applyAnnotationRange(built, selection.index, isVertical, true);
+    },
+    [selection.index, isVertical, applyAnnotationRange, noteAutoTurnPoint, viewSettings?.scrolled],
+  );
+
+  // Rebuild from the held handle position after an auto page-turn so the edited
+  // range extends onto the new page without waiting for the next move.
+  const subscribeAutoTurnReemit = useCallback(() => {
+    autoTurnUnsubRef.current?.();
+    autoTurnUnsubRef.current = onAutoTurn(() => {
+      const point = draggingRef.current === 'start' ? startRef.current : endRef.current;
+      updateFromDraggedPoint(point);
+    });
+  }, [onAutoTurn, updateFromDraggedPoint]);
+
   const handleStartDragStart = useCallback(
     (pointerType: string) => {
+      const base = lastBuiltRef.current?.range ?? selection.range;
+      fixedAnchorRef.current = { node: base.endContainer, offset: base.endOffset };
       draggingRef.current = 'start';
       dragPointerTypeRef.current = pointerType;
       setDraggingHandle('start');
       setLoupePoint({ ...startRef.current });
+      subscribeAutoTurnReemit();
       onStartEdit();
     },
-    [onStartEdit],
+    [selection, onStartEdit, subscribeAutoTurnReemit],
   );
 
   const handleEndDragStart = useCallback(
     (pointerType: string) => {
+      const base = lastBuiltRef.current?.range ?? selection.range;
+      fixedAnchorRef.current = { node: base.startContainer, offset: base.startOffset };
       draggingRef.current = 'end';
       dragPointerTypeRef.current = pointerType;
       setDraggingHandle('end');
       setLoupePoint({ ...endRef.current });
+      subscribeAutoTurnReemit();
       onStartEdit();
     },
-    [onStartEdit],
+    [selection, onStartEdit, subscribeAutoTurnReemit],
   );
 
   const handleStartDrag = useCallback(
@@ -223,9 +290,9 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
       setCurrentStart(point);
       setLoupePoint(point);
       startRef.current = point;
-      handleAnnotationRangeChange(point, endRef.current, isVertical, true);
+      updateFromDraggedPoint(point);
     },
-    [isVertical, handleAnnotationRangeChange],
+    [updateFromDraggedPoint],
   );
 
   const handleEndDrag = useCallback(
@@ -233,17 +300,23 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
       setCurrentEnd(point);
       setLoupePoint(point);
       endRef.current = point;
-      handleAnnotationRangeChange(startRef.current, point, isVertical, true);
+      updateFromDraggedPoint(point);
     },
-    [isVertical, handleAnnotationRangeChange],
+    [updateFromDraggedPoint],
   );
 
   const handleDragEnd = useCallback(() => {
     draggingRef.current = null;
     setDraggingHandle(null);
     setLoupePoint(null);
-    handleAnnotationRangeChange(startRef.current, endRef.current, isVertical, false);
-  }, [isVertical, handleAnnotationRangeChange]);
+    cancelAutoTurn();
+    autoTurnUnsubRef.current?.();
+    autoTurnUnsubRef.current = null;
+    const last = lastBuiltRef.current;
+    if (last) {
+      applyAnnotationRange(last.range, last.index, isVertical, false);
+    }
+  }, [isVertical, applyAnnotationRange, cancelAutoTurn]);
 
   if (currentStart.x === 0 && currentStart.y === 0) {
     return null;
@@ -257,7 +330,14 @@ const AnnotationRangeEditor: React.FC<AnnotationRangeEditorProps> = ({
   const showLoupe = appService?.isMobile && !viewSettings?.isEink && !viewSettings?.vertical;
 
   return (
-    <div className='pointer-events-none fixed inset-0 z-50'>
+    // The handle layer sits BELOW the popup/sheet layer. Both used to be z-50
+    // in the same stacking context, so the tie broke on DOM order — and the
+    // range editors are rendered after the popups, which put their handles on
+    // top of the dictionary, the translator and the note editor sheet. z-[44]
+    // keeps them over the book and the paragraph/TTS chrome (z-40) while
+    // leaving the popups (z-50), dialogs (z-50) and the side panels' overlay
+    // (z-[45]) above them.
+    <div className='pointer-events-none fixed inset-0 z-[44]'>
       <Handle
         hidden={activeHandle === 'end' || loupeDragPoint !== null}
         position={currentStart}

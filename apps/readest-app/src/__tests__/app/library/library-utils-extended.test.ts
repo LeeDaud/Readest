@@ -5,6 +5,7 @@ import {
   getBookSortValue,
   compareSortValues,
   createBookSorter,
+  getProgressPercentage,
 } from '@/app/library/utils/libraryUtils';
 import { Book } from '@/types/book';
 import { LibrarySortByType } from '@/types/settings';
@@ -17,6 +18,7 @@ import { BookMetadata } from '@/libs/document';
  * - getBookSortValue
  * - compareSortValues
  * - createBookSorter (additional sort-by cases: Author, Format, Series, Published, default)
+ * - getProgressPercentage
  */
 
 const createMockBook = (
@@ -76,6 +78,19 @@ describe('createBookFilter', () => {
       metadata: { description: 'An adventure tale' },
     });
     expect(filter(book)).toBe(true);
+  });
+
+  it('should match tags and subjects through regex and invalid-regex paths', () => {
+    expect(createBookFilter('favorite')(createMockBook({ tags: ['Favorite'] }))).toBe(true);
+    expect(
+      createBookFilter('science')(
+        createMockBook({ metadata: { subject: [{ name: { en: 'Science Fiction' } }] } }),
+      ),
+    ).toBe(true);
+    expect(createBookFilter('[favorite')(createMockBook({ tags: ['[Favorite'] }))).toBe(true);
+    expect(
+      createBookFilter('[history')(createMockBook({ metadata: { subject: ['[History'] } })),
+    ).toBe(true);
   });
 
   it('should be case-insensitive', () => {
@@ -195,6 +210,21 @@ describe('getBookSortValue', () => {
     const book = createMockBook({ updatedAt: 99999 });
     expect(getBookSortValue(book, 'unknown' as LibrarySortByType)).toBe(99999);
   });
+
+  it('should return read ratio for Progress sort', () => {
+    const book = createMockBook({ progress: [50, 100] });
+    expect(getBookSortValue(book, LibrarySortByType.Progress)).toBe(0.5);
+  });
+
+  it('should return 0 for Progress sort when book has no progress', () => {
+    const book = createMockBook({});
+    expect(getBookSortValue(book, LibrarySortByType.Progress)).toBe(0);
+  });
+
+  it('should return 0 for Progress sort when total pages is 0', () => {
+    const book = createMockBook({ progress: [0, 0] });
+    expect(getBookSortValue(book, LibrarySortByType.Progress)).toBe(0);
+  });
 });
 
 describe('compareSortValues', () => {
@@ -309,5 +339,35 @@ describe('createBookSorter - additional cases', () => {
     const sorted = [...books].sort(sorter);
     expect(sorted[0]!.title).toBe('Older');
     expect(sorted[1]!.title).toBe('Newer');
+  });
+
+  it('should sort by reading progress ascending (unread books first)', () => {
+    const books = [
+      createMockBook({ title: 'Almost done', progress: [90, 100] }),
+      createMockBook({ title: 'Not started' }),
+      createMockBook({ title: 'Just begun', progress: [10, 100] }),
+      createMockBook({ title: 'Halfway', progress: [1, 2] }),
+    ];
+    const sorter = createBookSorter(LibrarySortByType.Progress, 'en');
+    const sorted = [...books].sort(sorter);
+    expect(sorted.map((b) => b.title)).toEqual([
+      'Not started',
+      'Just begun',
+      'Halfway',
+      'Almost done',
+    ]);
+  });
+});
+
+describe('getProgressPercentage', () => {
+  it.each([
+    [undefined, null],
+    [[0, 0], null],
+    [[1, 1], 100], // a total of 1 means finished
+    [[1, 3], 33],
+    [[2, 3], 67],
+  ] as const)('maps progress %j to %j', (progress, expected) => {
+    const book = createMockBook({ progress: progress as [number, number] | undefined });
+    expect(getProgressPercentage(book)).toBe(expected);
   });
 });

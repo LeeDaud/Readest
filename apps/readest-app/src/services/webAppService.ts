@@ -4,6 +4,7 @@ import { SchemaType } from '@/services/database/migrate';
 import { getOSPlatform, isValidURL } from '@/utils/misc';
 import { isSafariBrowser } from '@/utils/ua';
 import { RemoteFile } from '@/utils/file';
+import { detectViewTransitionGroup, detectViewTransitionsAPI } from '@/utils/viewTransition';
 import { isPWA } from './environment';
 import { BaseAppService } from './appService';
 import {
@@ -80,9 +81,9 @@ const indexedDBFileSystem: FileSystem = {
   async getImageURL(path: string) {
     return await this.getBlobURL(path, 'None');
   },
-  async openFile(path: string, base: BaseDir, filename?: string) {
+  async openFile(path: string, base: BaseDir, filename?: string, fetcher?: typeof fetch) {
     if (isValidURL(path)) {
-      return await new RemoteFile(path, filename).open();
+      return await new RemoteFile(path, filename, '', Date.now(), fetcher).open();
     } else {
       const content = await this.readFile(path, base, 'binary');
       return new File([content], filename || path);
@@ -123,8 +124,15 @@ const indexedDBFileSystem: FileSystem = {
       request.onsuccess = async () => {
         if (request.result) {
           const content = request.result.content;
-          if (mode === 'text') resolve(content);
-          else {
+          if (mode === 'text') {
+            if (content instanceof Blob) {
+              resolve(await content.text());
+            } else if (content instanceof ArrayBuffer) {
+              resolve(new TextDecoder().decode(content));
+            } else {
+              resolve(content);
+            }
+          } else {
             if (content instanceof Blob) {
               const arrayBuffer = await content.arrayBuffer();
               resolve(arrayBuffer);
@@ -208,7 +216,10 @@ const indexedDBFileSystem: FileSystem = {
     return new Promise<FileItem[]>((resolve, reject) => {
       const transaction = db.transaction('files', 'readonly');
       const store = transaction.objectStore('files');
-      const request = store.getAll();
+      // Keys are file paths: constrain to the directory prefix instead of
+      // materializing the whole store (every book blob) per listing — an
+      // unbounded getAll() here cost seconds per call on large libraries.
+      const request = store.getAll(IDBKeyRange.bound(prefix, `${prefix}\uffff`, false, true));
 
       request.onsuccess = () => {
         const files = request.result as { path: string; content: string | ArrayBuffer | Blob }[];
@@ -289,6 +300,8 @@ export class WebAppService extends BaseAppService {
   override isMobile = ['android', 'ios'].includes(getOSPlatform());
   override appPlatform = 'web' as AppPlatform;
   override supportsCanvasContext2DFilter = !isSafariBrowser();
+  override supportsViewTransitionsAPI = detectViewTransitionsAPI();
+  override supportsViewTransitionGroup = detectViewTransitionGroup();
   override hasSafeAreaInset = isPWA();
 
   override async init() {
@@ -302,7 +315,7 @@ export class WebAppService extends BaseAppService {
       const settings = await this.loadSettings();
       const lastMigrationVersion = settings.migrationVersion || 0;
 
-      await super.runMigrations(lastMigrationVersion);
+      await super.runMigrations(lastMigrationVersion, settings);
 
       if (lastMigrationVersion < this.CURRENT_MIGRATION_VERSION) {
         await this.saveSettings({
@@ -333,7 +346,7 @@ export class WebAppService extends BaseAppService {
 
   async saveFile(
     filename: string,
-    content: string | ArrayBuffer,
+    content: string | ArrayBuffer | null,
     options?: {
       filePath?: string;
       mimeType?: string;
@@ -344,6 +357,9 @@ export class WebAppService extends BaseAppService {
     },
   ): Promise<boolean> {
     const mimeType = options?.mimeType || 'application/octet-stream';
+    // Web has no filesystem path to read from, so `null` content (only the
+    // native-only "Send" flow passes it) degrades to an empty body.
+    const body = content ?? '';
     if (
       options?.share &&
       typeof navigator !== 'undefined' &&
@@ -351,7 +367,7 @@ export class WebAppService extends BaseAppService {
     ) {
       let shareData: ShareData | null = null;
       try {
-        const file = new File([content], filename, { type: mimeType });
+        const file = new File([body], filename, { type: mimeType });
         const candidate: ShareData = { files: [file], title: filename };
         if (typeof navigator.canShare !== 'function' || navigator.canShare(candidate)) {
           shareData = candidate;
@@ -377,7 +393,7 @@ export class WebAppService extends BaseAppService {
       }
     }
     try {
-      const blob = new Blob([content], { type: mimeType });
+      const blob = new Blob([body], { type: mimeType });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -391,6 +407,11 @@ export class WebAppService extends BaseAppService {
       console.error('Failed to save file:', error);
       return false;
     }
+  }
+
+  // No system photo gallery on the web; callers fall back to the saveFile flow.
+  async saveImageToGallery(): Promise<boolean> {
+    return false;
   }
 
   async ask(message: string): Promise<boolean> {
@@ -414,5 +435,36 @@ export class WebAppService extends BaseAppService {
     const { getMigrations } = await import('./database/migrations');
     await migrate(db, getMigrations(schema));
     return db;
+  }
+
+  override async installDatabase(path: string, base: BaseDir, source: File): Promise<void> {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(await this.opfsDatabaseName(path, base), {
+      create: true,
+    });
+    const writable = await handle.createWritable();
+    await source.stream().pipeTo(writable);
+  }
+
+  private async opfsDatabaseName(path: string, base: BaseDir): Promise<string> {
+    const fullPath = await this.resolveFilePath(path, base);
+    return fullPath.replace(/[/\\]+/g, '_').replace(/^_+/, '');
+  }
+
+  override async databaseExists(path: string, base: BaseDir): Promise<boolean> {
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.getFileHandle(await this.opfsDatabaseName(path, base));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  override async deleteDatabase(path: string, base: BaseDir): Promise<void> {
+    const name = await this.opfsDatabaseName(path, base);
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(name).catch(() => {});
+    await root.removeEntry(`${name}-wal`).catch(() => {});
   }
 }

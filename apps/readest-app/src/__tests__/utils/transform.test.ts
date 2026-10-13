@@ -4,11 +4,88 @@ import {
   transformBookNoteFromDB,
   transformBookConfigToDB,
   transformBookConfigFromDB,
+  transformBookToDB,
+  transformBookFromDB,
 } from '@/utils/transform';
-import { BookConfig, BookNote } from '@/types/book';
+import { BookConfig, BookNote, Book } from '@/types/book';
 import { DBBookConfig, DBBookNote } from '@/types/records';
 
+describe('transformBookNoteToDB with handwriting', () => {
+  const ink: BookNote = {
+    bookHash: 'abc123',
+    id: 'ink-1',
+    type: 'ink',
+    cfi: 'epubcfi(/6/4!/4/2,/1:0,/1:5)',
+    text: 'marked words',
+    note: '',
+    ink: [
+      {
+        id: 's1',
+        color: '#facc15',
+        width: 0.03,
+        tool: 'marker',
+        anchor: 'epubcfi(/6/4!/4/2,/1:0,/1:5)',
+        shape: 'flow',
+        points: [
+          [0.1, 0.5, 0.42],
+          [0.9, 0.5],
+        ],
+      },
+    ],
+    createdAt: 1700000000000,
+    updatedAt: 1700000001000,
+  };
+
+  it('carries the strokes in the ink column, both ways', () => {
+    const db = transformBookNoteToDB(ink, 'user1');
+    expect(db.ink).toEqual(ink.ink);
+    expect(transformBookNoteFromDB(db).ink).toEqual(ink.ink);
+  });
+
+  it('leaves the ink column alone for other notes', () => {
+    const db = transformBookNoteToDB({ ...ink, type: 'annotation', ink: undefined }, 'user1');
+    // An absent key is not sent, so an upsert never clears stored strokes.
+    expect('ink' in JSON.parse(JSON.stringify(db))).toBe(false);
+    expect(transformBookNoteFromDB({ ...db, ink: null }).ink).toBeUndefined();
+  });
+
+  it('pulls a row without strokes without a key that would wipe local strokes', () => {
+    // A server whose database predates the column returns no ink; merging the
+    // pulled note over the local one must keep the local strokes.
+    const { ink: _ink, ...row } = transformBookNoteToDB(ink, 'user1');
+    const pulled = transformBookNoteFromDB(row);
+    expect('ink' in pulled).toBe(false);
+    expect({ ...ink, ...pulled }.ink).toEqual(ink.ink);
+  });
+});
+
 describe('transformBookNoteToDB with xpointer fields', () => {
+  it('round-trips the reserved Notebook type and Markdown content', () => {
+    const note: BookNote = {
+      bookHash: 'abc123',
+      id: 'notebook',
+      type: 'notebook',
+      cfi: 'epubcfi(/6/2!/4/2/1:0)',
+      xpointer0: '/body/DocFragment[1]/body/p[1]/text().0',
+      note: '# Reading notes\n\nA useful idea.',
+      createdAt: 1700000000000,
+      updatedAt: 1700000001000,
+    };
+
+    const db = transformBookNoteToDB(note, 'user1');
+    const roundTrip = transformBookNoteFromDB(db);
+
+    expect(roundTrip).toMatchObject({
+      id: 'notebook',
+      type: 'notebook',
+      cfi: note.cfi,
+      xpointer0: note.xpointer0,
+      note: note.note,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+    });
+  });
+
   it('passes through xpointer0 and xpointer1', () => {
     const note: BookNote = {
       bookHash: 'abc123',
@@ -282,5 +359,140 @@ describe('transformBookConfigToDB / transformBookConfigFromDB rsvpPosition', () 
     const dbRecord: DBBookConfig = { ...db, updated_at: new Date(config.updatedAt).toISOString() };
     const restored = transformBookConfigFromDB(dbRecord);
     expect(restored.rsvpPosition).toEqual(config.rsvpPosition);
+  });
+});
+
+describe('transformBook readingStatus + readingStatusUpdatedAt', () => {
+  const userId = 'user-1';
+  const baseBook: Book = {
+    hash: 'h1',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('serializes abandoned status + timestamp to ISO in the DB record', () => {
+    const ts = Date.UTC(2026, 5, 18, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, readingStatus: 'abandoned', readingStatusUpdatedAt: ts },
+      userId,
+    );
+    expect(db.reading_status).toBe('abandoned');
+    expect(db.reading_status_updated_at).toBe(new Date(ts).toISOString());
+  });
+
+  it('leaves reading_status_updated_at null when unset', () => {
+    const db = transformBookToDB({ ...baseBook, readingStatus: 'finished' }, userId);
+    expect(db.reading_status_updated_at).toBeNull();
+  });
+
+  it('round-trips abandoned + timestamp back to the client shape', () => {
+    const ts = Date.UTC(2026, 5, 18, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, readingStatus: 'abandoned', readingStatusUpdatedAt: ts },
+      userId,
+    );
+    const back = transformBookFromDB(db);
+    expect(back.readingStatus).toBe('abandoned');
+    expect(back.readingStatusUpdatedAt).toBe(ts);
+  });
+
+  it('reads undefined readingStatusUpdatedAt when the DB column is null', () => {
+    const back = transformBookFromDB({
+      user_id: userId,
+      book_hash: 'h1',
+      format: 'EPUB',
+      title: 'T',
+      author: 'A',
+      reading_status: 'finished',
+      reading_status_updated_at: null,
+      created_at: new Date(1).toISOString(),
+      updated_at: new Date(2).toISOString(),
+    });
+    expect(back.readingStatusUpdatedAt).toBeUndefined();
+  });
+});
+
+describe('transformBook coverHash + coverUpdatedAt (issue #4544)', () => {
+  const userId = 'user-1';
+  const baseBook: Book = {
+    hash: 'h1',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('serializes coverHash verbatim and coverUpdatedAt to ISO', () => {
+    const ts = Date.UTC(2026, 5, 22, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, coverHash: 'abcdef0123456789', coverUpdatedAt: ts },
+      userId,
+    );
+    expect(db.cover_hash).toBe('abcdef0123456789');
+    expect(db.cover_updated_at).toBe(new Date(ts).toISOString());
+  });
+
+  it('leaves cover columns null when unset', () => {
+    const db = transformBookToDB(baseBook, userId);
+    expect(db.cover_hash).toBeNull();
+    expect(db.cover_updated_at).toBeNull();
+  });
+
+  it('round-trips coverHash + coverUpdatedAt back to the client shape', () => {
+    const ts = Date.UTC(2026, 5, 22, 12, 0, 0);
+    const db = transformBookToDB(
+      { ...baseBook, coverHash: 'deadbeef', coverUpdatedAt: ts },
+      userId,
+    );
+    const back = transformBookFromDB(db);
+    expect(back.coverHash).toBe('deadbeef');
+    expect(back.coverUpdatedAt).toBe(ts);
+  });
+
+  it('reads null cover fields when the DB columns are null', () => {
+    const back = transformBookFromDB({
+      user_id: userId,
+      book_hash: 'h1',
+      format: 'EPUB',
+      title: 'T',
+      author: 'A',
+      cover_hash: null,
+      cover_updated_at: null,
+      created_at: new Date(1).toISOString(),
+      updated_at: new Date(2).toISOString(),
+    });
+    expect(back.coverHash).toBeNull();
+    expect(back.coverUpdatedAt).toBeNull();
+  });
+});
+
+describe('transformBook metadataUpdatedAt (issue #5438)', () => {
+  const userId = 'user-1';
+  const baseBook: Book = {
+    hash: 'h1',
+    format: 'EPUB',
+    title: 'T',
+    author: 'A',
+    createdAt: 1,
+    updatedAt: 2,
+  };
+
+  it('round-trips metadataUpdatedAt through the DB shape', () => {
+    const ts = Date.UTC(2026, 7, 1, 12, 0, 0);
+    const db = transformBookToDB({ ...baseBook, metadataUpdatedAt: ts }, userId);
+    expect(db.metadata_updated_at).toBe(new Date(ts).toISOString());
+    const back = transformBookFromDB(db);
+    expect(back.metadataUpdatedAt).toBe(ts);
+  });
+
+  it('leaves the column null when unset (legacy rows)', () => {
+    const db = transformBookToDB(baseBook, userId);
+    expect(db.metadata_updated_at).toBeNull();
+    const back = transformBookFromDB(db);
+    expect(back.metadataUpdatedAt).toBeNull();
   });
 });

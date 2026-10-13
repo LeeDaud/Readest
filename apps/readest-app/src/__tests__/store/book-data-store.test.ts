@@ -8,7 +8,7 @@ vi.mock('@/utils/md5', () => ({
   md5Fingerprint: (value: string) => `md5_${value}`,
 }));
 
-import { useBookDataStore } from '@/store/bookDataStore';
+import { useBookDataStore, flushPendingLibrarySave } from '@/store/bookDataStore';
 import type { BookData } from '@/store/bookDataStore';
 import type { BookConfig, BookNote, Book } from '@/types/book';
 import { useLibraryStore } from '@/store/libraryStore';
@@ -209,9 +209,58 @@ describe('bookDataStore', () => {
 
       warnSpy.mockRestore();
     });
+
+    // A note with no cfi has no location and can never be rendered or navigated
+    // to, but `CFI.compare` dereferences its arguments — so a null/undefined cfi
+    // reaching a sort comparator or findNearestCfi throws during render and drops
+    // the whole app to the error boundary. File sync, backup restore and the
+    // Foliate importer all parse untrusted JSON straight into booknotes, so the
+    // store is the choke point that keeps them out of live state.
+    test('discards booknotes without a usable cfi', () => {
+      const data = makeBookData('book1', { booknotes: [] });
+      useBookDataStore.setState({ booksData: { book1: data } });
+
+      useBookDataStore.getState().setConfig('book1', {
+        booknotes: [
+          makeBookNote({ id: 'good', cfi: 'epubcfi(/2/4)' }),
+          makeBookNote({ id: 'null-cfi', cfi: null as unknown as string }),
+          makeBookNote({ id: 'undef-cfi', cfi: undefined as unknown as string }),
+          makeBookNote({ id: 'empty-cfi', cfi: '' }),
+        ],
+      });
+
+      const booknotes = useBookDataStore.getState().getConfig('book1')!.booknotes!;
+      expect(booknotes.map((n) => n.id)).toEqual(['good']);
+    });
+
+    test('leaves booknotes untouched when the update does not carry them', () => {
+      const notes = [makeBookNote({ id: 'good', cfi: 'epubcfi(/2/4)' })];
+      const data = makeBookData('book1', { booknotes: notes });
+      useBookDataStore.setState({ booksData: { book1: data } });
+
+      useBookDataStore.getState().setConfig('book1', { location: 'loc' });
+
+      expect(useBookDataStore.getState().getConfig('book1')!.booknotes).toBe(notes);
+    });
   });
 
   describe('updateBooknotes', () => {
+    test('discards booknotes without a usable cfi', () => {
+      const data = makeBookData('book1', { booknotes: [] });
+      useBookDataStore.setState({ booksData: { book1: data } });
+
+      useBookDataStore
+        .getState()
+        .updateBooknotes('book1', [
+          makeBookNote({ id: 'good', cfi: 'epubcfi(/2/4)' }),
+          makeBookNote({ id: 'null-cfi', cfi: null as unknown as string }),
+          makeBookNote({ id: 'empty-cfi', cfi: '' }),
+        ]);
+
+      const booknotes = useBookDataStore.getState().getConfig('book1')!.booknotes!;
+      expect(booknotes.map((n) => n.id)).toEqual(['good']);
+    });
+
     test('deduplicates booknotes by id-type-cfi', () => {
       const data = makeBookData('book1', { booknotes: [] });
       useBookDataStore.setState({ booksData: { book1: data } });
@@ -379,7 +428,15 @@ describe('bookDataStore', () => {
 
       const stored = useLibraryStore.getState().getBookByHash('h1');
       expect(stored?.progress).toEqual([42, 100]);
+      // Per-book config still writes eagerly — it's small and the source
+      // of truth for reconstructing the shelf on next launch.
       expect(saveBookConfig).toHaveBeenCalledOnce();
+      // Library JSON write is throttled (see scheduleLibrarySave in
+      // bookDataStore) so a burst of saveConfig calls during reading
+      // doesn't fire IPC on every page turn. Force-flush here to
+      // observe the write actually happens.
+      expect(saveLibraryBooks).not.toHaveBeenCalled();
+      await flushPendingLibrarySave();
       expect(saveLibraryBooks).toHaveBeenCalledOnce();
     });
 

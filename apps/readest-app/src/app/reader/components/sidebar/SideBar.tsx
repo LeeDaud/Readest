@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import { useSettingsStore } from '@/store/settingsStore';
 import { useBookDataStore } from '@/store/bookDataStore';
@@ -8,6 +8,7 @@ import { useSidebarStore } from '@/store/sidebarStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
 import { getBookDirFromLanguage } from '@/utils/book';
+import { getPanelHorizontalInsetStyle, getPanelTopInset } from '@/utils/insets';
 import { useEnv } from '@/context/EnvContext';
 import { useSwipeToDismiss } from '@/hooks/useSwipeToDismiss';
 import { usePanelResize } from '@/hooks/usePanelResize';
@@ -28,15 +29,15 @@ const SideBar = ({}) => {
   const _ = useTranslation();
   const { appService } = useEnv();
   const { settings } = useSettingsStore();
-  const { updateAppTheme, safeAreaInsets, systemUIVisible, statusBarHeight } = useThemeStore();
+  const { updateAppTheme, safeAreaInsets, systemUIVisible, statusBarHeight, isIPhoneDuo } =
+    useThemeStore();
   const { sideBarBookKey, setSideBarBookKey, getSearchNavState, setSearchTerm, clearSearch } =
     useSidebarStore();
+  const { isSearchBarVisible, setSearchBarVisible } = useSidebarStore();
   const searchNavState = sideBarBookKey ? getSearchNavState(sideBarBookKey) : null;
-  const { searchTerm = '', searchResults = null } = searchNavState || {};
-  const { getBookData } = useBookDataStore();
+  const { searchResults = null } = searchNavState || {};
+  const { getBookData, getConfig } = useBookDataStore();
   const { getView, getViewSettings } = useReaderStore();
-  const [isSearchBarVisible, setIsSearchBarVisible] = useState(false);
-  const searchTermRef = useRef(searchTerm);
   const isMobile = window.innerWidth < 640;
   const [isFullHeightInMobile, setIsFullHeightInMobile] = useState(isMobile);
   const {
@@ -56,7 +57,7 @@ const SideBar = ({}) => {
     const { term, bookKey } = event.detail;
     setSideBarVisible(true);
     setSideBarBookKey(bookKey);
-    setIsSearchBarVisible(true);
+    setSearchBarVisible(true);
     if (term !== undefined && term !== null) {
       setSearchTerm(bookKey, term);
     }
@@ -94,10 +95,6 @@ const SideBar = ({}) => {
   }, [isSideBarVisible]);
 
   useEffect(() => {
-    searchTermRef.current = searchTerm;
-  }, [searchTerm]);
-
-  useEffect(() => {
     eventDispatcher.on('search-term', onSearchEvent);
     eventDispatcher.on('navigate', onNavigateEvent);
     return () => {
@@ -121,22 +118,23 @@ const SideBar = ({}) => {
   };
 
   const handleToggleSearchBar = () => {
-    setIsSearchBarVisible((prev) => {
-      if (prev) handleHideSearchBar();
-      return !prev;
-    });
+    if (isSearchBarVisible) {
+      handleHideSearchBar();
+    } else {
+      setSearchBarVisible(true);
+    }
   };
 
   const handleShowSearchBar = useCallback(() => {
     setTimeout(() => {
       setSideBarVisible(true);
-      setIsSearchBarVisible(true);
+      setSearchBarVisible(true);
     }, 100);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleHideSearchBar = useCallback(() => {
-    setIsSearchBarVisible(false);
+    setSearchBarVisible(false);
     setTimeout(() => {
       if (sideBarBookKey) clearSearch(sideBarBookKey);
     }, 100);
@@ -145,13 +143,16 @@ const SideBar = ({}) => {
   }, [sideBarBookKey, clearSearch]);
 
   const handleHideSideBar = useCallback(() => {
-    if (searchTermRef.current) {
+    if (isSearchBarVisible) {
       handleHideSearchBar();
-    } else if (!isSideBarPinned) {
-      setSideBarVisible(false);
+      return true;
     }
+    if (!isSideBarVisible) return false;
+    if (isSideBarPinned) return false;
+    setSideBarVisible(false);
+    return true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sideBarBookKey, isSideBarPinned]);
+  }, [sideBarBookKey, isSearchBarVisible, isSideBarPinned, isSideBarVisible]);
 
   useShortcuts({ onShowSearchBar: handleShowSearchBar, onEscape: handleHideSideBar }, [
     handleHideSideBar,
@@ -171,6 +172,9 @@ const SideBar = ({}) => {
   }
   const { book, bookDoc } = bookData;
   const languageDir = getBookDirFromLanguage(bookDoc.metadata.language);
+  // On the annotations tab the header search icon drives the annotation
+  // search in the toolbar instead of the in-book text search.
+  const isAnnotationsTab = getConfig(sideBarBookKey)?.viewSettings?.sideBarTab === 'annotations';
 
   return isSideBarVisible ? (
     <>
@@ -197,11 +201,16 @@ const SideBar = ({}) => {
           width: isMobile ? '100%' : `${sideBarWidth}`,
           maxWidth: isMobile ? '100%' : `${MAX_SIDEBAR_WIDTH * 100}%`,
           position: isMobile ? 'fixed' : isSideBarPinned ? 'relative' : 'absolute',
-          paddingTop: isFullHeightInMobile
-            ? systemUIVisible
-              ? `${Math.max(safeAreaInsets?.top || 0, statusBarHeight)}px`
-              : `${safeAreaInsets?.top || 0}px`
-            : '0px',
+          paddingTop: `${getPanelTopInset({
+            isMobile,
+            isFullHeightInMobile,
+            systemUIVisible,
+            statusBarHeight,
+            safeAreaInsets,
+          })}px`,
+          // iPhone Duo's status-bar strip reports as a large left/right inset
+          // (#6307). A side panel is only padded on its screen edge (left).
+          ...getPanelHorizontalInsetStyle(safeAreaInsets, isIPhoneDuo, isMobile, 'left'),
         }}
       >
         <style jsx>{`
@@ -229,7 +238,7 @@ const SideBar = ({}) => {
           onTouchStart={handleHorizontalDragStart}
           onKeyDown={handleDragKeyDown}
         ></div>
-        <div className='flex-shrink-0'>
+        <div className='shrink-0'>
           {isMobile && (
             <div
               role='slider'
@@ -254,11 +263,11 @@ const SideBar = ({}) => {
           />
           <div
             className={clsx('search-bar', {
-              'search-bar-visible': isSearchBarVisible,
+              'search-bar-visible': isSearchBarVisible && !isAnnotationsTab,
             })}
           >
             <SearchBar
-              isVisible={isSearchBarVisible}
+              isVisible={isSearchBarVisible && !isAnnotationsTab}
               bookKey={sideBarBookKey!}
               onHideSearchBar={handleHideSearchBar}
             />
@@ -267,7 +276,7 @@ const SideBar = ({}) => {
             <BookCard book={book} />
           </div>
         </div>
-        {isSearchBarVisible && searchResults ? (
+        {isSearchBarVisible && !isAnnotationsTab && searchResults ? (
           <SearchResults
             bookKey={sideBarBookKey!}
             results={searchResults}

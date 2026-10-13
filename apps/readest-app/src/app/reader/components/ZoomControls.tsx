@@ -1,12 +1,22 @@
 import React from 'react';
-import { IoClose, IoExpand, IoAdd, IoRemove } from 'react-icons/io5';
+import {
+  IoClose,
+  IoExpand,
+  IoAdd,
+  IoRemove,
+  IoShareOutline,
+  IoDownloadOutline,
+} from 'react-icons/io5';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useThemeStore } from '@/store/themeStore';
 import { Insets } from '@/types/misc';
 
 interface ZoomControlsProps {
   gridInsets: Insets;
+  // Save/Share is image-specific; omit `onSave` (e.g. the table viewer) to hide it.
+  canShare?: boolean;
   onClose: () => void;
+  onSave?: (e: React.MouseEvent<HTMLButtonElement>) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onReset: () => void;
@@ -14,13 +24,15 @@ interface ZoomControlsProps {
 
 const ZoomControls: React.FC<ZoomControlsProps> = ({
   gridInsets,
+  canShare,
   onClose,
+  onSave,
   onZoomIn,
   onZoomOut,
   onReset,
 }) => {
   const _ = useTranslation();
-  const { systemUIVisible, statusBarHeight } = useThemeStore();
+  const { systemUIVisible, statusBarHeight, isIPhoneDuo } = useThemeStore();
   return (
     <div
       className='absolute right-4 top-2 z-10 grid grid-cols-1 gap-4 text-white'
@@ -28,6 +40,8 @@ const ZoomControls: React.FC<ZoomControlsProps> = ({
         marginTop: systemUIVisible
           ? `${Math.max(gridInsets.top, statusBarHeight)}px`
           : `${gridInsets.top}px`,
+        // Clears the Duo status-bar strip / camera cutout (right inset, #6307).
+        ...(isIPhoneDuo ? { right: `${gridInsets.right + 16}px` } : {}),
       }}
     >
       <button
@@ -38,6 +52,21 @@ const ZoomControls: React.FC<ZoomControlsProps> = ({
       >
         <IoClose className='h-6 w-6' />
       </button>
+
+      {onSave && (
+        <button
+          onClick={onSave}
+          className='eink-bordered flex h-10 w-10 cursor-pointer items-center justify-center rounded-full bg-black/50 transition-colors hover:bg-black/70'
+          aria-label={canShare ? _('Share Image') : _('Save Image')}
+          title={canShare ? _('Share Image') : _('Save Image')}
+        >
+          {canShare ? (
+            <IoShareOutline className='h-6 w-6' />
+          ) : (
+            <IoDownloadOutline className='h-6 w-6' />
+          )}
+        </button>
+      )}
 
       <button
         onClick={onZoomIn}

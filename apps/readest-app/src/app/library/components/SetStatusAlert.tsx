@@ -35,6 +35,12 @@ const SetStatusAlert: React.FC<SetStatusAlertProps> = ({
         'not-eink:bg-success/15 not-eink:text-success not-eink:border-success/20 eink-bordered',
     },
     {
+      label: _('Mark as On hold'),
+      status: 'abandoned' as ReadingStatus,
+      className:
+        'not-eink:bg-slate-500/15 not-eink:text-slate-600 dark:not-eink:text-slate-300 not-eink:border-slate-500/20 eink-bordered',
+    },
+    {
       label: _('Clear Status'),
       status: undefined,
       className:
@@ -54,7 +60,7 @@ const SetStatusAlert: React.FC<SetStatusAlertProps> = ({
         className={clsx(
           'flex w-auto max-w-[90vw] flex-col gap-3',
           'border-base-content/10 bg-base-200/95 rounded-2xl border p-4',
-          'shadow-lg backdrop-blur-sm',
+          'shadow-lg backdrop-blur-xs',
         )}
       >
         {/* Header with close button for small screens */}
@@ -65,8 +71,7 @@ const SetStatusAlert: React.FC<SetStatusAlertProps> = ({
           <button
             className={clsx(
               'absolute right-0 flex items-center justify-center',
-              'rounded-full p-1.5 transition-colors',
-              'hover:bg-base-content/10',
+              'rounded-full p-1.5 transition-colors text-base-content/70 hover:text-base-content',
               'sm:hidden',
             )}
             onClick={onCancel}
@@ -81,7 +86,7 @@ const SetStatusAlert: React.FC<SetStatusAlertProps> = ({
               key={label}
               className={clsx(
                 'flex items-center gap-2 rounded-full border px-4 py-2',
-                'shadow-sm transition-all duration-200 ease-out active:scale-[0.97]',
+                'shadow-xs transition-all duration-200 ease-out active:scale-[0.97]',
                 className,
               )}
               onClick={() => onUpdateStatus(status)}
@@ -92,7 +97,7 @@ const SetStatusAlert: React.FC<SetStatusAlertProps> = ({
           <button
             className={clsx(
               'hidden items-center gap-2 rounded-full border px-4 py-2',
-              'not-eink:bg-base-300 not-eink:text-base-content not-eink:border-base-content/10 not-eink:shadow-sm',
+              'not-eink:bg-base-300 not-eink:text-base-content not-eink:border-base-content/10 not-eink:shadow-xs',
               'eink-bordered',
               'transition-all duration-200 ease-out active:scale-[0.97]',
               'sm:flex',

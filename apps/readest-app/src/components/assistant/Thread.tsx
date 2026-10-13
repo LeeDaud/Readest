@@ -34,10 +34,12 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/utils/tailwind';
-import type { ScoredChunk } from '@/services/ai/types';
+import type { SourceItem } from '@/services/ai/adapters/reedySourceStore';
 
 interface ThreadProps {
-  sources?: ScoredChunk[];
+  sources?: SourceItem[];
+  /** Invoked when a source row is clicked. Reedy passes the CFI to the reader's goTo. */
+  onSourceClick?: (source: SourceItem) => void;
   onClear?: () => void;
   onResetIndex?: () => void;
   isLoadingHistory?: boolean;
@@ -49,7 +51,7 @@ const LoadingOverlay: FC<{ isVisible: boolean }> = ({ isVisible }) => {
     <div
       className={cn(
         'absolute inset-0 z-20 flex items-center justify-center',
-        'bg-base-100/60 backdrop-blur-sm',
+        'bg-base-100/60 backdrop-blur-xs',
         'transition-all duration-300 ease-out',
         isVisible ? 'opacity-100' : 'pointer-events-none opacity-0',
       )}
@@ -75,11 +77,11 @@ const ScrollToBottomButton: FC = () => {
         'bg-base-300 text-base-content',
         'hover:bg-base-200',
         'border-base-content/10 border',
-        'shadow-sm',
+        'shadow-xs',
         'active:scale-[0.97]',
         'transition-[opacity,filter,transform] duration-150 ease-out',
         isAtBottom
-          ? 'pointer-events-none -translate-x-1/2 scale-90 opacity-0 blur-sm'
+          ? 'pointer-events-none -translate-x-1/2 scale-90 opacity-0 blur-xs'
           : '-translate-x-1/2 scale-100 opacity-100 blur-0',
       )}
       style={{
@@ -101,6 +103,7 @@ const ScrollToBottomButton: FC = () => {
 
 export const Thread: FC<ThreadProps> = ({
   sources = [],
+  onSourceClick,
   onClear,
   onResetIndex,
   isLoadingHistory = false,
@@ -192,14 +195,16 @@ export const Thread: FC<ThreadProps> = ({
               components={{
                 UserMessage,
                 EditComposer,
-                AssistantMessage: () => <AssistantMessage sources={sources} />,
+                AssistantMessage: () => (
+                  <AssistantMessage sources={sources} onSourceClick={onSourceClick} />
+                ),
               }}
             />
             <p className='text-base-content/40 mx-auto w-full p-1 text-center text-[10px]'>
               AI can make mistakes. Verify with the book.
             </p>
             <div
-              className={cn('flex-shrink transition-all duration-300', getSpacerHeight())}
+              className={cn('shrink transition-all duration-300', getSpacerHeight())}
               aria-hidden='true'
             />
           </ThreadPrimitive.Viewport>
@@ -228,7 +233,7 @@ const Composer: FC<ComposerProps> = ({ onClear, onResetIndex }) => {
       data-empty={isEmpty}
       data-running={isRunning}
     >
-      <div className='bg-base-200 ring-base-content/10 focus-within:ring-base-content/20 overflow-hidden rounded-2xl shadow-sm ring-1 ring-inset transition-all duration-200'>
+      <div className='bg-base-200 ring-base-content/10 focus-within:ring-base-content/20 overflow-hidden rounded-2xl shadow-xs ring-1 ring-inset transition-all duration-200'>
         <div className='flex items-end gap-0.5 p-1.5'>
           {onClear && (
             <button
@@ -256,7 +261,7 @@ const Composer: FC<ComposerProps> = ({ onClear, onResetIndex }) => {
           <ComposerPrimitive.Input
             placeholder='Ask about this book...'
             rows={1}
-            className='text-base-content placeholder:text-base-content/40 my-1 h-5 max-h-[200px] min-w-0 flex-1 resize-none bg-transparent text-sm leading-5 outline-none'
+            className='text-base-content placeholder:text-base-content/40 my-1 h-5 max-h-[200px] min-w-0 flex-1 resize-none bg-transparent text-sm leading-5 outline-hidden'
           />
 
           <div className='bg-base-content text-base-100 relative mb-0.5 size-7 shrink-0 rounded-full'>
@@ -280,15 +285,16 @@ const Composer: FC<ComposerProps> = ({ onClear, onResetIndex }) => {
 };
 
 interface AssistantMessageProps {
-  sources?: ScoredChunk[];
+  sources?: SourceItem[];
+  onSourceClick?: (source: SourceItem) => void;
 }
 
-const AssistantMessage: FC<AssistantMessageProps> = ({ sources = [] }) => {
+const AssistantMessage: FC<AssistantMessageProps> = ({ sources = [], onSourceClick }) => {
   return (
     <MessagePrimitive.Root className='group/message animate-in fade-in slide-in-from-bottom-1 relative mx-auto mb-1 flex w-full flex-col pb-0.5 duration-200'>
       <div className='flex flex-col items-start'>
         <div className='w-full max-w-none'>
-          <div className='prose prose-xs text-base-content [&_*]:!text-base-content [&_a]:!text-primary [&_code]:!text-base-content select-text text-sm'>
+          <div className='prose prose-xs text-base-content [&_*]:text-base-content! [&_a]:text-primary! [&_code]:text-base-content! select-text text-sm'>
             <MessagePrimitive.Parts components={{ Text: MarkdownText }} />
           </div>
         </div>
@@ -316,19 +322,41 @@ const AssistantMessage: FC<AssistantMessageProps> = ({ sources = [] }) => {
                       Sources from book
                     </div>
                     <div className='flex flex-col gap-1.5'>
-                      {sources.map((source, i) => (
-                        <div
-                          key={source.id || i}
-                          className='border-base-content/10 bg-base-200/50 rounded-lg border px-2 py-1.5 text-[11px]'
-                        >
-                          <div className='text-base-content font-medium'>
-                            {source.chapterTitle || `Section ${source.sectionIndex + 1}`}
+                      {sources.map((source, i) => {
+                        const clickable = !!source.cfi && !!onSourceClick;
+                        const baseClass =
+                          'border-base-content/10 bg-base-200/50 rounded-lg border px-2 py-1.5 text-[11px]';
+                        const content = (
+                          <>
+                            <div className='text-base-content font-medium'>
+                              {source.chapterTitle || `Section ${source.sectionIndex + 1}`}
+                            </div>
+                            <div className='text-base-content/60 mt-0.5 line-clamp-3'>
+                              {source.text}
+                            </div>
+                          </>
+                        );
+                        if (clickable) {
+                          return (
+                            <button
+                              type='button'
+                              key={source.id || i}
+                              className={cn(
+                                baseClass,
+                                'hover:bg-base-200 text-start transition-colors',
+                              )}
+                              onClick={() => onSourceClick?.(source)}
+                            >
+                              {content}
+                            </button>
+                          );
+                        }
+                        return (
+                          <div key={source.id || i} className={baseClass}>
+                            {content}
                           </div>
-                          <div className='text-base-content/60 mt-0.5 line-clamp-3'>
-                            {source.text}
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -360,7 +388,7 @@ const UserMessage: FC = () => {
     >
       <div className='flex flex-col items-end'>
         <div className='border-base-content/10 bg-base-200 text-base-content relative max-w-[90%] rounded-2xl rounded-br-md border px-3 py-2'>
-          <div className='prose prose-xs text-base-content [&_*]:!text-base-content select-text text-sm'>
+          <div className='prose prose-xs text-base-content [&_*]:text-base-content! select-text text-sm'>
             <MessagePrimitive.Parts components={{ Text: MarkdownText }} />
           </div>
         </div>
@@ -388,7 +416,7 @@ const EditComposer: FC = () => {
   return (
     <MessagePrimitive.Root className='mx-auto flex w-full flex-col py-2'>
       <ComposerPrimitive.Root className='border-base-content/10 bg-base-200 ml-auto flex w-full max-w-[90%] flex-col overflow-hidden rounded-2xl border'>
-        <ComposerPrimitive.Input className='text-base-content min-h-10 w-full resize-none bg-transparent p-3 text-sm outline-none' />
+        <ComposerPrimitive.Input className='text-base-content min-h-10 w-full resize-none bg-transparent p-3 text-sm outline-hidden' />
         <div className='mx-2 mb-2 flex items-center gap-1.5 self-end'>
           <ComposerPrimitive.Cancel asChild>
             <Button variant='ghost' size='sm' className='h-7 px-2 text-xs'>

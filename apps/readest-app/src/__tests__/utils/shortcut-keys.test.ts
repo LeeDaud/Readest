@@ -1,10 +1,34 @@
 import { describe, it, expect } from 'vitest';
-import { formatKeyForDisplay, filterPlatformKeys } from '../../utils/shortcutKeys';
+import {
+  formatKeyForDisplay,
+  filterPlatformKeys,
+  getShortcutFromKeyboardEvent,
+  getShortcutFromMouseEvent,
+  matchesShortcut,
+  normalizeShortcut,
+} from '../../utils/shortcutKeys';
+
+const evt = (
+  key: string,
+  modifiers: Partial<{
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+    shiftKey: boolean;
+  }> = {},
+) => ({
+  key,
+  ctrlKey: false,
+  altKey: false,
+  metaKey: false,
+  shiftKey: false,
+  ...modifiers,
+});
 
 describe('formatKeyForDisplay', () => {
   describe('Mac platform', () => {
-    it('maps ctrl to ⌘', () => {
-      expect(formatKeyForDisplay('ctrl+f', true)).toBe('⌘F');
+    it('maps ctrl to ⌃', () => {
+      expect(formatKeyForDisplay('ctrl+f', true)).toBe('⌃F');
     });
 
     it('maps cmd to ⌘', () => {
@@ -125,5 +149,75 @@ describe('filterPlatformKeys', () => {
       'shift+f',
       'ctrl+,',
     ]);
+  });
+});
+
+describe('matchesShortcut', () => {
+  it('matches a shift+letter shortcut against an uppercased key event', () => {
+    expect(matchesShortcut(evt('P', { shiftKey: true }), ['shift+p'])).toBe(true);
+  });
+
+  it('does not match when a required modifier is missing', () => {
+    expect(matchesShortcut(evt('p'), ['shift+p'])).toBe(false);
+  });
+
+  it('does not match when an extra modifier is pressed', () => {
+    expect(matchesShortcut(evt('P', { shiftKey: true, ctrlKey: true }), ['shift+p'])).toBe(false);
+  });
+
+  it('treats alt and opt as the same modifier', () => {
+    expect(matchesShortcut(evt('p', { altKey: true }), ['alt+p'])).toBe(true);
+    expect(matchesShortcut(evt('p', { altKey: true }), ['opt+p'])).toBe(true);
+  });
+
+  it('treats cmd and meta as the same modifier', () => {
+    expect(matchesShortcut(evt('p', { metaKey: true }), ['cmd+p'])).toBe(true);
+    expect(matchesShortcut(evt('p', { metaKey: true }), ['meta+p'])).toBe(true);
+  });
+
+  it('matches when any key in the list matches', () => {
+    expect(matchesShortcut(evt('p', { altKey: true }), ['ctrl+p', 'cmd+p', 'alt+p'])).toBe(true);
+  });
+
+  it('matches symbol and space base keys', () => {
+    expect(matchesShortcut(evt(']', { ctrlKey: true }), ['ctrl+]'])).toBe(true);
+    expect(matchesShortcut(evt(' ', { shiftKey: true }), ['shift+ '])).toBe(true);
+  });
+
+  it('returns false for an empty key list', () => {
+    expect(matchesShortcut(evt('p', { shiftKey: true }), [])).toBe(false);
+  });
+});
+
+describe('shortcut recording', () => {
+  it('records layout-aware keyboard keys and auxiliary mouse buttons', () => {
+    expect(getShortcutFromKeyboardEvent(evt('ö', { ctrlKey: true }))).toBe('ctrl+ö');
+    expect(getShortcutFromKeyboardEvent(evt('+', { shiftKey: true }))).toBe('shift+plus');
+    expect(
+      getShortcutFromKeyboardEvent(
+        new KeyboardEvent('keydown', { key: 'P', ctrlKey: true, shiftKey: true }),
+      ),
+    ).toBe('ctrl+shift+P');
+    expect(
+      getShortcutFromKeyboardEvent({
+        ...evt('@', { ctrlKey: true, altKey: true }),
+        altGraphKey: true,
+      }),
+    ).toBe('altgr+@');
+
+    expect(getShortcutFromMouseEvent({ button: 3 })).toBe('MouseX1');
+    expect(getShortcutFromMouseEvent({ button: 4, ctrlKey: true })).toBe('ctrl+MouseX2');
+    expect(getShortcutFromMouseEvent({ button: 1 })).toBeNull();
+
+    expect(formatKeyForDisplay('shift+plus', false)).toBe('Shift++');
+    expect(formatKeyForDisplay('MouseX1', false)).toBe('Mouse X1');
+    expect(matchesShortcut(evt('+', { shiftKey: true }), ['shift+plus'])).toBe(true);
+    expect(matchesShortcut(evt('+', { shiftKey: true }), ['shift+='])).toBe(true);
+    expect(normalizeShortcut('shift+=')).toBe(normalizeShortcut('shift+plus'));
+    expect(
+      matchesShortcut({ ...evt('@', { ctrlKey: true, altKey: true }), altGraphKey: true }, [
+        'altgr+@',
+      ]),
+    ).toBe(true);
   });
 });

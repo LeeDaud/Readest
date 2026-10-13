@@ -45,15 +45,35 @@ COPY --from=dependencies /app/apps/readest-app/public/vendor /app/apps/readest-a
 COPY --from=dependencies /app/packages/foliate-js/node_modules /app/packages/foliate-js/node_modules
 COPY . .
 WORKDIR /app/apps/readest-app
+# Opt into the self-contained `.next/standalone` tree for this image only;
+# next.config.mjs gates `output: 'standalone'` on BUILD_STANDALONE so other
+# web builds keep their default output.
+ENV BUILD_STANDALONE=true
 RUN pnpm build-web
 
+# Production runtime ships only the standalone server, its traced node_modules,
+# and the static/public assets — no pnpm, no source tree, no dev dependencies,
+# no build cache. `output: 'standalone'` (next.config.mjs) emits the self-contained
+# tree under .next/standalone, so the entrypoint is a plain `node server.js`.
 FROM docker.io/library/node:24-slim@sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4d7f0692e4d1fe5db0e AS production-stage
-ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
-RUN corepack prepare pnpm@11.1.1 --activate
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+# This image is the self-hosted artifact — web.readest.com runs on
+# Cloudflare/Vercel, never on it — so premium features are unlocked by default
+# rather than left to the operator's compose file. `compose.yaml` passes
+# `SELF_HOSTED: ${SELF_HOSTED:-true}`, but that line only landed in #5996: a
+# compose file copied before it survives every `docker compose pull`, so the
+# container came up gated with nothing on screen to explain why (#6093).
+# An operator running a hosted service that sells plans sets SELF_HOSTED=false.
+ENV SELF_HOSTED=true
 WORKDIR /app
-COPY --from=build /app /app
-WORKDIR /app/apps/readest-app
-ENTRYPOINT ["pnpm", "start-web", "-H", "0.0.0.0"]
+# Monorepo-rooted standalone tree: server.js + hoisted, traced node_modules.
+COPY --from=build --chown=node:node /app/apps/readest-app/.next/standalone ./
+# Static and public assets are not part of the standalone trace; copy them next
+# to the server so their default relative paths resolve.
+COPY --from=build --chown=node:node /app/apps/readest-app/.next/static ./apps/readest-app/.next/static
+COPY --from=build --chown=node:node /app/apps/readest-app/public ./apps/readest-app/public
+USER node
 EXPOSE 3000
+ENTRYPOINT ["node", "apps/readest-app/server.js"]

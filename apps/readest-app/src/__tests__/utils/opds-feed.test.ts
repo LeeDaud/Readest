@@ -167,6 +167,76 @@ describe('OPDS feed parsing', () => {
     });
   });
 
+  describe('metadata-only entries without an acquisition link (Calibre, #4599)', () => {
+    // Reproduces https://github.com/readest/readest/issues/4599
+    // A Calibre book whose file was removed (e.g. a borrowed/loaned title kept
+    // for tracking) still emits a full metadata entry with cover/thumbnail
+    // links but no acquisition link. Such an entry was classified as a
+    // navigation item whose href fell back to links[0] — the cover image — so
+    // tapping it tried to load the image as a feed and crashed with a JSON
+    // parse error. It should be treated as a publication (so its metadata is
+    // shown) with no downloadable format.
+    const calibreNoFormatFeed = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <title>Calibre Library</title>
+  <entry>
+    <title>A Borrowed Book</title>
+    <id>urn:uuid:1234</id>
+    <author><name>Jane Author</name></author>
+    <updated>2026-01-15T10:30:00Z</updated>
+    <dc:language>eng</dc:language>
+    <summary>A book I borrowed; the file is no longer available.</summary>
+    <link type="image/jpeg" href="/get/cover/123/lib" rel="http://opds-spec.org/image"/>
+    <link type="image/png" href="/get/thumb/123/lib" rel="http://opds-spec.org/image/thumbnail"/>
+  </entry>
+</feed>`;
+
+    it('classifies a metadata+cover entry with no acquisition link as a publication', () => {
+      const doc = parseXML(calibreNoFormatFeed);
+      const feed = getFeed(doc) as OPDSFeed;
+
+      expect(feed.publications).toBeDefined();
+      expect(feed.publications!).toHaveLength(1);
+      expect(feed.publications![0]!.metadata.title).toBe('A Borrowed Book');
+      // The crash path: the entry must NOT become a navigation item pointing at
+      // the cover image.
+      expect(feed.navigation).toBeUndefined();
+    });
+
+    it('exposes no acquisition link for a format-less publication', () => {
+      const doc = parseXML(calibreNoFormatFeed);
+      const feed = getFeed(doc) as OPDSFeed;
+      const pub = feed.publications![0]!;
+      const hasAcquisition = pub.links.some((link) => {
+        const rels = Array.isArray(link.rel) ? link.rel : [link.rel ?? ''];
+        return rels.some((rel) => rel.startsWith('http://opds-spec.org/acquisition'));
+      });
+      expect(hasAcquisition).toBe(false);
+    });
+
+    it('still classifies a true navigation entry (sub-catalog link, no image) as navigation', () => {
+      const navFeed = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Root</title>
+  <entry>
+    <title>By Author</title>
+    <link rel="subsection" href="author/?opds"
+          type="application/atom+xml;profile=opds-catalog"/>
+    <updated>2026-03-28T05:37:03Z</updated>
+  </entry>
+</feed>`;
+      const doc = parseXML(navFeed);
+      const feed = getFeed(doc) as OPDSFeed;
+
+      expect(feed.publications).toBeUndefined();
+      expect(feed.navigation).toBeDefined();
+      expect(feed.navigation!).toHaveLength(1);
+      expect(feed.navigation![0]!.title).toBe('By Author');
+    });
+  });
+
   describe('entry id and updated parsing', () => {
     const shelfFeed = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom"
@@ -265,6 +335,69 @@ describe('OPDS feed parsing', () => {
       expect(feed.publications).toHaveLength(1);
       expect(feed.publications![0]!.metadata.id).toBeUndefined();
       expect(feed.publications![0]!.metadata.updated).toBeUndefined();
+    });
+  });
+  // Regression tests for https://github.com/readest/readest/issues/6003
+  //
+  // calibre and Calibre-Web mean opposite things by Atom <published>:
+  //
+  //   calibre (srv/opds.py)      <published> = mi.timestamp (date ADDED),
+  //                              <dcterms:date> = mi.pubdate (the real one)
+  //   Calibre-Web (feed.xml)     <published> = Books.pubdate (the real one),
+  //                              no Dublin Core date at all
+  //
+  // So the Dublin Core dates have to outrank <published>, which is also what
+  // RFC 4287 implies: atom:published is when the ENTRY was published to the
+  // feed, not when the book was published. Getting this backwards made every
+  // calibre download import its added-date as the publication date once
+  // #5477 let feed metadata win over the file's own metadata.
+  describe('publication date precedence (#6003)', () => {
+    const entryOf = (body: string) =>
+      parseXML(
+        `<?xml version="1.0" encoding="UTF-8"?>
+<entry xmlns="http://www.w3.org/2005/Atom"
+       xmlns:dc="http://purl.org/dc/elements/1.1/"
+       xmlns:dcterms="http://purl.org/dc/terms/">
+  <title>Dune</title>
+  <id>urn:uuid:1234</id>
+  <updated>2026-08-30T12:00:00+00:00</updated>
+  ${body}
+</entry>`,
+      ).documentElement;
+
+    const publishedOf = (body: string) =>
+      (getPublication(entryOf(body)) as OPDSPublication).metadata.published;
+
+    it("prefers calibre's dcterms:date over the added-date in atom:published", () => {
+      expect(
+        publishedOf(`<published>2026-08-30T12:00:00+00:00</published>
+  <dcterms:date>1965-08-01T00:00:00+00:00</dcterms:date>`),
+      ).toBe('1965-08-01T00:00:00+00:00');
+    });
+
+    it('prefers dc:date over atom:published', () => {
+      expect(
+        publishedOf(`<published>2026-08-30T12:00:00+00:00</published>
+  <dc:date>1965-08-01T00:00:00+00:00</dc:date>`),
+      ).toBe('1965-08-01T00:00:00+00:00');
+    });
+
+    it('still prefers dcterms:issued above everything else', () => {
+      expect(
+        publishedOf(`<published>2026-08-30T12:00:00+00:00</published>
+  <dcterms:issued>1965-08-01T00:00:00+00:00</dcterms:issued>
+  <dcterms:date>1970-01-01T00:00:00+00:00</dcterms:date>`),
+      ).toBe('1965-08-01T00:00:00+00:00');
+    });
+
+    it('falls back to atom:published when no Dublin Core date is offered (Calibre-Web)', () => {
+      expect(publishedOf('<published>1965-08-01T00:00:00+00:00</published>')).toBe(
+        '1965-08-01T00:00:00+00:00',
+      );
+    });
+
+    it('leaves published undefined when the entry carries no date at all', () => {
+      expect(publishedOf('')).toBeUndefined();
     });
   });
 });

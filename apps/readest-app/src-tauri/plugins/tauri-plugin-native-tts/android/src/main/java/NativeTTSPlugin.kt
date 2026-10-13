@@ -40,8 +40,14 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import java.io.File
 
 data class TTSVoiceData(
     val id: String,
@@ -79,6 +85,7 @@ class SetVoiceArgs(
 
 @InvokeArg
 class UpdateMediaSessionMetadataArgs {
+  var sessionId: String? = null
   var title: String? = null
   var artist: String? = null
   var album: String? = null
@@ -87,19 +94,37 @@ class UpdateMediaSessionMetadataArgs {
 
 @InvokeArg
 class UpdateMediaSessionStateArgs {
+  var sessionId: String? = null
   var playing: Boolean? = null
   var position: Int? = null // in milliseconds
   var duration: Int? = null // in milliseconds
 }
 
 @InvokeArg
+class UpdateMediaLibraryArgs {
+  var booksJson: String? = null
+}
+
+@InvokeArg
 class SetMediaSessionActiveArgs {
   var active: Boolean? = null
-  var keepAppInForeground: Boolean? = null
+  var sessionId: String? = null
+  var ownsAudioFocus: Boolean? = null
   var notificationTitle: String? = null
   var notificationText: String? = null
   var foregroundServiceTitle: String? = null
   var foregroundServiceText: String? = null
+  var bookHash: String? = null
+  var bookTitle: String? = null
+  var bookAuthor: String? = null
+}
+
+@InvokeArg
+class PlayoutControlArgs {
+    var action: String? = null
+    var rate: Double? = null
+    var path: String? = null
+    var positionMs: Double? = null
 }
 
 @TauriPlugin(
@@ -125,6 +150,31 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
     private var isSpeaking = AtomicBoolean(false)
     private var currentRate = AtomicReference<Float>(1.0f)
     private var currentPitch = AtomicReference<Float>(1.0f)
+
+    // Continuous local-file playback for EPUB Media Overlays and paired
+    // audiobooks. The WebView cannot expose Android app-private files as a
+    // seekable Blob without first reading the whole file into memory; ExoPlayer
+    // can seek and stream the original file path directly.
+    private var playoutPlayer: ExoPlayer? = null
+    private var playoutSession = 0
+    private var playoutCurrentIndex = -1
+    private var playoutRate = 1.0f
+    private var playoutLoadedPath: String? = null
+    private val playoutListener = object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_ENDED && playoutCurrentIndex >= 0) {
+                playoutCurrentIndex = -1
+                emitPlayoutEvent("ended", 0)
+            }
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            if (playoutCurrentIndex < 0) return
+            Log.e(TAG, "Native narration playback failed", error)
+            playoutCurrentIndex = -1
+            emitPlayoutEvent("error", 0)
+        }
+    }
 
     private val eventChannels = ConcurrentHashMap<String, Channel<TTSMessageEvent>>()
     private val speakingJobs = ConcurrentHashMap<String, Job>()
@@ -497,19 +547,13 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         val args = invoke.parseArgs(UpdateMediaSessionMetadataArgs::class.java)
         val title = args.title ?: ""
         val artist = args.artist ?: ""
-        val album = args.album ?: ""
 
         coroutineScope.launch {
             try {
                 val artworkBitmap = args.artwork?.let { loadArtworkFromUrl(it) }
-                val intent = Intent(activity, MediaPlaybackService::class.java).apply {
-                    action = "UPDATE_METADATA"
-                    putExtra("title", title)
-                    putExtra("artist", artist)
-                    putExtra("album", album)
-                    putExtra("artwork", artworkBitmap)
-                }
-                activity.startService(intent)
+                // In-process update on the running service; never startService()
+                // — that throws "app is in background" once backgrounded.
+                MediaPlaybackService.pushMetadata(args.sessionId, title, artist, artworkBitmap)
                 invoke.resolve()
             } catch (e: Exception) {
                 invoke.reject("Failed to update metadata: ${e.message}")
@@ -519,22 +563,37 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun update_media_session_state(invoke: Invoke) {
-        var args = invoke.parseArgs(UpdateMediaSessionStateArgs::class.java)
+        val args = invoke.parseArgs(UpdateMediaSessionStateArgs::class.java)
         val isPlaying = args.playing ?: false
-        val position = args.position ?: 0
-        val duration = args.duration ?: 0
 
         try {
-            val intent = Intent(activity, MediaPlaybackService::class.java).apply {
-                action = "UPDATE_PLAYBACK_STATE"
-                putExtra("playing", isPlaying)
-                putExtra("position", position)
-                putExtra("duration", duration)
-            }
-            activity.startService(intent)
+            // In-process update on the running service; never startService()
+            // — that throws "app is in background" once backgrounded. position
+            // and duration are null on a bare play/pause flip; the service
+            // keeps the last known values so the scrubber does not reset.
+            MediaPlaybackService.pushPlaybackState(
+                args.sessionId,
+                isPlaying,
+                args.position?.toLong(),
+                args.duration?.toLong(),
+            )
             invoke.resolve()
         } catch (e: Exception) {
             invoke.reject("Failed to update playback state: ${e.message}")
+        }
+    }
+
+    @Command
+    fun update_media_library(invoke: Invoke) {
+        val args = invoke.parseArgs(UpdateMediaLibraryArgs::class.java)
+        try {
+            MediaPlaybackService.saveLibrary(activity, args.booksJson ?: "[]")
+            // Keep a process-local route from Android Auto selections back to
+            // the WebView even while no TTS session is active.
+            MediaPlaybackService.setPluginEventTrigger { event, data -> trigger(event, data) }
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("Failed to update Android Auto library: ${e.message}")
         }
     }
 
@@ -549,21 +608,159 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         args.foregroundServiceText?.let { FOREGROUND_SERVICE_TEXT = it }
 
         try {
-            val intent = Intent(activity, MediaPlaybackService::class.java)
             if (active) {
                 cancelIdleTimer()
-                MediaPlaybackService.pluginEventTrigger = { event, data -> trigger(event, data) }
                 MediaPlaybackService.currentTitle = FOREGROUND_SERVICE_TITLE
                 MediaPlaybackService.currentArtist = FOREGROUND_SERVICE_TEXT
+                // Set before the service starts: activateSession reads it to
+                // decide whether to take audio focus for this session.
+                MediaPlaybackService.ownsAudioFocus = args.ownsAudioFocus ?: true
+                // Record ownership before service creation. A late teardown
+                // from the prior book must not deactivate this replacement.
+                MediaPlaybackService.requestActivation(args.sessionId, args.bookHash)
+                MediaPlaybackService.setPluginEventTrigger { event, data -> trigger(event, data) }
+                // Persist the book so the Android Auto browse tree can offer a
+                // "Resume last book" entry after the process is cold.
+                args.bookHash?.let {
+                    MediaPlaybackService.saveLastBook(activity, it, args.bookTitle, args.bookAuthor)
+                }
+                val intent = Intent(activity, MediaPlaybackService::class.java).apply {
+                    action = MediaPlaybackService.ACTION_ACTIVATE_SESSION
+                }
+                Log.d(TAG, "set_media_session_active: startForegroundService")
                 ContextCompat.startForegroundService(activity, intent)
             } else {
-                activity.stopService(intent)
-                MediaPlaybackService.pluginEventTrigger = null
+                // Not stopService: Android Auto may keep the service bound for
+                // browsing, in which case stopService would leave the foreground
+                // notification and the keep-alive player running.
+                MediaPlaybackService.requestDeactivation(args.sessionId)
             }
             invoke.resolve()
         } catch (e: Exception) {
+            if (active) {
+                MediaPlaybackService.requestDeactivation(args.sessionId)
+            }
             invoke.reject("Failed to set media session active state: ${e.message}")
         }
+    }
+
+    @Command
+    fun playout_control(invoke: Invoke) {
+        val args = invoke.parseArgs(PlayoutControlArgs::class.java)
+        val action = args.action ?: ""
+
+        activity.runOnUiThread {
+            try {
+                when (action) {
+                    "start-session" -> {
+                        cancelIdleTimer()
+                        abortPlayout()
+                        playoutSession += 1
+                        invoke.resolve(JSObject().apply { put("session", playoutSession) })
+                    }
+                    "end-session" -> {
+                        if (playoutCurrentIndex < 0) emitPlayoutEvent("session-end")
+                        invoke.resolve(JSObject().apply { put("session", JSONObject.NULL) })
+                    }
+                    "abort" -> {
+                        abortPlayout()
+                        invoke.resolve(JSObject().apply { put("session", JSONObject.NULL) })
+                    }
+                    "pause" -> {
+                        playoutPlayer?.pause()
+                        invoke.resolve(JSObject().apply { put("session", JSONObject.NULL) })
+                    }
+                    "resume" -> {
+                        playoutPlayer?.play()
+                        invoke.resolve(JSObject().apply { put("session", JSONObject.NULL) })
+                    }
+                    "set-rate" -> {
+                        playoutRate = (args.rate ?: 1.0).toFloat()
+                        playoutPlayer?.setPlaybackSpeed(playoutRate)
+                        invoke.resolve(JSObject().apply { put("session", JSONObject.NULL) })
+                    }
+                    "load" -> {
+                        val path = args.path
+                        if (path.isNullOrEmpty()) {
+                            invoke.reject("playout load requires path")
+                        } else {
+                            loadContinuousFile(path, args.positionMs ?: 0.0)
+                            invoke.resolve(JSObject().apply { put("session", playoutSession) })
+                        }
+                    }
+                    "seek" -> {
+                        playoutPlayer?.seekTo((args.positionMs ?: 0.0).coerceAtLeast(0.0).toLong())
+                        invoke.resolve(JSObject().apply { put("session", JSONObject.NULL) })
+                    }
+                    else -> invoke.reject("Unknown playout action: $action")
+                }
+            } catch (e: Exception) {
+                invoke.reject("Native narration control failed: ${e.message}")
+            }
+        }
+    }
+
+    @Command
+    fun playout_position(invoke: Invoke) {
+        activity.runOnUiThread {
+            val player = playoutPlayer
+            invoke.resolve(JSObject().apply {
+                put("session", playoutSession)
+                put("index", playoutCurrentIndex)
+                put("positionMs", player?.currentPosition ?: 0L)
+                put("playing", player?.isPlaying ?: false)
+            })
+        }
+    }
+
+    private fun ensurePlayoutPlayer(): ExoPlayer {
+        return playoutPlayer ?: ExoPlayer.Builder(activity).build().also { player ->
+            player.addListener(playoutListener)
+            player.setPlaybackSpeed(playoutRate)
+            playoutPlayer = player
+        }
+    }
+
+    private fun loadContinuousFile(path: String, positionMs: Double) {
+        // A paired Audiobookshelf audiobook streams its tracks by URL, the
+        // same way the iOS playout player already accepts http(s) paths.
+        val uri = if (path.startsWith("http://") || path.startsWith("https://")) {
+            Uri.parse(path)
+        } else {
+            val file = File(path)
+            require(file.isFile) { "Narration file not found: $path" }
+            Uri.fromFile(file)
+        }
+        val player = ensurePlayoutPlayer()
+        val startMs = positionMs.coerceAtLeast(0.0).toLong()
+
+        if (playoutLoadedPath == path && player.currentMediaItem != null) {
+            player.seekTo(startMs)
+        } else {
+            player.setMediaItem(MediaItem.fromUri(uri), startMs)
+            player.prepare()
+            playoutLoadedPath = path
+        }
+        // Loading and resuming are separate operations, matching the web and
+        // iOS clocks used by MediaOverlayClient.
+        player.pause()
+        playoutCurrentIndex = 0
+        emitPlayoutEvent("chunk-start", 0)
+    }
+
+    private fun abortPlayout() {
+        playoutCurrentIndex = -1
+        playoutPlayer?.stop()
+        playoutPlayer?.clearMediaItems()
+        playoutLoadedPath = null
+    }
+
+    private fun emitPlayoutEvent(type: String, index: Int? = null) {
+        trigger("playout_events", JSObject().apply {
+            put("type", type)
+            put("session", playoutSession)
+            index?.let { put("index", it) }
+        })
     }
     
     private fun startIdleTimer() {
@@ -577,9 +774,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun shutdownTTSEngine() {
         try {
-            val intent = Intent(activity, MediaPlaybackService::class.java)
-            activity.stopService(intent)
-            MediaPlaybackService.pluginEventTrigger = null
+            abortPlayout()
+            MediaPlaybackService.requestDeactivation()
 
             textToSpeech?.shutdown()
             textToSpeech = null
@@ -602,8 +798,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
         try {
             cancelIdleTimer()
 
-            val intent = Intent(activity, MediaPlaybackService::class.java)
-            activity.stopService(intent)
+            MediaPlaybackService.requestDeactivation()
+            MediaPlaybackService.setPluginEventTrigger(null)
 
             coroutineScope.cancel()
             textToSpeech?.shutdown()
@@ -613,6 +809,8 @@ class NativeTTSPlugin(private val activity: Activity) : Plugin(activity) {
             eventChannels.clear()
             speakingJobs.values.forEach { it.cancel() }
             speakingJobs.clear()
+            playoutPlayer?.release()
+            playoutPlayer = null
 
             Log.d(TAG, "Plugin destroyed successfully")
         } catch (e: Exception) {

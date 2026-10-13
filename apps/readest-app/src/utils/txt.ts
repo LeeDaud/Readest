@@ -21,7 +21,13 @@ export const extractTxtFilenameMetadata = (
   const base = getBaseFilename(filename);
   const cjkMatch = base.match(/《([^》]+)》(.*)/);
   if (!cjkMatch) {
-    return { title: base };
+    // No 《》 wrapper: keep the whole filename as the title (web-novel files use
+    // 【】 brackets for the title and tack the author on, e.g.
+    // 【书名】1-129 作者：起落.txt). Only the labeled "作者：X" form is safe to pull
+    // here — a bracketed/bare fallback would mistake a leading 【title】 for the
+    // author. See issue #4390.
+    const author = parseLabeledAuthor(base);
+    return author ? { title: base, author } : { title: base };
   }
   const title = cjkMatch[1]!.trim();
   const rest = (cjkMatch[2] ?? '').trim();
@@ -29,11 +35,17 @@ export const extractTxtFilenameMetadata = (
   return author ? { title, author } : { title };
 };
 
+// 作者：X / 作者:X / 作者 X — a labeled author. Returns '' when absent.
+const parseLabeledAuthor = (text: string): string => {
+  const labeled = text.match(/作者\s*[：:\s]\s*(.+)$/);
+  return labeled ? stripWrappingPunctuation(labeled[1]!) : '';
+};
+
 const parseAuthorFragment = (text: string): string => {
   if (!text) return '';
   // 作者：X / 作者:X / 作者 X — labeled author wins
-  const labeled = text.match(/作者\s*[：:\s]\s*(.+)$/);
-  if (labeled) return stripWrappingPunctuation(labeled[1]!);
+  const labeled = parseLabeledAuthor(text);
+  if (labeled) return labeled;
   // [X] (X) 【X】 （X）［X］ — bracketed author
   const bracketed = text.match(/[[(（【［]\s*([^\])）】］]+?)\s*[\])）】］]/);
   if (bracketed) return stripWrappingPunctuation(bracketed[1]!);
@@ -49,6 +61,15 @@ const stripWrappingPunctuation = (text: string): string => {
     return trimmed;
   }
 };
+
+// A header line like "作者：X" is meant to yield a short personal/pen name. Some
+// web-novel TXT files instead carry a metadata blob there (e.g.
+// "作者：2024/08/01发表于：是否首发：是 字数1023150字…") that the greedy capture would
+// otherwise surface as the author. Reject values that look like such a blob —
+// an embedded field separator (a second colon), a long digit run, or excessive
+// length — so callers fall back to the filename's labeled author. See #4390.
+const isPlausibleAuthorName = (name: string): boolean =>
+  name.length > 0 && name.length <= 20 && !/[:：]/.test(name) && !/\d{4,}/.test(name);
 
 interface Chapter {
   title: string;
@@ -100,6 +121,17 @@ const escapeXml = (str: string) => {
     .replace(/'/g, '&apos;');
 };
 
+// Characters that can spell a chapter number after 第. Beyond the plain
+// 一二三…, 两/兩 is the colloquial "two" web novels use for hundreds
+// (第两百一十八章) and 壹贰叁… are the uppercase numerals of classical and formal
+// editions. A numeral style left out here does not merely lose its own
+// headings: its chapters glue into one oversized part that isGoodMatches
+// rejects, dropping the TOC for the entire book. See issue #6172.
+const CJK_NUMBER_DIGITS = '零〇一二两兩三四五六七八九十壹贰貳叁叄參肆伍陆陸柒捌玖拾0-9';
+const CJK_NUMBER_UNITS = '百千万萬佰仟';
+const CJK_NUMBER_CHARS = `${CJK_NUMBER_DIGITS}${CJK_NUMBER_UNITS}`;
+const CJK_VOLUME_HEADING = new RegExp(`第[${CJK_NUMBER_CHARS}]+(卷|本|册|部)`);
+
 export class TxtToEpubConverter {
   public async convert(options: Txt2EpubOptions): Promise<ConversionResult> {
     if (options.file.size <= LARGE_TXT_THRESHOLD_BYTES) {
@@ -111,12 +143,13 @@ export class TxtToEpubConverter {
   private async convertSmallFile(options: Txt2EpubOptions): Promise<ConversionResult> {
     const { file: txtFile, author: providedAuthor, language: providedLanguage } = options;
 
-    const fileContent = await txtFile.arrayBuffer();
+    let fileContent: ArrayBuffer | null = await txtFile.arrayBuffer();
     const detectedEncoding = this.detectEncoding(fileContent) || 'utf-8';
     const runtimeEncoding = this.resolveSupportedEncoding(detectedEncoding);
     // console.log(`Detected encoding: ${detectedEncoding}, runtime encoding: ${runtimeEncoding}`);
     const decoder = new TextDecoder(runtimeEncoding);
-    const txtContent = decoder.decode(fileContent).trim();
+    let txtContent: string | null = decoder.decode(fileContent).trim();
+    fileContent = null;
 
     const filenameMeta = extractTxtFilenameMetadata(txtFile.name);
     const bookTitle = filenameMeta.title;
@@ -130,7 +163,8 @@ export class TxtToEpubConverter {
     try {
       matchedAuthor = matchedAuthor.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
     } catch {}
-    const author = matchedAuthor || filenameMeta.author || providedAuthor || '';
+    const headerAuthor = isPlausibleAuthorName(matchedAuthor) ? matchedAuthor : '';
+    const author = headerAuthor || filenameMeta.author || providedAuthor || '';
     const language = providedLanguage || detectLanguage(fileHeader);
     // console.log(`Detected language: ${language}`);
     const identifier = await partialMD5(txtFile);
@@ -156,6 +190,8 @@ export class TxtToEpubConverter {
         fallbackParagraphsPerChapter,
       });
     }
+    // Chapter HTML is the remaining corpus; drop the decoded TXT before zip.
+    txtContent = null;
 
     const blob = await this.createEpub(chapters, metadata);
     return {
@@ -523,11 +559,12 @@ export class TxtToEpubConverter {
     const authorMatch =
       fileHeader.match(/[【\[]?作者[】\]]?[:：\s]\s*(.+)\r?\n/) ||
       fileHeader.match(/[【\[]?\s*(.+)\s+著\s*[】\]]?\r?\n/);
-    let matchedAuthor = authorMatch ? authorMatch[1]!.trim() : providedAuthor || '';
+    let matchedAuthor = authorMatch ? authorMatch[1]!.trim() : '';
     try {
       matchedAuthor = matchedAuthor.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
     } catch {}
-    const author = matchedAuthor || providedAuthor || '';
+    const headerAuthor = isPlausibleAuthorName(matchedAuthor) ? matchedAuthor : '';
+    const author = headerAuthor || providedAuthor || '';
     const language = providedLanguage || detectLanguage(fileHeader);
     return { author, language };
   }
@@ -580,7 +617,7 @@ export class TxtToEpubConverter {
 
       let isVolume = false;
       if (language === 'zh') {
-        isVolume = /第[零〇一二三四五六七八九十百千万0-9]+(卷|本|册|部)/.test(title);
+        isVolume = CJK_VOLUME_HEADING.test(title);
       } else {
         isVolume = /\b(Part|Volume|Book)\b/i.test(title);
       }
@@ -696,15 +733,28 @@ export class TxtToEpubConverter {
     const chapterRegexps: RegExp[] = [];
 
     if (language === 'zh') {
+      // 第N + unit, expressed as two explicit tiers that share the 第N prefix and
+      // the trailing boundary. They stay in ONE alternation (and so one split
+      // pass) on purpose: a segment often mixes chapter and volume headings (a
+      // volume wraps chapters), and the regexps array is a fallback chain — the
+      // first regex that splits "well enough" wins — so separate entries would
+      // recognize one tier and silently drop the other.
+      const cjkNumber = `第[ 　${CJK_NUMBER_DIGITS}][ 　${CJK_NUMBER_CHARS}]*`;
+      // Tier 1 — chapter units. Real headings; a title may attach directly
+      // (第一章天地初开) or after a separator.
+      const chapterUnit = String.raw`[章节回讲篇话](?:[：:、 　\(\)0-9]*[^\n-]{0,36})`;
+      // Tier 2 — volume/measure-word units. These double as 量词 in prose
+      // (第一封信 "the first letter", 第四本书 "the fourth book"), so a title only
+      // counts when introduced by a separator (：:、, space, parens) or the line
+      // ends — never a bare noun directly after the unit. See issue #4658.
+      const volumeUnit = String.raw`[卷本册部封](?:[：:、 　\(\)][：:、 　\(\)0-9]*[^\n-]{0,36})?`;
+      const numberedHeading = String.raw`${cjkNumber}(?:${chapterUnit}|${volumeUnit})(?!\S)`;
+      const prefaceHeading = String.raw`(?:楔子|前言|简介|引言|序言|序章|总论|概论|后记|番外篇|番外|外传)(?:[：: 　][^\n-]{0,36})?(?!\S)`;
+      const englishHeading = String.raw`chapter[\s.]*[0-9]+(?:[：:. 　]+[^\n-]{0,50})?(?!\S)`;
       chapterRegexps.push(
         new RegExp(
-          String.raw`(?:^|\n)\s*` +
-            '(' +
-            [
-              String.raw`第[ 　零〇一二三四五六七八九十0-9][ 　零〇一二三四五六七八九十百千万0-9]*(?:[章卷节回讲篇封本册部话])(?:[：:、 　\(\)0-9]*[^\n-]{0,36})(?!\S)`,
-              String.raw`(?:楔子|前言|简介|引言|序言|序章|总论|概论|后记|番外篇|番外|外传)(?:[：: 　][^\n-]{0,36})?(?!\S)`,
-              String.raw`chapter[\s.]*[0-9]+(?:[：:. 　]+[^\n-]{0,50})?(?!\S)`,
-            ].join('|') +
+          String.raw`(?:^|\n)\s*(` +
+            [numberedHeading, prefaceHeading, englishHeading].join('|') +
             ')',
           'gui',
         ),
@@ -854,10 +904,14 @@ export class TxtToEpubConverter {
 
     await zipWriter.add('style.css', new TextReader(css), zipWriteOptions);
 
-    // Add chapter files
+    // Add chapter files. Drop each chapter body from the chapters array before
+    // zip.js buffers the entry so the full HTML corpus is not retained beside
+    // BlobWriter's growing archive (folder TXT import converts many books).
     for (let i = 0; i < chapters.length; i++) {
       const chapter = chapters[i]!;
       const lang = language;
+      const body = chapter.content;
+      chapter.content = '';
       const chapterContent = `<?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
         <html xmlns="http://www.w3.org/1999/xhtml" lang="${lang}" xml:lang="${lang}">
@@ -865,7 +919,7 @@ export class TxtToEpubConverter {
             <title>${chapter.title}</title>
             <link rel="stylesheet" type="text/css" href="../style.css"/>
           </head>
-          <body>${chapter.content}</body>
+          <body>${body}</body>
         </html>`.trim();
 
       await zipWriter.add(

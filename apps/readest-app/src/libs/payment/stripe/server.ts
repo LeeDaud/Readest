@@ -3,6 +3,7 @@ import { UserPlan } from '@/types/quota';
 import { createSupabaseAdminClient } from '@/utils/supabase';
 import { PaymentStatus, StripePaymentData, StripeProductMetadata } from '@/types/payment';
 import { updateUserStorage } from '../storage';
+import { resolveUserPlan } from '../entitlements';
 
 let stripe: Stripe | null;
 
@@ -19,6 +20,55 @@ export const getStripe = () => {
   return stripe;
 };
 
+// A user can hold several subscriptions at once (e.g. right after upgrading
+// Plus -> Pro, before the old Plus subscription is cancelled). Rank the plans
+// so we can always reflect the highest one on the account.
+const PLAN_RANK: Record<UserPlan, number> = {
+  free: 0,
+  purchase: 0,
+  plus: 1,
+  pro: 2,
+};
+
+const getSubscriptionPlan = (subscription: Stripe.Subscription): UserPlan => {
+  const product = subscription.items.data[0]?.price.product as
+    | (Stripe.Product & { metadata: StripeProductMetadata })
+    | undefined;
+  return product?.metadata?.plan || 'free';
+};
+
+/**
+ * Resolve the highest plan among a customer's currently active (or trialing)
+ * Stripe subscriptions. Returns `'free'` when none are active. This keeps the
+ * `plans` table correct regardless of the order in which subscription webhooks
+ * arrive when multiple subscriptions overlap.
+ */
+export const getHighestActivePlan = async (
+  stripe: Stripe,
+  customerId: string,
+): Promise<UserPlan> => {
+  const { data: subscriptions } = await stripe.subscriptions.list({
+    customer: customerId,
+    status: 'all',
+    limit: 100,
+  });
+  const activeSubscriptions = subscriptions.filter((sub) =>
+    ['active', 'trialing'].includes(sub.status),
+  );
+  const plans = await Promise.all(
+    activeSubscriptions.map(async (sub) => {
+      const detailed = await stripe.subscriptions.retrieve(sub.id, {
+        expand: ['items.data.price.product'],
+      });
+      return getSubscriptionPlan(detailed);
+    }),
+  );
+  return plans.reduce<UserPlan>(
+    (highest, plan) => (PLAN_RANK[plan] > PLAN_RANK[highest] ? plan : highest),
+    'free',
+  );
+};
+
 export const createOrUpdateSubscription = async (
   userId: string,
   customerId: string,
@@ -27,15 +77,9 @@ export const createOrUpdateSubscription = async (
   const stripe = getStripe();
   const supabase = createSupabaseAdminClient();
 
-  const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
-    expand: ['items.data.price.product'],
-  });
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
   const subscriptionItem = subscription.items.data[0]!;
   const priceId = subscriptionItem.price.id;
-  const product = subscriptionItem.price.product as Stripe.Product & {
-    metadata: StripeProductMetadata;
-  };
-  const plan = product.metadata?.plan || 'free';
 
   try {
     const { data: existingSubscription } = await supabase
@@ -71,10 +115,13 @@ export const createOrUpdateSubscription = async (
     console.error('Error checking existing subscription:', error);
   }
 
+  // Across every provider, not just Stripe: this user may also hold a Google
+  // Play or App Store subscription that must not be cancelled out from here.
+  const plan = await resolveUserPlan(userId, { stripeCustomerId: customerId });
   await supabase
     .from('plans')
     .update({
-      plan: ['active', 'trialing'].includes(subscription.status) ? plan : 'free',
+      plan,
       status: subscription.status,
     })
     .eq('id', userId);
@@ -91,7 +138,7 @@ export const createOrUpdatePayment = async (
   const supabase = createSupabaseAdminClient();
 
   const session = await stripe.checkout.sessions.retrieve(checkoutSessionId, {
-    expand: ['line_items.data.price.product', 'payment_intent'],
+    expand: ['line_items.data.price.product', 'payment_intent.latest_charge'],
   });
 
   if (!session.payment_intent) {
@@ -99,6 +146,10 @@ export const createOrUpdatePayment = async (
   }
 
   const paymentIntent = session.payment_intent as Stripe.PaymentIntent;
+  // A refunded intent stays `succeeded`; the refund is only on the charge.
+  // Without this, re-running this for a refunded session restores the
+  // entitlement.
+  const refunded = (paymentIntent.latest_charge as Stripe.Charge | null)?.refunded;
   const lineItem = session.line_items?.data[0];
   const product = lineItem?.price?.product as Stripe.Product & {
     metadata: { plan: UserPlan; storageGB: string };
@@ -114,7 +165,7 @@ export const createOrUpdatePayment = async (
       stripe_payment_intent_id: paymentIntent.id,
       amount: paymentIntent.amount,
       currency: paymentIntent.currency,
-      status: paymentIntent.status as PaymentStatus,
+      status: refunded ? 'refunded' : (paymentIntent.status as PaymentStatus),
       payment_method: paymentIntent.payment_method as string | null,
       product_id: product?.id,
       storage_gb: productMetadata?.storageGB ? parseInt(productMetadata.storageGB) : 0,

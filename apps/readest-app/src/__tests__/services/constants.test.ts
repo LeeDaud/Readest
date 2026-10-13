@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { DEFAULT_ANNOTATION_TOOLBAR_ITEMS } from '@/utils/annotationToolbar';
 
 vi.mock('@/utils/config', () => ({
   getDefaultMaxBlockSize: vi.fn(() => 1600),
@@ -141,6 +142,10 @@ describe('services/constants', () => {
       expect(SUPPORTED_BOOK_EXTS).toContain('pdf');
       expect(SUPPORTED_BOOK_EXTS).toContain('mobi');
       expect(SUPPORTED_BOOK_EXTS).toContain('txt');
+      expect(SUPPORTED_BOOK_EXTS).toContain('md');
+      expect(SUPPORTED_BOOK_EXTS).toContain('html');
+      expect(SUPPORTED_BOOK_EXTS).toContain('mhtml');
+      expect(SUPPORTED_BOOK_EXTS).toContain('mht');
     });
 
     it('BOOK_ACCEPT_FORMATS is a comma-separated string of dotted extensions', () => {
@@ -224,13 +229,12 @@ describe('services/constants', () => {
 
     it('has boolean flags', () => {
       expect(typeof DEFAULT_SYSTEM_SETTINGS.keepLogin).toBe('boolean');
-      expect(typeof DEFAULT_SYSTEM_SETTINGS.autoUpload).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.alwaysOnTop).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.openBookInNewWindow).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.alwaysShowStatusBar).toBe('boolean');
-      expect(typeof DEFAULT_SYSTEM_SETTINGS.alwaysInForeground).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.autoCheckUpdates).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.screenWakeLock).toBe('boolean');
+      expect(typeof DEFAULT_SYSTEM_SETTINGS.autohideCursor).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.openLastBooks).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.autoImportBooksOnOpen).toBe('boolean');
       expect(typeof DEFAULT_SYSTEM_SETTINGS.telemetryEnabled).toBe('boolean');
@@ -253,6 +257,8 @@ describe('services/constants', () => {
         font: true,
         texture: true,
         opds_catalog: true,
+        abs_server: true,
+        custom_translator: true,
         settings: true,
       });
     });
@@ -302,6 +308,7 @@ describe('services/constants', () => {
       expect(hw.bindings.pageNext).toBeNull();
       expect(hw.bindings.sectionPrev).toBeNull();
       expect(hw.bindings.sectionNext).toBeNull();
+      expect(hw.bindings.refresh).toBeNull();
     });
   });
 
@@ -368,8 +375,7 @@ describe('services/constants', () => {
       expect(typeof DEFAULT_READSETTINGS.notebookActiveTab).toBe('string');
     });
 
-    it('has cursor and translation settings', () => {
-      expect(typeof DEFAULT_READSETTINGS.autohideCursor).toBe('boolean');
+    it('has translation settings', () => {
       expect(typeof DEFAULT_READSETTINGS.translationProvider).toBe('string');
       expect(typeof DEFAULT_READSETTINGS.translateTargetLang).toBe('string');
     });
@@ -442,6 +448,10 @@ describe('services/constants', () => {
       expect(DEFAULT_BOOK_LAYOUT.gapPercent).toBeLessThanOrEqual(100);
     });
 
+    it('derives the column gap from the margins by default', () => {
+      expect(DEFAULT_BOOK_LAYOUT.columnGapPx).toBe(0);
+    });
+
     it('has boolean layout flags', () => {
       expect(typeof DEFAULT_BOOK_LAYOUT.scrolled).toBe('boolean');
       expect(typeof DEFAULT_BOOK_LAYOUT.noContinuousScroll).toBe('boolean');
@@ -504,6 +514,7 @@ describe('services/constants', () => {
       expect(typeof DEFAULT_BOOK_STYLE.wordSpacing).toBe('number');
       expect(typeof DEFAULT_BOOK_STYLE.letterSpacing).toBe('number');
       expect(typeof DEFAULT_BOOK_STYLE.textIndent).toBe('number');
+      expect(DEFAULT_BOOK_STYLE.contrast).toBe(100);
     });
 
     it('has boolean style flags', () => {
@@ -553,7 +564,6 @@ describe('services/constants', () => {
       expect(DEFAULT_MOBILE_VIEW_SETTINGS.fullJustification).toBe(false);
       expect(DEFAULT_MOBILE_VIEW_SETTINGS.animated).toBe(true);
       expect(typeof DEFAULT_MOBILE_VIEW_SETTINGS.defaultFont).toBe('string');
-      expect(typeof DEFAULT_MOBILE_VIEW_SETTINGS.marginBottomPx).toBe('number');
       expect(DEFAULT_MOBILE_VIEW_SETTINGS.disableDoubleClick).toBe(true);
       expect(typeof DEFAULT_MOBILE_VIEW_SETTINGS.spreadMode).toBe('string');
     });
@@ -603,13 +613,11 @@ describe('services/constants', () => {
       expect(typeof DEFAULT_VIEW_CONFIG.showCurrentBatteryStatus).toBe('boolean');
       expect(typeof DEFAULT_VIEW_CONFIG.showBatteryPercentage).toBe('boolean');
       expect(typeof DEFAULT_VIEW_CONFIG.use24HourClock).toBe('boolean');
-      expect(typeof DEFAULT_VIEW_CONFIG.tapToToggleFooter).toBe('boolean');
       expect(typeof DEFAULT_VIEW_CONFIG.showPaginationButtons).toBe('boolean');
     });
 
     it('has progress style settings', () => {
       expect(typeof DEFAULT_VIEW_CONFIG.progressStyle).toBe('string');
-      expect(typeof DEFAULT_VIEW_CONFIG.progressInfoMode).toBe('string');
     });
 
     it('has animation and eink flags', () => {
@@ -648,10 +656,12 @@ describe('services/constants', () => {
       expect(typeof DEFAULT_TTS_CONFIG).toBe('object');
       expect(typeof DEFAULT_TTS_CONFIG.ttsRate).toBe('number');
       expect(DEFAULT_TTS_CONFIG.ttsRate).toBeGreaterThan(0);
+      expect(typeof DEFAULT_TTS_CONFIG.ttsSentenceGap).toBe('number');
+      expect(DEFAULT_TTS_CONFIG.ttsSentenceGap).toBeGreaterThan(0);
       expect(typeof DEFAULT_TTS_CONFIG.ttsVoice).toBe('string');
       expect(typeof DEFAULT_TTS_CONFIG.ttsLocation).toBe('string');
-      expect(typeof DEFAULT_TTS_CONFIG.showTTSBar).toBe('boolean');
       expect(typeof DEFAULT_TTS_CONFIG.ttsMediaMetadata).toBe('string');
+      expect(DEFAULT_TTS_CONFIG.ttsSkipInlineAnnotations).toBe(false);
     });
 
     it('has ttsHighlightOptions with style and color', () => {
@@ -710,6 +720,13 @@ describe('services/constants', () => {
       expect(typeof DEFAULT_ANNOTATOR_CONFIG.copyToNotebook).toBe('boolean');
       expect(DEFAULT_ANNOTATOR_CONFIG.noteExportConfig).toBeDefined();
       expect(DEFAULT_ANNOTATOR_CONFIG.noteExportConfig).toBe(DEFAULT_NOTE_EXPORT_CONFIG);
+    });
+
+    it('annotationToolbarItems defaults to the eight non-share tools', () => {
+      expect(DEFAULT_ANNOTATOR_CONFIG.annotationToolbarItems).toEqual(
+        DEFAULT_ANNOTATION_TOOLBAR_ITEMS,
+      );
+      expect(DEFAULT_ANNOTATOR_CONFIG.annotationToolbarItems).not.toContain('share');
     });
   });
 
@@ -1100,6 +1117,10 @@ describe('services/constants', () => {
       expect(TRANSLATOR_LANGS['nb']).toBeDefined();
       expect(TRANSLATOR_LANGS['sv']).toBeDefined();
       expect(TRANSLATOR_LANGS['fi']).toBeDefined();
+    });
+
+    it('TRANSLATOR_LANGS includes Urdu', () => {
+      expect(TRANSLATOR_LANGS['ur']).toBe('اردو');
     });
 
     it('SUPPORTED_LANGS includes zh in addition to TRANSLATED_LANGS entries', () => {

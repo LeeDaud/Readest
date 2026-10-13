@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+  SETTINGS_DICTIONARY_FIELDS,
   SETTINGS_KIND,
   SETTINGS_REPLICA_ID,
   SETTINGS_SCHEMA_VERSION,
@@ -34,6 +35,23 @@ describe('settingsAdapter', () => {
     expect(SETTINGS_KIND).toBe('settings');
     expect(SETTINGS_SCHEMA_VERSION).toBe(1);
     expect(SETTINGS_REPLICA_ID).toBe('singleton');
+  });
+
+  test('every dictionary-category path is a real whitelist entry', () => {
+    // The 'dictionary' sync gate in replicaSettingsSync matches these
+    // paths against SETTINGS_WHITELIST by exact string. A typo or a
+    // renamed whitelist entry would silently reopen the leak in #5465,
+    // so pin the membership here.
+    for (const path of SETTINGS_DICTIONARY_FIELDS) {
+      expect(SETTINGS_WHITELIST).toContain(path);
+    }
+    // Conversely, every whitelisted dictionarySettings.* path must be
+    // gated — a new one added without updating the list would sync
+    // regardless of the Dictionaries toggle.
+    const whitelistedDictPaths = SETTINGS_WHITELIST.filter((p) =>
+      p.startsWith('dictionarySettings.'),
+    );
+    expect([...SETTINGS_DICTIONARY_FIELDS].sort()).toEqual(whitelistedDictPaths.slice().sort());
   });
 
   test('declares no `binary` capability — bundled metadata only', () => {
@@ -74,6 +92,68 @@ describe('settingsAdapter', () => {
     expect(fields['kosync.serverUrl']).toBe('https://kosync.example');
   });
 
+  test('pack/unpack round-trips Notion connection fields and drops local sync state', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        notion: {
+          enabled: true,
+          accessToken: 'notion-token',
+          databaseId: 'notion-database-id',
+          lastSyncedAt: 123,
+          includeChapterHeading: false,
+        },
+      } as Partial<SystemSettings>,
+    };
+
+    const fields = settingsAdapter.pack(record);
+    expect(fields['notion.databaseId']).toBe('notion-database-id');
+    expect(fields['notion.accessToken']).toBe('notion-token');
+    expect(fields['notion.enabled']).toBeUndefined();
+    expect(fields['notion.lastSyncedAt']).toBeUndefined();
+    expect(fields['notion.includeChapterHeading']).toBeUndefined();
+
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.notion?.databaseId).toBe('notion-database-id');
+    expect(out.patch.notion?.accessToken).toBe('notion-token');
+    expect(out.patch.notion?.enabled).toBeUndefined();
+    expect(out.patch.notion?.lastSyncedAt).toBeUndefined();
+    expect(out.patch.notion?.includeChapterHeading).toBeUndefined();
+  });
+
+  test('pack ∘ unpack round-trips WebDAV connection fields, dropping per-device state', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        webdav: {
+          enabled: true,
+          serverUrl: 'https://dav.example.com',
+          username: 'alice',
+          password: 'hunter2',
+          rootPath: '/Books',
+          deviceId: 'this-device',
+          lastSyncedAt: 123,
+        },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['webdav.serverUrl']).toBe('https://dav.example.com');
+    expect(fields['webdav.username']).toBe('alice');
+    expect(fields['webdav.password']).toBe('hunter2');
+    expect(fields['webdav.rootPath']).toBe('/Books');
+    // Per-device bookkeeping must not ship.
+    expect(fields['webdav.enabled']).toBeUndefined();
+    expect(fields['webdav.deviceId']).toBeUndefined();
+    expect(fields['webdav.lastSyncedAt']).toBeUndefined();
+
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.webdav?.serverUrl).toBe('https://dav.example.com');
+    expect(out.patch.webdav?.username).toBe('alice');
+    expect(out.patch.webdav?.password).toBe('hunter2');
+    expect(out.patch.webdav?.rootPath).toBe('/Books');
+    expect(out.patch.webdav?.enabled).toBeUndefined();
+  });
+
   test('pack ∘ unpack round-trips object-valued nested fields (highlight palette)', () => {
     const customColors = { yellow: '#ffeb3b', blue: '#2196f3' };
     const userColors = [{ name: 'mint', color: '#a8e6cf' }];
@@ -92,18 +172,165 @@ describe('settingsAdapter', () => {
     expect(out.patch.globalReadSettings?.userHighlightColors).toEqual(userColors);
   });
 
-  test('declares encryptedFields covering kosync / readwise / hardcover credentials only (not serverUrl)', () => {
+  test('pack ∘ unpack round-trips S3 connection fields, dropping per-device state', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        s3: {
+          enabled: true,
+          endpoint: 'https://acc.r2.cloudflarestorage.com',
+          region: 'auto',
+          bucket: 'readest',
+          accessKeyId: 'AKIA',
+          secretAccessKey: 'shh',
+          deviceId: 'this-device',
+          lastSyncedAt: 123,
+          providerSelectedAt: 456,
+        },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['s3.endpoint']).toBe('https://acc.r2.cloudflarestorage.com');
+    expect(fields['s3.region']).toBe('auto');
+    expect(fields['s3.bucket']).toBe('readest');
+    expect(fields['s3.accessKeyId']).toBe('AKIA');
+    expect(fields['s3.secretAccessKey']).toBe('shh');
+    // Per-device bookkeeping must not ship.
+    expect(fields['s3.enabled']).toBeUndefined();
+    expect(fields['s3.deviceId']).toBeUndefined();
+    expect(fields['s3.lastSyncedAt']).toBeUndefined();
+    expect(fields['s3.providerSelectedAt']).toBeUndefined();
+
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.s3?.endpoint).toBe('https://acc.r2.cloudflarestorage.com');
+    expect(out.patch.s3?.accessKeyId).toBe('AKIA');
+    expect(out.patch.s3?.secretAccessKey).toBe('shh');
+    expect(out.patch.s3?.enabled).toBeUndefined();
+  });
+
+  test('pack ∘ unpack round-trips kosync.customHeaders, serialized to a JSON string across the boundary', () => {
+    // encryptPackedFields / decryptRowFields only handle string-valued
+    // fields (String(value) on encrypt, a decrypted string back on
+    // decrypt) — every other entry in SETTINGS_ENCRYPTED_FIELDS is a
+    // plain string. customHeaders is the first object-valued encrypted
+    // field, so pack must serialize it to JSON before it reaches the
+    // crypto middleware, and unpack must parse it back.
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        kosync: {
+          customHeaders: { 'CF-Access-Client-Id': 'client-id' },
+        },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['kosync.customHeaders']).toBe(
+      JSON.stringify({ 'CF-Access-Client-Id': 'client-id' }),
+    );
+
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.kosync?.customHeaders).toEqual({ 'CF-Access-Client-Id': 'client-id' });
+  });
+
+  test('unpackRow parses kosync.customHeaders back from its JSON string envelope', () => {
+    const row = makeRow({
+      'kosync.customHeaders': env(JSON.stringify({ 'CF-Access-Client-Id': 'client-id' })),
+    });
+    const out = settingsAdapter.unpackRow(row, '');
+    expect(out).not.toBeNull();
+    expect(out!.patch.kosync?.customHeaders).toEqual({ 'CF-Access-Client-Id': 'client-id' });
+  });
+
+  test('pack drops empty/blank kosync.customHeaders instead of shipping an empty object', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        kosync: { customHeaders: {} },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['kosync.customHeaders']).toBeUndefined();
+  });
+
+  test('kosync.customHeaders is encrypted, like the other kosync credential fields', () => {
+    expect(settingsAdapter.encryptedFields).toContain('kosync.customHeaders');
+  });
+
+  test('pack ∘ unpack round-trips bookorbit.customHeaders, serialized to a JSON string across the boundary', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        bookorbit: {
+          customHeaders: { 'CF-Access-Client-Id': 'client-id' },
+        },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['bookorbit.customHeaders']).toBe(
+      JSON.stringify({ 'CF-Access-Client-Id': 'client-id' }),
+    );
+
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.bookorbit?.customHeaders).toEqual({ 'CF-Access-Client-Id': 'client-id' });
+  });
+
+  test('unpackRow parses bookorbit.customHeaders back from its JSON string envelope', () => {
+    const row = makeRow({
+      'bookorbit.customHeaders': env(JSON.stringify({ 'CF-Access-Client-Id': 'client-id' })),
+    });
+    const out = settingsAdapter.unpackRow(row, '');
+    expect(out).not.toBeNull();
+    expect(out!.patch.bookorbit?.customHeaders).toEqual({ 'CF-Access-Client-Id': 'client-id' });
+  });
+
+  test('pack drops empty/blank bookorbit.customHeaders instead of shipping an empty object', () => {
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        bookorbit: { customHeaders: {} },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['bookorbit.customHeaders']).toBeUndefined();
+  });
+
+  test('bookorbit.customHeaders is encrypted, like the other bookorbit credential fields', () => {
+    expect(settingsAdapter.encryptedFields).toContain('bookorbit.customHeaders');
+  });
+
+  test('declares encryptedFields covering kosync / bookorbit / readwise / hardcover / webdav / s3 credentials only (not serverUrl / endpoint)', () => {
     expect(settingsAdapter.encryptedFields).toEqual([
       'kosync.username',
       'kosync.userkey',
       'kosync.password',
+      'kosync.customHeaders',
+      'bookorbit.username',
+      'bookorbit.userkey',
+      'bookorbit.password',
+      'bookorbit.customHeaders',
       'readwise.accessToken',
       'hardcover.accessToken',
+      'notion.accessToken',
+      'webdav.username',
+      'webdav.password',
+      's3.accessKeyId',
+      's3.secretAccessKey',
     ]);
   });
 
   test('kosync.serverUrl is plaintext (not in encryptedFields)', () => {
     expect(settingsAdapter.encryptedFields).not.toContain('kosync.serverUrl');
+  });
+
+  test('webdav.serverUrl and webdav.rootPath are plaintext (not in encryptedFields)', () => {
+    expect(settingsAdapter.encryptedFields).not.toContain('webdav.serverUrl');
+    expect(settingsAdapter.encryptedFields).not.toContain('webdav.rootPath');
+  });
+
+  test('s3.endpoint / region / bucket are plaintext (not in encryptedFields)', () => {
+    expect(settingsAdapter.encryptedFields).not.toContain('s3.endpoint');
+    expect(settingsAdapter.encryptedFields).not.toContain('s3.region');
+    expect(settingsAdapter.encryptedFields).not.toContain('s3.bucket');
   });
 
   test('unpackRow reconstructs the patch from CRDT envelopes', () => {
@@ -141,10 +368,90 @@ describe('SETTINGS_WHITELIST', () => {
     expect(SETTINGS_WHITELIST).toContain('dictionarySettings.providerOrder');
     expect(SETTINGS_WHITELIST).toContain('dictionarySettings.providerEnabled');
     expect(SETTINGS_WHITELIST).toContain('dictionarySettings.webSearches');
+    // Dictionary popup font size (#4443) follows the user across devices.
+    expect(SETTINGS_WHITELIST).toContain('dictionarySettings.fontScale');
+  });
+
+  test('includes the S3 connection fields but not its per-device bookkeeping', () => {
+    expect(SETTINGS_WHITELIST).toContain('s3.endpoint');
+    expect(SETTINGS_WHITELIST).toContain('s3.region');
+    expect(SETTINGS_WHITELIST).toContain('s3.bucket');
+    expect(SETTINGS_WHITELIST).toContain('s3.accessKeyId');
+    expect(SETTINGS_WHITELIST).toContain('s3.secretAccessKey');
+    expect(SETTINGS_WHITELIST).not.toContain('s3.enabled');
+    expect(SETTINGS_WHITELIST).not.toContain('s3.deviceId');
+    expect(SETTINGS_WHITELIST).not.toContain('s3.providerSelectedAt');
   });
 
   test('does NOT sync dictionarySettings.defaultProviderId (per-device last-used tab)', () => {
     expect(SETTINGS_WHITELIST).not.toContain('dictionarySettings.defaultProviderId');
+  });
+
+  test('syncs library-scope proofread rules (issue #4700 — PC rules not reaching mobile)', () => {
+    expect(SETTINGS_WHITELIST).toContain('globalViewSettings.proofreadRules');
+  });
+
+  test('syncs WebDAV connection + credentials (issue #4810 — credentials not synced)', () => {
+    expect(SETTINGS_WHITELIST).toContain('webdav.serverUrl');
+    expect(SETTINGS_WHITELIST).toContain('webdav.username');
+    expect(SETTINGS_WHITELIST).toContain('webdav.password');
+    expect(SETTINGS_WHITELIST).toContain('webdav.rootPath');
+  });
+
+  test('does NOT sync per-device WebDAV bookkeeping fields', () => {
+    // enabled / deviceId / lastSyncedAt / sync sub-toggles are per-device
+    // state — syncing them would auto-arm a fresh device or rotate its id.
+    expect(SETTINGS_WHITELIST).not.toContain('webdav.enabled');
+    expect(SETTINGS_WHITELIST).not.toContain('webdav.deviceId');
+    expect(SETTINGS_WHITELIST).not.toContain('webdav.lastSyncedAt');
+  });
+});
+
+describe('settingsAdapter proofread rules', () => {
+  test('pack ∘ unpack round-trips globalViewSettings.proofreadRules', () => {
+    const proofreadRules = [
+      {
+        id: 'r1',
+        scope: 'library',
+        pattern: 'colour',
+        replacement: 'color',
+        enabled: true,
+        isRegex: false,
+        caseSensitive: true,
+        order: 1000,
+        wholeWord: true,
+      },
+    ];
+    const record: SettingsRemoteRecord = {
+      name: 'singleton',
+      patch: {
+        globalViewSettings: { proofreadRules },
+      } as unknown as Partial<SystemSettings>,
+    };
+    const fields = settingsAdapter.pack(record);
+    expect(fields['globalViewSettings.proofreadRules']).toEqual(proofreadRules);
+    const out = settingsAdapter.unpack(fields);
+    expect(out.patch.globalViewSettings?.proofreadRules).toEqual(proofreadRules);
+  });
+
+  test('unpackRow reconstructs proofread rules from a CRDT envelope', () => {
+    const proofreadRules = [
+      {
+        id: 'r1',
+        scope: 'library',
+        pattern: 'teh',
+        replacement: 'the',
+        enabled: true,
+        isRegex: false,
+        caseSensitive: false,
+        order: 1000,
+        wholeWord: true,
+      },
+    ];
+    const row = makeRow({ 'globalViewSettings.proofreadRules': env(proofreadRules) });
+    const out = settingsAdapter.unpackRow(row, '');
+    expect(out).not.toBeNull();
+    expect(out!.patch.globalViewSettings?.proofreadRules).toEqual(proofreadRules);
   });
 });
 

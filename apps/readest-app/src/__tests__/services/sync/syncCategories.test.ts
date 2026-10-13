@@ -49,6 +49,51 @@ describe('isSyncCategoryEnabled', () => {
     expect(isSyncCategoryEnabled('font')).toBe(true);
   });
 
+  describe('cloud sync provider gate (exclusive routing, #4380)', () => {
+    test('book/progress/note are gated off while a third-party provider is selected', () => {
+      setSettings({ webdav: { enabled: true } } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book')).toBe(false);
+      expect(isSyncCategoryEnabled('progress')).toBe(false);
+      expect(isSyncCategoryEnabled('note')).toBe(false);
+    });
+
+    test('legacy plural/singular aliases are gated too', () => {
+      setSettings({ googleDrive: { enabled: true } } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('books')).toBe(false);
+      expect(isSyncCategoryEnabled('configs')).toBe(false);
+      expect(isSyncCategoryEnabled('config')).toBe(false);
+      expect(isSyncCategoryEnabled('notes')).toBe(false);
+    });
+
+    test('account channels stay native while a third-party provider is selected', () => {
+      setSettings({ webdav: { enabled: true } } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('stats')).toBe(true);
+      expect(isSyncCategoryEnabled('settings')).toBe(true);
+      expect(isSyncCategoryEnabled('dictionary')).toBe(true);
+      expect(isSyncCategoryEnabled('font')).toBe(true);
+      expect(isSyncCategoryEnabled('opds_catalog')).toBe(true);
+    });
+
+    test('the gate overrides an explicitly-true user category toggle', () => {
+      setSettings({
+        webdav: { enabled: true },
+        syncCategories: { book: true, progress: true },
+      } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book')).toBe(false);
+      expect(isSyncCategoryEnabled('progress')).toBe(false);
+    });
+
+    test('no gating when readest is the provider', () => {
+      setSettings({
+        webdav: { enabled: false },
+        googleDrive: { enabled: false },
+      } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book')).toBe(true);
+      expect(isSyncCategoryEnabled('progress')).toBe(true);
+      expect(isSyncCategoryEnabled('note')).toBe(true);
+    });
+  });
+
   test('settings is togglable on its own', () => {
     setSettings({
       syncCategories: { settings: false, dictionary: false } as Partial<
@@ -146,20 +191,61 @@ describe('isSyncCategoryEnabled', () => {
     expect(isSyncCategoryEnabled('books')).toBe(false);
     expect(isSyncCategoryEnabled('notes')).toBe(false);
   });
+
+  describe('provider gating with multiple providers', () => {
+    test('native book channels stay on when Readest Cloud runs alongside Drive', () => {
+      setSettings({
+        readestCloud: { enabled: true },
+        googleDrive: { enabled: true },
+      } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book')).toBe(true);
+      expect(isSyncCategoryEnabled('progress')).toBe(true);
+      expect(isSyncCategoryEnabled('note')).toBe(true);
+    });
+
+    test('native book channels gate off when Readest Cloud is unchecked', () => {
+      setSettings({
+        readestCloud: { enabled: false },
+        googleDrive: { enabled: true },
+      } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book')).toBe(false);
+      expect(isSyncCategoryEnabled('progress')).toBe(false);
+      expect(isSyncCategoryEnabled('note')).toBe(false);
+      // Account-level categories are never provider-gated.
+      expect(isSyncCategoryEnabled('settings')).toBe(true);
+    });
+
+    test('a legacy Drive user (no readestCloud field) keeps the native channels gated', () => {
+      setSettings({ googleDrive: { enabled: true } } as Partial<SystemSettings>);
+      expect(isSyncCategoryEnabled('book')).toBe(false);
+    });
+  });
+});
+
+describe('translator category', () => {
+  test('one toggle gates both custom_translator and translation_prompt kinds', () => {
+    expect(isSyncCategoryEnabled('translation_prompt')).toBe(true);
+    setSettings({ syncCategories: { custom_translator: false } });
+    expect(isSyncCategoryEnabled('custom_translator')).toBe(false);
+    expect(isSyncCategoryEnabled('translation_prompt')).toBe(false);
+  });
 });
 
 describe('SYNC_CATEGORIES', () => {
-  test('covers all nine user-facing categories (incl. settings + credentials)', () => {
+  test('covers all twelve user-facing categories (incl. settings + stats + credentials)', () => {
     expect([...SYNC_CATEGORIES].sort()).toEqual(
       [
+        'abs_server',
         'book',
         'credentials',
+        'custom_translator',
         'dictionary',
         'font',
         'note',
         'opds_catalog',
         'progress',
         'settings',
+        'stats',
         'texture',
       ].sort(),
     );

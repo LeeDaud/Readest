@@ -2,6 +2,7 @@ import clsx from 'clsx';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { PiSun, PiMoon } from 'react-icons/pi';
 import { TbSunMoon } from 'react-icons/tb';
+import { MdOutlineSensors } from 'react-icons/md';
 import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useTranslation } from '@/hooks/useTranslation';
@@ -10,6 +11,7 @@ import { useDeviceControlStore } from '@/store/deviceStore';
 import { saveSysSettings } from '@/helpers/settings';
 import { themes } from '@/styles/themes';
 import { debounce } from '@/utils/debounce';
+import { nextThemeMode } from '@/utils/ambientLight';
 import Slider from '@/components/Slider';
 
 const SCREEN_BRIGHTNESS_LIMITS = {
@@ -22,12 +24,15 @@ interface ColorPanelProps {
   actionTab: string;
   bottomOffset: string;
   forceMobileLayout: boolean;
+  // Keeps the panel clear of iPhone Duo's side status strip (#6307).
+  insetStyle?: React.CSSProperties;
 }
 
 export const ColorPanel: React.FC<ColorPanelProps> = ({
   actionTab,
   bottomOffset,
   forceMobileLayout,
+  insetStyle,
 }) => {
   const _ = useTranslation();
   const { envConfig, appService } = useEnv();
@@ -54,11 +59,12 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
   const debouncedSetScreenBrightness = useMemo(
     () =>
       debounce(async (value: number) => {
-        saveSysSettings(envConfig, 'screenBrightness', value);
-        saveSysSettings(envConfig, 'autoScreenBrightness', false);
-        await setScreenBrightness(value / 100);
+        if (!settings.autoScreenBrightness) {
+          saveSysSettings(envConfig, 'screenBrightness', value);
+        }
+        await setScreenBrightness(value / 100, settings.autoScreenBrightness);
       }, 100),
-    [envConfig, setScreenBrightness],
+    [envConfig, setScreenBrightness, settings.autoScreenBrightness],
   );
 
   const handleScreenBrightnessChange = useCallback(
@@ -72,17 +78,20 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
   );
 
   const cycleThemeMode = () => {
-    const nextMode = themeMode === 'auto' ? 'light' : themeMode === 'light' ? 'dark' : 'auto';
-    setThemeMode(nextMode);
+    setThemeMode(nextThemeMode(themeMode, !!appService?.hasAmbientLightSensor));
   };
 
   const classes = clsx(
     'footerbar-color-mobile not-eink:bg-base-200 eink:bg-base-100 absolute flex w-full flex-col items-center gap-y-8 px-4 transition-all',
     'eink:border-base-content eink:border-t',
     !forceMobileLayout && 'sm:hidden',
+    // Paddings stay constant in both states (the slide is transform-only) so
+    // offsetHeight always reports the panel's settled height; the TTS mini
+    // player measures it to stack above the expanded panel.
+    'pb-4 pt-8',
     actionTab === 'color'
-      ? 'pointer-events-auto translate-y-0 pb-4 pt-8 ease-out'
-      : 'pointer-events-none invisible translate-y-full overflow-hidden pb-0 pt-0 ease-in',
+      ? 'pointer-events-auto translate-y-0 ease-out'
+      : 'pointer-events-none invisible translate-y-full overflow-hidden ease-in',
   );
 
   return (
@@ -92,6 +101,7 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
         bottom: appService?.isAndroidApp
           ? `calc(env(safe-area-inset-bottom) + 64px)`
           : bottomOffset,
+        ...insetStyle,
       }}
     >
       {appService?.hasScreenBrightness && (
@@ -136,7 +146,7 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
               key={name}
               onClick={() => setThemeColor(name)}
               className={clsx(
-                'flex flex-shrink-0 flex-col items-center justify-center rounded-lg p-3 transition-all',
+                'flex shrink-0 flex-col items-center justify-center rounded-lg p-3 transition-all',
                 'h-[40px] min-w-[80px]',
                 themeColor === name
                   ? 'ring-primary ring-offset-base-200 ring-2 ring-offset-2'
@@ -153,7 +163,7 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
           <button
             onClick={() => cycleThemeMode()}
             className={clsx(
-              'flex flex-shrink-0 flex-col items-center justify-center rounded-lg p-3 transition-all',
+              'flex shrink-0 flex-col items-center justify-center rounded-lg p-3 transition-all',
               'h-[40px] min-w-[80px]',
               themeMode === 'dark'
                 ? 'ring-primary ring-offset-base-200 ring-2 ring-offset-2'
@@ -171,6 +181,8 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
               <PiSun size={20} />
             ) : themeMode === 'dark' ? (
               <PiMoon size={20} />
+            ) : themeMode === 'ambient' ? (
+              <MdOutlineSensors size={20} />
             ) : (
               <TbSunMoon size={20} />
             )}

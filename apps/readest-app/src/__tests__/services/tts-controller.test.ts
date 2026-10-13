@@ -15,8 +15,14 @@ vi.mock('@/services/tts/WebSpeechClient', () => ({
 }));
 
 vi.mock('@/services/tts/EdgeTTSClient', () => ({
+  // constants.ts imports this named const from the same module; the mock
+  // factory replaces the whole module, so it must re-export it too.
+  DEFAULT_SENTENCE_GAP_SEC: 0.15,
   EdgeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
-    Object.assign(this, createMockTTSClient('edge'));
+    Object.assign(this, createMockTTSClient('edge'), {
+      setSentenceGap: vi.fn(),
+      setParagraphGap: vi.fn(),
+    });
   }),
 }));
 
@@ -24,6 +30,16 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
   NativeTTSClient: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, createMockTTSClient('native'));
   }),
+}));
+
+// Track the inaudible background keep-alive (WebAudio) toggled for direct-speak
+// engines. Arrow closures so the vi.mock hoist never hits a TDZ on these consts.
+const startKeepAlive = vi.fn();
+const stopKeepAlive = vi.fn();
+vi.mock('@/services/tts/WebAudioPlayer', async (importActual) => ({
+  ...(await importActual<typeof import('@/services/tts/WebAudioPlayer')>()),
+  startAudioKeepAlive: () => startKeepAlive(),
+  stopAudioKeepAlive: () => stopKeepAlive(),
 }));
 
 vi.mock('@/services/tts/TTSUtils', () => ({
@@ -47,6 +63,7 @@ vi.mock('@/utils/ssml', () => ({
     plainText: ssml ? 'hello' : '',
     marks: ssml ? [{ offset: 0, name: '0', text: 'hello', language: 'en' }] : [],
   })),
+  truncateSSMLAfterMark: vi.fn((ssml: string, mark: string) => `first(${mark}):${ssml}`),
 }));
 
 vi.mock('@/utils/node', () => ({
@@ -55,6 +72,7 @@ vi.mock('@/utils/node', () => ({
 
 vi.mock('@/utils/lang', () => ({
   isValidLang: vi.fn(() => true),
+  isCJKLang: vi.fn(() => false),
 }));
 
 vi.mock('foliate-js/tts.js', () => ({
@@ -66,7 +84,9 @@ vi.mock('foliate-js/tts.js', () => ({
       prev: vi.fn().mockReturnValue('<speak>prev</speak>'),
       nextMark: vi.fn().mockReturnValue('<speak>nextMark</speak>'),
       prevMark: vi.fn().mockReturnValue('<speak>prevMark</speak>'),
+      from: vi.fn().mockReturnValue('<speak>A</speak>'),
       setMark: vi.fn().mockReturnValue(new Range()),
+      getLastRange: vi.fn().mockReturnValue(new Range()),
       doc: null,
     });
   }),
@@ -97,6 +117,12 @@ function createMockTTSClient(name: string): TTSClient {
     getAllVoices: vi.fn().mockResolvedValue([]),
     getVoices: vi.fn().mockResolvedValue([]),
     getGranularities: vi.fn().mockReturnValue(['word', 'sentence'] as TTSGranularity[]),
+    getCapabilities: vi.fn().mockImplementation(() => ({
+      wordBoundaries: name === 'edge',
+      mediaClock: name === 'edge',
+      gapControl: name === 'edge',
+      liveRateChange: false,
+    })),
     getVoiceId: vi.fn().mockReturnValue('voice-1'),
     getSpeakingLang: vi.fn().mockReturnValue('en'),
   };
@@ -141,9 +167,10 @@ function createMockView(): FoliateView {
 
 // --- Helper: create mock AppService ---
 
-function createMockAppService(isAndroid = false): AppService {
+function createMockAppService(isAndroid = false, isIOS = false): AppService {
   return {
     isAndroidApp: isAndroid,
+    isIOSApp: isIOS,
   } as unknown as AppService;
 }
 
@@ -153,6 +180,15 @@ describe('TTSController', () => {
   let controller: TTSController;
   let mockView: FoliateView;
   let mockAppService: AppService;
+
+  // Controllers that kick off a detached `#speak` loop (the native-TTS tests
+  // start speak() un-awaited and only assert on an early side-effect). They
+  // must be stopped after the test, or the loop keeps running past teardown
+  // and its deferred `set state` dispatch — queueMicrotask(() =>
+  // dispatchEvent(new CustomEvent(...))) — fires once the jsdom env is gone,
+  // where `CustomEvent` is Node's global rather than jsdom's and jsdom's
+  // EventTarget rejects it as "parameter 1 is not of type 'Event'" (#5149).
+  const speakingControllers: TTSController[] = [];
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -164,12 +200,29 @@ describe('TTSController', () => {
   });
 
   afterEach(async () => {
+    // Before anything that awaits a real timer: a fake-timer test that fails
+    // mid-way never reaches its own useRealTimers, and would hang every test
+    // after it on this shared clock.
+    vi.useRealTimers();
     // Ensure controller is stopped after each test
     try {
       await controller.stop();
     } catch {
       // ignore
     }
+    // Abort any detached speak loop started on a locally-created controller so
+    // no trailing state change escapes into env teardown (see speakingControllers).
+    for (const c of speakingControllers) {
+      try {
+        await c.stop();
+      } catch {
+        // ignore
+      }
+    }
+    speakingControllers.length = 0;
+    // Flush the deferred set-state dispatch microtasks while the jsdom realm
+    // is still alive.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     vi.restoreAllMocks();
   });
 
@@ -214,7 +267,13 @@ describe('TTSController', () => {
       expect(c.ttsNativeClient).not.toBeNull();
     });
 
-    test('does not create native client when not Android', () => {
+    test('creates native client when isIOSApp', () => {
+      const iosService = createMockAppService(false, true);
+      const c = new TTSController(iosService, mockView);
+      expect(c.ttsNativeClient).not.toBeNull();
+    });
+
+    test('does not create native client when neither Android nor iOS', () => {
       expect(controller.ttsNativeClient).toBeNull();
     });
 
@@ -237,6 +296,21 @@ describe('TTSController', () => {
 
       expect(controller.ttsEdgeClient.init).toHaveBeenCalled();
       expect(controller.ttsWebClient.init).toHaveBeenCalled();
+    });
+
+    test('initialises the engines concurrently, not one after another', async () => {
+      // Each init can take seconds (Edge synthesizes a probe sentence, system
+      // TTS waits for its voice list); in sequence they add up before play.
+      let edgeDone!: (ok: boolean) => void;
+      vi.mocked(controller.ttsEdgeClient.init).mockImplementation(
+        () => new Promise<boolean>((resolve) => (edgeDone = resolve)),
+      );
+      const ready = controller.init();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(controller.ttsWebClient.init).toHaveBeenCalled();
+      edgeDone(true);
+      await ready;
+      expect(controller.ttsClient.name).toBe('edge');
     });
 
     test('sets ttsClient to first available client (edge)', async () => {
@@ -284,6 +358,25 @@ describe('TTSController', () => {
     test('delegates to ttsClient.setRate', async () => {
       await controller.setRate(2.0);
       expect(controller.ttsClient.setRate).toHaveBeenCalledWith(2.0);
+    });
+  });
+
+  describe('supportsGapControl', () => {
+    test('returns true when ttsClient is the edge client', () => {
+      controller.ttsClient = controller.ttsEdgeClient;
+      expect(controller.supportsGapControl()).toBe(true);
+    });
+
+    test('returns false when ttsClient is not the edge client', () => {
+      controller.ttsClient = controller.ttsWebClient;
+      expect(controller.supportsGapControl()).toBe(false);
+    });
+  });
+
+  describe('setSentenceGap', () => {
+    test('delegates to ttsEdgeClient.setSentenceGap with the given value', () => {
+      controller.setSentenceGap(0.5);
+      expect(controller.ttsEdgeClient.setSentenceGap).toHaveBeenCalledWith(0.5);
     });
   });
 
@@ -461,12 +554,6 @@ describe('TTSController', () => {
       expect(controller.ttsClient.resume).toHaveBeenCalled();
     });
 
-    test('stop sets state to stopped', async () => {
-      controller.state = 'playing';
-      await controller.stop();
-      expect(controller.state).toBe('stopped');
-    });
-
     test('error sets state to stopped', () => {
       controller.state = 'playing';
       controller.error(new Error('test'));
@@ -550,6 +637,1109 @@ describe('TTSController', () => {
       const mark = { offset: 0, name: '-1', text: 'hello', language: 'en' };
       controller.dispatchSpeakMark(mark);
       expect(highlightListener).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('word highlighting (prepareSpeakWords / dispatchSpeakWord)', () => {
+    const getOverlayer = () =>
+      (
+        mockView.renderer.getContents() as unknown as Array<{
+          overlayer: { add: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn> };
+        }>
+      )[0]!.overlayer;
+
+    const makeSentenceRange = () => {
+      document.body.innerHTML = '<p>Hello brave world</p>';
+      const textNode = document.body.firstElementChild!.firstChild as Text;
+      const range = document.createRange();
+      range.setStart(textNode, 0);
+      range.setEnd(textNode, textNode.length);
+      return range;
+    };
+
+    const armWithSentence = async (range: Range, markName = '0') => {
+      await controller.initViewTTS(0);
+      // A client that reports word boundaries, as word mode needs.
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: false,
+        liveRateChange: false,
+      }) as unknown as typeof controller.ttsClient.getCapabilities;
+      mockView.tts = {
+        setMark: vi.fn().mockReturnValue(range),
+        getLastRange: vi.fn().mockImplementation(() => range.cloneRange()),
+      } as unknown as FoliateView['tts'];
+      controller.dispatchSpeakMark({
+        offset: 0,
+        name: markName,
+        text: 'Hello brave world',
+        language: 'en',
+      });
+    };
+
+    const addedKeys = () => getOverlayer().add.mock.calls.map((call) => call[0]);
+
+    test('word mode tints the sentence at its mark; the first word waits for its audio', async () => {
+      await armWithSentence(makeSentenceRange());
+      // The tint shows where reading is even while the audio is pending.
+      expect(addedKeys()).toEqual(['tts-sentence']);
+      getOverlayer().add.mockClear();
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      expect(addedKeys()).toEqual([]);
+
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.dispatchSpeakWord(0);
+      expect(addedKeys()).toEqual(['tts-highlight']);
+      expect(String(vi.mocked(mockView.getCFI).mock.calls[0]![1])).toBe('Hello');
+    });
+
+    test('the next sentence replaces the tint and clears the last word', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(2);
+      getOverlayer().remove.mockClear();
+      getOverlayer().add.mockClear();
+      await armWithSentence(makeSentenceRange(), '1');
+      expect(getOverlayer().remove).toHaveBeenCalledWith('tts-highlight');
+      expect(getOverlayer().remove).toHaveBeenCalledWith('tts-sentence');
+      expect(addedKeys()).toEqual(['tts-sentence']);
+    });
+
+    test('prepareSpeakWords with no words falls back to the full-sentence highlight', async () => {
+      await armWithSentence(makeSentenceRange());
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.prepareSpeakWords([]);
+
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(String(getCFICalls[0]![1])).toBe('Hello brave world');
+      // The sentence tint from the mark, then the full-sentence highlight.
+      expect(addedKeys()).toEqual(['tts-sentence', 'tts-highlight']);
+    });
+
+    test('dispatchSpeakWord highlights the word sub-range of the current sentence', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+
+      vi.mocked(mockView.getCFI).mockClear();
+      getOverlayer().add.mockClear();
+      controller.dispatchSpeakWord(1);
+
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(String(getCFICalls[0]![1])).toBe('brave');
+      expect(getOverlayer().add).toHaveBeenCalledTimes(1);
+      expect(getOverlayer().add.mock.calls[0]![0]).toBe('tts-highlight');
+    });
+
+    test('word indexes can be dispatched out of order after a seek back', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+
+      controller.dispatchSpeakWord(2);
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.dispatchSpeakWord(0);
+
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(String(getCFICalls[0]![1])).toBe('Hello');
+    });
+
+    test('does not highlight words for one-time marks (name -1)', async () => {
+      await armWithSentence(makeSentenceRange(), '-1');
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(0);
+
+      expect(getOverlayer().add).not.toHaveBeenCalled();
+    });
+
+    test('a new speak mark clears previously prepared words', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(0);
+      expect(addedKeys()).toEqual(['tts-sentence', 'tts-highlight']);
+
+      controller.dispatchSpeakMark({
+        offset: 0,
+        name: '1',
+        text: 'Hello brave world',
+        language: 'en',
+      });
+      getOverlayer().add.mockClear();
+      controller.dispatchSpeakWord(0);
+      expect(getOverlayer().add).not.toHaveBeenCalled();
+    });
+
+    test('unmatched first word does not highlight but later words still align', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['BOGUS', 'brave']);
+
+      // First word unmatched: nothing to draw for it.
+      getOverlayer().add.mockClear();
+      controller.dispatchSpeakWord(0);
+      expect(getOverlayer().add).not.toHaveBeenCalled();
+
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.dispatchSpeakWord(1);
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(String(getCFICalls[0]![1])).toBe('brave');
+    });
+
+    test('reapplyCurrentHighlight re-draws the current word during word mode', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(1);
+
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.reapplyCurrentHighlight();
+
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(getCFICalls.map((call) => String(call[1]))).toContain('brave');
+    });
+
+    test('reapplyCurrentHighlight re-draws the whole sentence when not in word mode', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords([]);
+
+      vi.mocked(mockView.getCFI).mockClear();
+      controller.reapplyCurrentHighlight();
+
+      const getCFICalls = vi.mocked(mockView.getCFI).mock.calls;
+      expect(getCFICalls.length).toBeGreaterThanOrEqual(1);
+      expect(String(getCFICalls[0]![1])).toBe('Hello brave world');
+    });
+
+    test('dispatchSpeakWord emits tts-highlight-word for word-level page following', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+
+      const listener = vi.fn();
+      controller.addEventListener('tts-highlight-word', listener);
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-word');
+      controller.dispatchSpeakWord(1);
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const ev = listener.mock.calls[0]![0] as CustomEvent;
+      expect(ev.detail).toEqual({ cfi: 'cfi-word' });
+    });
+
+    test('dispatchSpeakWord does not emit a word event when the word is unmatched', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['BOGUS', 'brave']);
+
+      const listener = vi.fn();
+      controller.addEventListener('tts-highlight-word', listener);
+      controller.dispatchSpeakWord(0); // unmatched → no range, no event
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    test('getCurrentHighlightCfi returns the word cfi in word mode, null otherwise', async () => {
+      await armWithSentence(makeSentenceRange());
+      // Not in word mode until prepareSpeakWords with words.
+      expect(controller.getCurrentHighlightCfi()).toBeNull();
+
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-word');
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(1);
+      expect(controller.getCurrentHighlightCfi()).toBe('cfi-word');
+
+      // Empty (sentence fallback) leaves word mode → null so the caller uses
+      // the sentence-level ttsLocation.
+      controller.prepareSpeakWords([]);
+      expect(controller.getCurrentHighlightCfi()).toBeNull();
+    });
+
+    test('granularity "sentence" forces sentence highlighting (skips word-by-word)', async () => {
+      controller.setHighlightGranularity('sentence');
+      await armWithSentence(makeSentenceRange());
+      getOverlayer().add.mockClear();
+      // Even when the client reports word boundaries and calls prepareSpeakWords,
+      // the user's "sentence" choice keeps highlighting at the sentence level: the
+      // sentence highlight was already drawn at mark dispatch (not suppressed), so
+      // prepareSpeakWords is a no-op and word mode never engages.
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      expect(getOverlayer().add).not.toHaveBeenCalled();
+      expect(controller.getCurrentHighlightCfi()).toBeNull();
+    });
+
+    test('granularity "word" (default) still highlights word-by-word', async () => {
+      controller.setHighlightGranularity('word');
+      await armWithSentence(makeSentenceRange());
+      getOverlayer().add.mockClear();
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(0);
+      expect(addedKeys()).toEqual(['tts-highlight']);
+      expect(controller.getCurrentHighlightCfi()).not.toBeNull();
+    });
+  });
+
+  describe('tts-position event', () => {
+    const makeSentenceRange = () => {
+      document.body.innerHTML = '<p>Hello brave world</p>';
+      const textNode = document.body.firstElementChild!.firstChild as Text;
+      const range = document.createRange();
+      range.setStart(textNode, 0);
+      range.setEnd(textNode, textNode.length);
+      return range;
+    };
+
+    const armWithSentence = async (range: Range, markName = '0') => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        setMark: vi.fn().mockReturnValue(range),
+        getLastRange: vi.fn().mockImplementation(() => range.cloneRange()),
+      } as unknown as FoliateView['tts'];
+      controller.dispatchSpeakMark({
+        offset: 0,
+        name: markName,
+        text: 'Hello brave world',
+        language: 'en',
+      });
+    };
+
+    test('dispatchSpeakMark emits tts-position with kind sentence, cfi, sectionIndex and sequence', async () => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        setMark: vi.fn().mockReturnValue(new Range()),
+        getLastRange: vi.fn(),
+      } as unknown as FoliateView['tts'];
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-sentence');
+
+      const listener = vi.fn();
+      controller.addEventListener('tts-position', listener);
+
+      controller.dispatchSpeakMark({ offset: 0, name: '0', text: 'hello', language: 'en' });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const ev = listener.mock.calls[0]![0] as CustomEvent;
+      expect(ev.detail.kind).toBe('sentence');
+      expect(ev.detail.cfi).toBe('cfi-sentence');
+      // initViewTTS(0) set the TTS section index to 0.
+      expect(ev.detail.sectionIndex).toBe(0);
+      expect(typeof ev.detail.sequence).toBe('number');
+    });
+
+    test('dispatchSpeakWord emits tts-position with kind word', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+
+      const listener = vi.fn();
+      controller.addEventListener('tts-position', listener);
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-word');
+      controller.dispatchSpeakWord(1);
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const ev = listener.mock.calls[0]![0] as CustomEvent;
+      expect(ev.detail.kind).toBe('word');
+      expect(ev.detail.cfi).toBe('cfi-word');
+      expect(ev.detail.sectionIndex).toBe(0);
+      expect(typeof ev.detail.sequence).toBe('number');
+    });
+
+    test('sequence strictly increases across successive emits', async () => {
+      await armWithSentence(makeSentenceRange());
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-x');
+
+      const sequences: number[] = [];
+      controller.addEventListener('tts-position', (e) => {
+        sequences.push((e as CustomEvent).detail.sequence);
+      });
+
+      // word emit
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(1);
+      // sentence emit
+      controller.dispatchSpeakMark({ offset: 0, name: '1', text: 'hello', language: 'en' });
+      // another word emit
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      controller.dispatchSpeakWord(2);
+
+      expect(sequences.length).toBeGreaterThanOrEqual(3);
+      for (let i = 1; i < sequences.length; i++) {
+        expect(sequences[i]!).toBeGreaterThan(sequences[i - 1]!);
+      }
+    });
+
+    test('a fresh controller continues the sequence instead of restarting', async () => {
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-x');
+
+      // Emit one sentence position from a controller and return its sequence.
+      const emitOnce = async (c: TTSController) => {
+        await c.initViewTTS(0);
+        mockView.tts = {
+          setMark: vi.fn().mockReturnValue(makeSentenceRange()),
+          getLastRange: vi.fn().mockImplementation(() => makeSentenceRange()),
+        } as unknown as FoliateView['tts'];
+        let seq = -1;
+        const handler = (e: Event) => {
+          seq = (e as CustomEvent).detail.sequence;
+        };
+        c.addEventListener('tts-position', handler);
+        c.dispatchSpeakMark({ offset: 0, name: '0', text: 'hello', language: 'en' });
+        c.removeEventListener('tts-position', handler);
+        return seq;
+      };
+
+      const firstSeq = await emitOnce(controller);
+      // A new `tts-speak` builds a fresh TTSController (see useTTSControl). A
+      // per-instance counter would restart, so the new session's first sequence
+      // would be <= the previous session's and a consumer holding
+      // `lastSequenceSeen` would drop it. A module-level counter keeps the
+      // sequence strictly increasing across sessions.
+      const controller2 = new TTSController(mockAppService, mockView, false);
+      const secondSeq = await emitOnce(controller2);
+
+      expect(secondSeq).toBeGreaterThan(firstSeq);
+    });
+  });
+
+  describe('redispatchPosition', () => {
+    const makeSentenceRange = () => {
+      document.body.innerHTML = '<p>Hello brave world</p>';
+      const textNode = document.body.firstElementChild!.firstChild as Text;
+      const range = document.createRange();
+      range.setStart(textNode, 0);
+      range.setEnd(textNode, textNode.length);
+      return range;
+    };
+
+    const armWithSentence = async (range: Range, markName = '0') => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        setMark: vi.fn().mockReturnValue(range),
+        getLastRange: vi.fn().mockImplementation(() => range.cloneRange()),
+      } as unknown as FoliateView['tts'];
+      controller.dispatchSpeakMark({
+        offset: 0,
+        name: markName,
+        text: 'Hello brave world',
+        language: 'en',
+      });
+    };
+
+    test('re-emits the current sentence position when not in word mode', async () => {
+      await armWithSentence(makeSentenceRange());
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-sentence');
+
+      const listener = vi.fn();
+      controller.addEventListener('tts-position', listener);
+      controller.redispatchPosition();
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const ev = listener.mock.calls[0]![0] as CustomEvent;
+      expect(ev.detail.kind).toBe('sentence');
+      expect(ev.detail.cfi).toBe('cfi-sentence');
+      expect(ev.detail.sectionIndex).toBe(0);
+      expect(typeof ev.detail.sequence).toBe('number');
+    });
+
+    test('re-emits the current word position when in word mode', async () => {
+      await armWithSentence(makeSentenceRange());
+      controller.prepareSpeakWords(['Hello', 'brave', 'world']);
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-word');
+      controller.dispatchSpeakWord(1);
+
+      const listener = vi.fn();
+      controller.addEventListener('tts-position', listener);
+      controller.redispatchPosition();
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const ev = listener.mock.calls[0]![0] as CustomEvent;
+      expect(ev.detail.kind).toBe('word');
+      expect(ev.detail.cfi).toBe('cfi-word');
+    });
+
+    test('uses a fresh, strictly increasing sequence on each call', async () => {
+      await armWithSentence(makeSentenceRange());
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-x');
+
+      const sequences: number[] = [];
+      controller.addEventListener('tts-position', (e) => {
+        sequences.push((e as CustomEvent).detail.sequence);
+      });
+      controller.redispatchPosition();
+      controller.redispatchPosition();
+
+      expect(sequences.length).toBe(2);
+      expect(sequences[1]!).toBeGreaterThan(sequences[0]!);
+    });
+
+    test('is a no-op when TTS is inactive (no section)', () => {
+      const listener = vi.fn();
+      controller.addEventListener('tts-position', listener);
+      controller.redispatchPosition();
+      expect(listener).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getSpokenSentence', () => {
+    test('returns the trimmed text and cfi of the current sentence', async () => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        getLastRange: vi.fn().mockReturnValue({ toString: () => '  A spoken sentence.  ' }),
+      } as unknown as FoliateView['tts'];
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-current');
+
+      expect(controller.getSpokenSentence()).toEqual({
+        cfi: 'cfi-current',
+        text: 'A spoken sentence.',
+      });
+    });
+
+    test('returns null when TTS is inactive (no view.tts)', () => {
+      // No initViewTTS: view.tts is null and the section index is -1.
+      expect(controller.getSpokenSentence()).toBeNull();
+    });
+
+    test('returns null when there is no current range', async () => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        getLastRange: vi.fn().mockReturnValue(undefined),
+      } as unknown as FoliateView['tts'];
+
+      expect(controller.getSpokenSentence()).toBeNull();
+    });
+
+    test('returns null when getCFI throws', async () => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        getLastRange: vi.fn().mockReturnValue({ toString: () => 'x' }),
+      } as unknown as FoliateView['tts'];
+      vi.mocked(mockView.getCFI).mockImplementation(() => {
+        throw new Error('cfi failure');
+      });
+
+      expect(controller.getSpokenSentence()).toBeNull();
+    });
+
+    test('returns null when the sentence text is only whitespace', async () => {
+      await controller.initViewTTS(0);
+      mockView.tts = {
+        getLastRange: vi.fn().mockReturnValue({ toString: () => '   ' }),
+      } as unknown as FoliateView['tts'];
+      vi.mocked(mockView.getCFI).mockReturnValue('cfi-current');
+
+      expect(controller.getSpokenSentence()).toBeNull();
+    });
+  });
+
+  // "End of Chapter" sleep-timer mode. The distinction under test is auto
+  // continuation vs. a deliberate user skip: both land on the same
+  // cross-section path in forward(), but only the former may stop there.
+  describe('mark navigation before playback', () => {
+    test.each([
+      ['forward', 'Third sentence.'],
+      ['backward', 'First sentence.'],
+    ] as const)('%s preserves the current paragraph before stepping', async (direction, expected) => {
+      await controller.initViewTTS(0);
+      const { TTS } =
+        await vi.importActual<typeof import('foliate-js/tts.js')>('foliate-js/tts.js');
+      const { textWalker } = await vi.importActual<typeof import('foliate-js/text-walker.js')>(
+        'foliate-js/text-walker.js',
+      );
+      const doc = document.implementation.createHTMLDocument();
+      doc.body.innerHTML = '<p>First sentence.</p><p>Second sentence.</p><p>Third sentence.</p>';
+      const tts = new TTS(doc, textWalker, () => NodeFilter.FILTER_ACCEPT, vi.fn(), 'sentence');
+      tts.start();
+      const ssml = tts.next()!;
+      const mark = new DOMParser().parseFromString(ssml, 'application/xml').querySelector('mark')!;
+      tts.setMark(mark.getAttribute('name')!);
+      mockView.tts = tts;
+
+      await controller[direction](true);
+
+      expect(tts.getLastRange()?.toString()).toBe(expected);
+    });
+
+    test.each([
+      'forward',
+      'backward',
+    ] as const)('%s initializes a fresh text iterator', async (direction) => {
+      await controller.initViewTTS(0);
+      const { TTS } =
+        await vi.importActual<typeof import('foliate-js/tts.js')>('foliate-js/tts.js');
+      const { textWalker } = await vi.importActual<typeof import('foliate-js/text-walker.js')>(
+        'foliate-js/text-walker.js',
+      );
+      const doc = document.implementation.createHTMLDocument();
+      doc.body.innerHTML = '<p>First sentence.</p><p>Second sentence.</p>';
+      mockView.tts = new TTS(doc, textWalker, () => NodeFilter.FILTER_ACCEPT, vi.fn(), 'sentence');
+
+      await expect(controller[direction](true)).resolves.toBeUndefined();
+    });
+
+    test.each([
+      'forward',
+      'backward',
+    ] as const)('%s handles a section without readable text', async (direction) => {
+      await controller.initViewTTS(0);
+      const { TTS } =
+        await vi.importActual<typeof import('foliate-js/tts.js')>('foliate-js/tts.js');
+      const { textWalker } = await vi.importActual<typeof import('foliate-js/text-walker.js')>(
+        'foliate-js/text-walker.js',
+      );
+      const doc = document.implementation.createHTMLDocument();
+      mockView.tts = new TTS(doc, textWalker, () => NodeFilter.FILTER_ACCEPT, vi.fn(), 'sentence');
+
+      await expect(controller[direction](true)).resolves.toBeUndefined();
+    });
+  });
+
+  describe('stopAtChapterEnd', () => {
+    // Park on the last paragraph of the section: both cursors run dry, so
+    // forward() falls through to the cross-section branch.
+    const arriveAtSectionEnd = async (fromSection = 0) => {
+      await controller.init();
+      await controller.initViewTTS(fromSection);
+      const tts = mockView.tts as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      tts['next'] = vi.fn().mockReturnValue(undefined);
+      tts['nextMark'] = vi.fn().mockReturnValue(undefined);
+      controller.state = 'playing';
+      speakingControllers.push(controller);
+    };
+
+    const sectionOpened = (index: number) => {
+      const { sections } = mockView.book as unknown as {
+        sections: { createDocument: ReturnType<typeof vi.fn> }[];
+      };
+      return sections[index]!.createDocument.mock.calls.length > 0;
+    };
+
+    // Crossing a boundary hands off to a detached #speak(), which only settles
+    // on 'playing' after its own stop() cycle — so the resumed cases must let
+    // the microtask queue drain before asserting.
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    test('auto-advance stops at the boundary, parked on the next section', async () => {
+      await arriveAtSectionEnd();
+      const sectionChanges: number[] = [];
+      controller.addEventListener('tts-section-change', (event) => {
+        sectionChanges.push((event as CustomEvent<{ sectionIndex: number }>).detail.sectionIndex);
+      });
+      controller.stopAtChapterEnd = true;
+
+      await controller.forward(false, true);
+
+      expect(sectionOpened(1)).toBe(true);
+      expect(controller.getSectionIndex()).toBe(1);
+      expect(sectionChanges).toEqual([1]);
+      // 'forward-paused', not 'paused': the play/pause toggle routes plain
+      // 'paused' to the lightweight ttsClient.resume(), which would be a no-op
+      // here since nothing was ever spoken for the new section.
+      expect(controller.state).toBe('forward-paused');
+      expect(stopKeepAlive).toHaveBeenCalled();
+    });
+
+    test('paused cross-section navigation publishes the section Play will resume from', async () => {
+      await controller.init();
+      await controller.initViewTTS(0);
+      const sectionChanges: number[] = [];
+      controller.addEventListener('tts-section-change', (event) => {
+        sectionChanges.push((event as CustomEvent<{ sectionIndex: number }>).detail.sectionIndex);
+      });
+
+      const firstTts = mockView.tts as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      firstTts['next'] = vi.fn().mockReturnValue(undefined);
+      controller.state = 'paused';
+      await controller.forward();
+
+      expect(controller.state).toBe('forward-paused');
+      expect(controller.getSectionIndex()).toBe(1);
+
+      const secondTts = mockView.tts as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      secondTts['prev'] = vi.fn().mockReturnValue(undefined);
+      await controller.backward();
+
+      expect(controller.state).toBe('backward-paused');
+      expect(controller.getSectionIndex()).toBe(0);
+      expect(sectionChanges).toEqual([1, 0]);
+    });
+
+    test('auto-advance crosses the boundary normally when the mode is off', async () => {
+      await arriveAtSectionEnd();
+
+      await controller.forward(false, true);
+      await flush();
+
+      expect(sectionOpened(1)).toBe(true);
+      expect(controller.state).toBe('playing');
+    });
+
+    test('a user skip still crosses the boundary while the mode is armed', async () => {
+      await arriveAtSectionEnd();
+      controller.stopAtChapterEnd = true;
+
+      // The player sheet / mini player next button, and the lock-screen and
+      // CarPlay 'nexttrack' handler.
+      await controller.forward(false);
+      await flush();
+
+      expect(sectionOpened(1)).toBe(true);
+      expect(controller.state).toBe('playing');
+    });
+
+    test('a user next-sentence skip still crosses the boundary', async () => {
+      await arriveAtSectionEnd();
+      controller.stopAtChapterEnd = true;
+
+      // The next-sentence button, and the media session's 'seekforward'.
+      await controller.forward(true);
+      await flush();
+
+      expect(controller.state).toBe('playing');
+    });
+
+    test('backward is never gated by the mode', async () => {
+      await controller.init();
+      await controller.initViewTTS(1);
+      const tts = mockView.tts as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      tts['prev'] = vi.fn().mockReturnValue(undefined);
+      controller.stopAtChapterEnd = true;
+      controller.state = 'playing';
+      speakingControllers.push(controller);
+
+      await controller.backward();
+      await flush();
+
+      // Reaching section 0 resumes rather than terminating (which is what a
+      // failed #initTTSForPrevSection would do).
+      expect(controller.terminated).toBe(false);
+      expect(controller.state).toBe('playing');
+    });
+
+    test('the last chapter still terminates instead of parking', async () => {
+      const ended = vi.fn();
+      await arriveAtSectionEnd(2); // final section of the mock book
+      controller.addEventListener('tts-session-ended', ended);
+      controller.stopAtChapterEnd = true;
+
+      await controller.forward(false, true);
+
+      expect(ended).toHaveBeenCalledTimes(1);
+      expect(controller.terminated).toBe(true);
+      expect(controller.state).toBe('stopped');
+    });
+
+    test('the speak loop advances with the auto flag set', async () => {
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0);
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+      speakingControllers.push(controller);
+
+      await controller.speak('<speak>hello</speak>');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(forwardSpy).toHaveBeenCalledWith(false, true);
+    });
+
+    test('next paragraphs are preloaded once this paragraph is audible, not before', async () => {
+      // Stepping the live cursor through upcoming paragraphs is synchronous
+      // DOM work: done before this paragraph's audio is scheduled, it lands in
+      // the pause between paragraphs.
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0);
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+      const preloadSpy = vi.spyOn(controller, 'preloadNextSSML').mockResolvedValue();
+      speakingControllers.push(controller);
+      let audible!: () => void;
+      const gate = new Promise<void>((resolve) => (audible = resolve));
+      vi.mocked(controller.ttsClient.speak).mockImplementation(
+        (_ssml: string, _signal: AbortSignal, preload?: boolean) =>
+          (async function* () {
+            if (preload) return;
+            await gate;
+            yield { code: 'boundary', mark: '0' } as TTSMessageEvent;
+            yield { code: 'end' } as TTSMessageEvent;
+          })(),
+      );
+
+      await controller.speak('<speak>hello</speak>');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(preloadSpy).not.toHaveBeenCalled();
+
+      audible();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(preloadSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('next paragraphs are preloaded anyway if this paragraph is slow to become audible', async () => {
+      // Uncached audio waits on the network: the next paragraphs must not.
+      vi.useFakeTimers();
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0);
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+      const preloadSpy = vi.spyOn(controller, 'preloadNextSSML').mockResolvedValue();
+      speakingControllers.push(controller);
+      vi.mocked(controller.ttsClient.speak).mockImplementation(
+        (_ssml: string, _signal: AbortSignal, preload?: boolean) =>
+          (async function* () {
+            if (preload) return;
+            await new Promise(() => {}); // never audible in this test
+          })(),
+      );
+
+      await controller.speak('<speak>hello</speak>');
+      await vi.advanceTimersByTimeAsync(400);
+      expect(preloadSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(preloadSpy).toHaveBeenCalledTimes(1);
+      vi.useRealTimers();
+    });
+
+    test('the paragraph gap is waited out as given, not re-scaled by the rate', async () => {
+      // The gap arrives already scaled for the rate (see scaleGapForRate);
+      // dividing it again here cut every paragraph pause in half at 2x (#5750).
+      vi.useFakeTimers();
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0.3);
+      await controller.setRate(2);
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+      speakingControllers.push(controller);
+
+      await controller.speak('<speak>hello</speak>');
+      await vi.advanceTimersByTimeAsync(290);
+      expect(forwardSpy).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(forwardSpy).toHaveBeenCalledWith(false, true);
+      vi.useRealTimers();
+    });
+
+    test('a client that schedules its own gaps is not made to wait twice', async () => {
+      // The buffered client puts the paragraph pause on the audio clock, where
+      // the next paragraph's synthesis and decode hide inside it. Sleeping here
+      // as well would add the gap twice and put the network back on top (#5750).
+      vi.useFakeTimers();
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0.3);
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: true,
+        liveRateChange: false,
+        scheduledGaps: true,
+      });
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+      speakingControllers.push(controller);
+
+      await controller.speak('<speak>hello</speak>');
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(forwardSpy).toHaveBeenCalledWith(false, true);
+      vi.useRealTimers();
+    });
+  });
+
+  // A section too big to lay out whole is rendered in chunks (foliate-js
+  // section-chunks.js); Read Aloud reads the rendered chunk.
+  describe('chunked sections', () => {
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const chunkDoc = (own: number) =>
+      new DOMParser().parseFromString(
+        `<html><body>${[0, 1, 2]
+          .map((k) => (k === own ? `<p>Chunk ${k}.</p>` : `<p data-foliate-chunk="${k}"></p>`))
+          .join('')}</body></html>`,
+        'text/html',
+      );
+
+    let docs: Document[];
+    let goTo: ReturnType<typeof vi.fn>;
+    let sectionChanges: number[];
+
+    // The view shows chunk `current` of section 0; going to an element of
+    // another chunk renders that chunk instead.
+    const showChunk = (current: number) => {
+      const renderer = mockView.renderer as unknown as Record<string, unknown>;
+      renderer['getContents'] = vi
+        .fn()
+        .mockReturnValue([
+          { doc: docs[current], index: 0, overlayer: { remove: vi.fn(), add: vi.fn() } },
+        ]);
+    };
+
+    const arriveAtChunkEnd = async (chunk: number) => {
+      docs = [0, 1, 2].map(chunkDoc);
+      showChunk(chunk);
+      goTo = vi.fn(async ({ anchor }: { anchor: (doc: Document) => Range }) => {
+        const owner = docs.findIndex(
+          (doc) => !(anchor(doc).startContainer as Element).hasAttribute('data-foliate-chunk'),
+        );
+        showChunk(owner);
+      });
+      (mockView.renderer as unknown as Record<string, unknown>)['goTo'] = goTo;
+      await controller.init();
+      await controller.initViewTTS(0);
+      sectionChanges = [];
+      controller.addEventListener('tts-section-change', (event) => {
+        sectionChanges.push((event as CustomEvent<{ sectionIndex: number }>).detail.sectionIndex);
+      });
+      const tts = mockView.tts as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      tts['next'] = vi.fn().mockReturnValue(undefined);
+      tts['nextMark'] = vi.fn().mockReturnValue(undefined);
+      controller.state = 'playing';
+      speakingControllers.push(controller);
+    };
+
+    const sectionOpened = (index: number) => {
+      const { sections } = mockView.book as unknown as {
+        sections: { createDocument: ReturnType<typeof vi.fn> }[];
+      };
+      return sections[index]!.createDocument.mock.calls.length > 0;
+    };
+
+    test('reads on into the next chunk of the section', async () => {
+      await arriveAtChunkEnd(0);
+
+      await controller.forward(false, true);
+      await flush();
+
+      expect(goTo).toHaveBeenCalledWith(expect.objectContaining({ index: 0 }));
+      const [{ anchor }] = goTo.mock.calls[0]!;
+      expect(anchor(docs[1]!).startContainer.textContent).toBe('Chunk 1.');
+      expect(controller.getSectionIndex()).toBe(0);
+      expect(sectionChanges).toEqual([]);
+      expect(sectionOpened(1)).toBe(false);
+      const { TTS } = await import('foliate-js/tts.js');
+      expect(vi.mocked(TTS).mock.calls.at(-1)![0]).toBe(docs[1]);
+      expect(controller.state).toBe('playing');
+    });
+
+    test('stop at end of chapter does not stop between chunks', async () => {
+      await arriveAtChunkEnd(1);
+      controller.stopAtChapterEnd = true;
+
+      await controller.forward(false, true);
+      await flush();
+
+      expect(controller.getSectionIndex()).toBe(0);
+      expect(controller.state).toBe('playing');
+    });
+
+    test('leaves the section after its last chunk', async () => {
+      await arriveAtChunkEnd(2);
+
+      await controller.forward(false, true);
+      await flush();
+
+      expect(goTo).not.toHaveBeenCalled();
+      expect(controller.getSectionIndex()).toBe(1);
+    });
+
+    test('reads back into the previous chunk', async () => {
+      await arriveAtChunkEnd(2);
+      const tts = mockView.tts as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      tts['prev'] = vi.fn().mockReturnValue(undefined);
+
+      await controller.backward();
+      await flush();
+
+      const [{ anchor }] = goTo.mock.calls[0]!;
+      expect(anchor(docs[1]!).startContainer.textContent).toBe('Chunk 1.');
+      expect(controller.getSectionIndex()).toBe(0);
+    });
+  });
+
+  describe('sentence stepping (#5233)', () => {
+    type Mocked = Record<string, ReturnType<typeof vi.fn>>;
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const CFI_A = 'epubcfi(/6/4!/4/2/1:0)';
+    const CFI_B = 'epubcfi(/6/4!/4/10/1:0)';
+    let tts: Mocked;
+    const cfis = new Map<Range, string>();
+
+    // Make `cfi` the sentence the reader is on.
+    const readingAt = (cfi: string) => {
+      const range = new Range();
+      cfis.set(range, cfi);
+      tts['getLastRange']!.mockReturnValue(range);
+      return range;
+    };
+
+    // Utterances actually spoken, not preloads.
+    const spoken = () =>
+      (controller.ttsClient.speak as ReturnType<typeof vi.fn>).mock.calls
+        .filter((call) => !call[2])
+        .map((call) => call[0] as string);
+
+    // The first utterance ends normally; later ones play nothing, so the speak
+    // loop stops instead of reading on through the mock book forever.
+    const endFirstUtteranceOnly = () => {
+      let count = 0;
+      controller.ttsClient.speak = vi.fn().mockImplementation(async function* (
+        _ssml: string,
+        _signal: AbortSignal,
+        preload?: boolean,
+      ): AsyncGenerator<TTSMessageEvent> {
+        if (preload || count++ > 0) return;
+        yield { code: 'end' };
+      });
+    };
+
+    beforeEach(async () => {
+      cfis.clear();
+      await controller.init();
+      await controller.initViewTTS(0);
+      controller.setParagraphGap(0);
+      tts = mockView.tts as unknown as Mocked;
+      (mockView.getCFI as ReturnType<typeof vi.fn>).mockImplementation(
+        (_index: number, range: Range) => cfis.get(range) ?? 'cfi-string',
+      );
+      speakingControllers.push(controller);
+    });
+
+    test('sentence-by-sentence speaks one sentence, then parks on the next', async () => {
+      endFirstUtteranceOnly();
+      controller.pauseAfterSentence = true;
+
+      await controller.speak('<speak>hello</speak>');
+      await flush();
+
+      expect(spoken()).toEqual(['first(0):<speak>hello</speak>']);
+      expect(tts['nextMark']).toHaveBeenCalledWith(true);
+      expect(controller.state).toBe('forward-paused');
+    });
+
+    test('switched on mid-paragraph, it stops at the next sentence boundary', async () => {
+      let readOn = false;
+      controller.ttsClient.speak = vi.fn().mockImplementation(async function* (
+        _ssml: string,
+        _signal: AbortSignal,
+        preload?: boolean,
+      ): AsyncGenerator<TTSMessageEvent> {
+        if (preload) return;
+        yield { code: 'boundary', mark: '0' };
+        controller.pauseAfterSentence = true;
+        yield { code: 'boundary', mark: '1' };
+        readOn = true;
+        yield { code: 'end' };
+      });
+
+      await controller.speak('<speak>hello</speak>');
+      await flush();
+
+      expect(spoken()).toEqual(['<speak>hello</speak>']);
+      expect(readOn).toBe(false);
+      // The boundary already moved the cursor onto the next sentence.
+      expect(tts['nextMark']).not.toHaveBeenCalled();
+      expect(controller.state).toBe('forward-paused');
+    });
+
+    test('A-B marks cycle A, A-B, off', () => {
+      readingAt(CFI_A);
+      expect(controller.toggleLoopPoint()).toBe('a');
+      readingAt(CFI_B);
+      expect(controller.toggleLoopPoint()).toBe('ab');
+      expect(controller.toggleLoopPoint()).toBe('off');
+    });
+
+    test('after B, playback goes back to A', async () => {
+      endFirstUtteranceOnly();
+      readingAt(CFI_A);
+      controller.toggleLoopPoint();
+      readingAt(CFI_B);
+      controller.toggleLoopPoint();
+
+      await controller.speak('<speak>B</speak>');
+      await flush();
+
+      expect(mockView.resolveCFI).toHaveBeenCalledWith(CFI_A);
+      expect(tts['from']).toHaveBeenCalled();
+      expect(spoken()).toEqual(['first(0):<speak>B</speak>', 'first(0):<speak>A</speak>']);
+    });
+
+    test('B marked before A swaps the two', async () => {
+      endFirstUtteranceOnly();
+      readingAt(CFI_B);
+      controller.toggleLoopPoint();
+      readingAt(CFI_A);
+      controller.toggleLoopPoint();
+      readingAt(CFI_B);
+
+      await controller.speak('<speak>B</speak>');
+      await flush();
+
+      expect(mockView.resolveCFI).toHaveBeenCalledWith(CFI_A);
+    });
+
+    test('a sentence before B reads on by sentence, not by paragraph', async () => {
+      endFirstUtteranceOnly();
+      readingAt(CFI_A);
+      controller.toggleLoopPoint();
+      readingAt(CFI_B);
+      controller.toggleLoopPoint();
+      readingAt(CFI_A);
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      await controller.speak('<speak>A</speak>');
+      await flush();
+
+      expect(forwardSpy).toHaveBeenCalledWith(true, true);
+    });
+
+    test('with sentence-by-sentence on, B parks on A', async () => {
+      endFirstUtteranceOnly();
+      readingAt(CFI_A);
+      controller.toggleLoopPoint();
+      readingAt(CFI_B);
+      controller.toggleLoopPoint();
+      controller.pauseAfterSentence = true;
+
+      await controller.speak('<speak>B</speak>');
+      await flush();
+
+      expect(mockView.resolveCFI).toHaveBeenCalledWith(CFI_A);
+      expect(spoken()).toHaveLength(1);
+      expect(controller.state).toBe('forward-paused');
+    });
+
+    test('the A-B range is tinted in the book until the loop is cleared', () => {
+      const content = (
+        mockView.renderer.getContents() as { doc: Document; overlayer: Mocked }[]
+      )[0]!;
+      content.doc = document;
+      const { overlayer } = content;
+      readingAt(CFI_A);
+      controller.toggleLoopPoint();
+      readingAt(CFI_B);
+      controller.toggleLoopPoint();
+
+      expect(overlayer['add']).toHaveBeenCalledWith(
+        'tts-loop',
+        expect.any(Range),
+        expect.any(Function),
+        expect.objectContaining({ color: 'gray' }),
+      );
+
+      overlayer['add']!.mockClear();
+      controller.toggleLoopPoint();
+      expect(overlayer['remove']).toHaveBeenCalledWith('tts-loop');
+      expect(overlayer['add']).not.toHaveBeenCalled();
+    });
+
+    test('a paired audiobook ignores sentence-by-sentence', async () => {
+      // Its marks are chapters, not sentences.
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: false,
+        mediaClock: true,
+        gapControl: false,
+        liveRateChange: true,
+        textHighlight: false,
+      });
+      controller.pauseAfterSentence = true;
+      const forwardSpy = vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      await controller.speak('<speak>hello</speak>');
+      await flush();
+
+      expect(spoken()).toEqual(['<speak>hello</speak>']);
+      expect(forwardSpy).toHaveBeenCalledWith(false, true);
     });
   });
 
@@ -673,6 +1863,196 @@ describe('TTSController', () => {
     });
   });
 
+  // Regression: Android System TTS (and iOS) read offline can report a terminal
+  // 'error' for an utterance it cannot synthesize — typically a specific
+  // unsupported character, hit characteristically on the first utterance after
+  // a chapter boundary even with a local/offline voice (online the engine often
+  // network-falls-back, which is why it only breaks offline). #speak only
+  // auto-advances on 'end', so without handling, one such error dead-ends
+  // playback ("stops at the end of the chapter") with the controls wedged in
+  // 'playing'. Re-speaking the same text would just fail again, so the
+  // controller skips the bad chunk and advances, bounding consecutive failures
+  // so a wholly-unusable engine still stops gracefully. See #4613, #4408.
+  describe('native TTS offline error recovery (#4613, #4408)', () => {
+    // An Android controller whose ACTIVE client is the native client, so the
+    // native-scoped recovery in #speak() is exercised.
+    const makeAndroidNativeController = async () => {
+      const androidService = createMockAppService(true);
+      const c = new TTSController(androidService, mockView);
+      await c.init();
+      c.ttsClient = c.ttsNativeClient!;
+      await c.initViewTTS(0);
+      speakingControllers.push(c);
+      return c;
+    };
+
+    // A native speak() mock that always reports a terminal 'error' for real
+    // (non-preload) utterances — i.e. a deterministically unspeakable chunk.
+    // Preload calls (used to warm caches) resolve immediately like the real
+    // client and never count as attempts.
+    const alwaysErrorSpeakMock = (state: { attempts: number }) =>
+      async function* (
+        _ssml: string,
+        _signal: AbortSignal,
+        preload?: boolean,
+      ): AsyncGenerator<TTSMessageEvent> {
+        if (preload) {
+          yield { code: 'end' };
+          return;
+        }
+        state.attempts += 1;
+        yield { code: 'error', message: 'TTS playback error:-8' };
+      };
+
+    test('skips a chunk the engine cannot speak and advances instead of dead-ending', async () => {
+      const c = await makeAndroidNativeController();
+      // Stub forward() so the skip is observable without recursing through the
+      // mock sections; the point is that an error triggers an advance at all
+      // (retrying the same unspeakable text would be futile).
+      const forwardSpy = vi.spyOn(c, 'forward').mockResolvedValue();
+
+      const state = { attempts: 0 };
+      vi.mocked(c.ttsNativeClient!.speak).mockImplementation(alwaysErrorSpeakMock(state));
+
+      c.speak('<speak>bad-char</speak>');
+
+      await vi.waitFor(
+        () => {
+          expect(forwardSpy).toHaveBeenCalled(); // advanced past the bad chunk
+        },
+        { timeout: 5000 },
+      );
+      // It advanced rather than freezing in a phantom 'playing' halt.
+      expect(c.state).toBe('playing');
+    });
+
+    test('stops gracefully after a run of consecutive unspeakable chunks', async () => {
+      const c = await makeAndroidNativeController();
+      // Real forward(): each error skips to the next (mock) chunk, which also
+      // errors, until the consecutive-error cap stops playback.
+
+      const state = { attempts: 0 };
+      vi.mocked(c.ttsNativeClient!.speak).mockImplementation(alwaysErrorSpeakMock(state));
+
+      c.speak('<speak>bad-char</speak>');
+
+      // It skips past each unspeakable chunk — attempts climb past 1 (not an
+      // immediate halt) — until the consecutive-error cap is reached. (We key
+      // off attempts, not state: the controller starts 'stopped' and forward()
+      // transiently re-enters 'stopped' between chunks.)
+      await vi.waitFor(() => expect(state.attempts).toBeGreaterThanOrEqual(5), { timeout: 8000 });
+
+      // Confirm the cap-stop settled (bounded, not racing to the end of the book).
+      await vi.waitFor(() => expect(c.state).not.toBe('playing'));
+      expect(c.state).not.toBe('playing');
+      expect(state.attempts).toBeLessThanOrEqual(10);
+    });
+  });
+
+  describe('native TTS background keep-alive (#4408)', () => {
+    // Android controller whose ACTIVE client is the direct-speak native engine
+    // (mediaClock === false): its audio renders in the OS, not the WebView.
+    const makeAndroidNativeController = async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.ttsClient = c.ttsNativeClient!;
+      await c.initViewTTS(0);
+      speakingControllers.push(c);
+      return c;
+    };
+
+    test('starts an inaudible keep-alive when native TTS begins playing on Android', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+
+      c.speak('<speak>hello</speak>');
+
+      await vi.waitFor(() => expect(startKeepAlive).toHaveBeenCalled(), { timeout: 5000 });
+      expect(c.state).toBe('playing');
+      expect(stopKeepAlive).not.toHaveBeenCalled();
+    });
+
+    test('does not keep the WebView awake for a buffered (Edge) engine — it emits its own audio', async () => {
+      const c = await makeAndroidNativeController();
+      c.ttsClient = c.ttsEdgeClient; // mediaClock === true
+      vi.spyOn(c, 'forward').mockResolvedValue();
+
+      c.speak('<speak>hello</speak>');
+
+      await vi.waitFor(() => expect(c.state).toBe('playing'), { timeout: 5000 });
+      expect(startKeepAlive).not.toHaveBeenCalled();
+    });
+
+    test('does not start the keep-alive off Android', async () => {
+      // Default controller: appService.isAndroidApp === false, web engine.
+      await controller.initViewTTS(0);
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>hello</speak>');
+
+      await vi.waitFor(() => expect(controller.state).toBe('playing'), { timeout: 5000 });
+      expect(startKeepAlive).not.toHaveBeenCalled();
+    });
+
+    // A paused session is still a live session: its lock-screen / Bluetooth
+    // transport handlers run in the WebView. Dropping the keep-alive at pause
+    // let Android freeze the hidden page, after which Play from a headset only
+    // flipped the notification (the media session lives in the app process)
+    // while the reader never woke up to speak. See #5561.
+    test('keeps the keep-alive running while paused so transport still reaches the page', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(startKeepAlive).toHaveBeenCalled(), { timeout: 5000 });
+      startKeepAlive.mockClear();
+      stopKeepAlive.mockClear();
+
+      await c.pause();
+
+      expect(startKeepAlive).toHaveBeenCalled();
+      expect(stopKeepAlive).not.toHaveBeenCalled();
+    });
+
+    // Buffered engines earn the exemption for free only while they are actually
+    // speaking; a paused WebAudio session emits nothing either, so it needs the
+    // tone exactly as the direct-speak engines do.
+    test('starts the keep-alive when a buffered (Edge) session is paused', async () => {
+      const c = await makeAndroidNativeController();
+      c.ttsClient = c.ttsEdgeClient; // mediaClock === true
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(c.state).toBe('playing'), { timeout: 5000 });
+      expect(startKeepAlive).not.toHaveBeenCalled();
+
+      await c.pause();
+
+      expect(startKeepAlive).toHaveBeenCalled();
+    });
+
+    test('does not keep the page awake while paused off Android', async () => {
+      await controller.initViewTTS(0);
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+      controller.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(controller.state).toBe('playing'), { timeout: 5000 });
+
+      await controller.pause();
+
+      expect(startKeepAlive).not.toHaveBeenCalled();
+      expect(stopKeepAlive).toHaveBeenCalled();
+    });
+
+    test('stops the keep-alive on shutdown', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(startKeepAlive).toHaveBeenCalled(), { timeout: 5000 });
+
+      await c.shutdown();
+
+      expect(stopKeepAlive).toHaveBeenCalled();
+    });
+  });
+
   describe('preloadSSML', () => {
     test('does nothing when ssml is undefined', async () => {
       await controller.preloadSSML(undefined, new AbortController().signal);
@@ -690,6 +2070,194 @@ describe('TTSController', () => {
   });
 
   describe('preloadNextSSML', () => {
+    test('keeps inline readings in synthesized speech when the option is disabled', async () => {
+      mockView.tts = {
+        next: vi
+          .fn()
+          .mockReturnValueOnce('<speak>彼は憂鬱（ゆううつ）な気分だった。</speak>')
+          .mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+
+      await controller.preloadNextSSML(1);
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledWith(
+        expect.stringContaining('（ゆううつ）'),
+        expect.anything(),
+        true,
+      );
+    });
+
+    test('removes inline readings from synthesized speech when the option is enabled', async () => {
+      mockView.tts = {
+        next: vi
+          .fn()
+          .mockReturnValueOnce('<speak>彼は憂鬱（ゆううつ）な気分だった。</speak>')
+          .mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      controller.setSkipInlineAnnotations(true);
+
+      await controller.preloadNextSSML(1);
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledWith(
+        expect.not.stringContaining('（ゆううつ）'),
+        expect.anything(),
+        true,
+      );
+    });
+
+    test('a windowed client gets about three minutes of upcoming paragraphs, not four', async () => {
+      // 450 Latin chars is about 30 s at the default estimate: six reach 180 s.
+      const paragraph = `<speak>${'a'.repeat(450)}</speak>`;
+      mockView.tts = {
+        next: vi.fn().mockReturnValue(paragraph),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: true,
+        liveRateChange: false,
+        windowedPrefetch: true,
+      }) as unknown as typeof controller.ttsClient.getCapabilities;
+
+      await controller.preloadNextSSML();
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(6);
+    });
+
+    test('a windowed client preloads into the next chapter when this one ends', async () => {
+      // The section ends after one more paragraph: the next section's opening
+      // (the throwaway foliate TTS starts at "hello") follows it.
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>last</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: true,
+        gapControl: true,
+        liveRateChange: false,
+        windowedPrefetch: true,
+      }) as unknown as typeof controller.ttsClient.getCapabilities;
+
+      await controller.preloadNextSSML();
+
+      const preloaded = vi.mocked(controller.ttsClient.speak).mock.calls.map(([ssml]) => ssml);
+      expect(preloaded[0]).toContain('last');
+      expect(preloaded[1]).toContain('hello');
+    });
+
+    test('other clients never preload past the chapter', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>last</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const sections = (
+        mockView.book as unknown as { sections: { createDocument: ReturnType<typeof vi.fn> }[] }
+      ).sections;
+      for (const s of sections) s.createDocument.mockClear();
+
+      await controller.preloadNextSSML();
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(1);
+      expect(sections.some((s) => s.createDocument.mock.calls.length > 0)).toBe(false);
+    });
+
+    test('other clients keep preloading four paragraphs', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValue(`<speak>${'a'.repeat(450)}</speak>`),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+
+      await controller.preloadNextSSML();
+
+      expect(controller.ttsClient.speak).toHaveBeenCalledTimes(4);
+    });
+
+    test('a voice change withdraws the preloads queued under the old voice', async () => {
+      // A windowed provider keeps queued preloads until their signal aborts:
+      // left alive, old-voice sentences keep reaching the worker after the
+      // switch, preempting the new voice's buffer and charging the quota.
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>one</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      await controller.preloadNextSSML(1);
+      const [, signal] = vi.mocked(controller.ttsClient.speak).mock.calls[0]!;
+      expect((signal as AbortSignal).aborted).toBe(false);
+
+      controller.ttsEdgeVoices = [{ id: 'edge-voice-1', name: 'Edge Voice', lang: 'en-US' }];
+      await controller.setVoice('edge-voice-1', 'en');
+
+      expect((signal as AbortSignal).aborted).toBe(true);
+    });
+
+    test('stopping withdraws queued preloads', async () => {
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>one</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      await controller.preloadNextSSML(1);
+      const [, signal] = vi.mocked(controller.ttsClient.speak).mock.calls[0]!;
+
+      await controller.stop();
+
+      expect((signal as AbortSignal).aborted).toBe(true);
+    });
+
+    test('a paragraph handover keeps queued preloads', async () => {
+      // Each paragraph's speak starts with stop(true): withdrawing there would
+      // drop the next paragraphs' audio at every paragraph boundary.
+      mockView.tts = {
+        next: vi.fn().mockReturnValueOnce('<speak>one</speak>').mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      await controller.preloadNextSSML(1);
+      const [, signal] = vi.mocked(controller.ttsClient.speak).mock.calls[0]!;
+
+      await controller.stop(true);
+
+      expect((signal as AbortSignal).aborted).toBe(false);
+    });
+
+    test('preloads the next paragraphs one after another, in reading order', async () => {
+      // A windowed provider queues preloads in the order they reach it: the
+      // paragraph read next must not land behind a later one.
+      mockView.tts = {
+        next: vi
+          .fn()
+          .mockReturnValueOnce('<speak>one</speak>')
+          .mockReturnValueOnce('<speak>two</speak>')
+          .mockReturnValue(undefined),
+        prev: vi.fn(),
+        doc: {},
+      } as unknown as FoliateView['tts'];
+      const order: string[] = [];
+      vi.mocked(controller.ttsClient.speak).mockImplementation((ssml: string) => {
+        const name = ssml.includes('one') ? 'one' : 'two';
+        order.push(`start ${name}`);
+        return (async function* () {
+          await new Promise((r) => setTimeout(r, name === 'one' ? 20 : 0));
+          order.push(`end ${name}`);
+        })();
+      });
+
+      await controller.preloadNextSSML(2);
+
+      expect(order).toEqual(['start one', 'end one', 'start two', 'end two']);
+    });
+
     test('calls tts.next() and tts.prev() synchronously without async gaps between them', async () => {
       // This test verifies the fix for a race condition where async gaps between
       // tts.next() calls in preloadNextSSML allowed #speak() to interleave and
@@ -739,32 +2307,81 @@ describe('TTSController', () => {
     });
   });
 
-  describe('initViewTTS', () => {
-    test('does nothing when already initialised (section index != -1)', async () => {
-      // Manually set section index via a reflect access workaround
-      // Since #ttsSectionIndex is private, we test indirectly through initViewTTS
-      // being called multiple times - first call will init, second should skip
-      mockView.tts = {
-        doc: {},
-        start: vi.fn(),
-      } as unknown as FoliateView['tts'];
-
-      // Call once to set the section index
-      await controller.initViewTTS(0);
-      // Now we can verify it doesn't re-init by checking the section was already created
-    });
-  });
-
   describe('extends EventTarget', () => {
-    test('is an instance of EventTarget', () => {
-      expect(controller instanceof EventTarget).toBe(true);
-    });
-
     test('can add and dispatch custom events', () => {
       const handler = vi.fn();
       controller.addEventListener('test-event', handler);
       controller.dispatchEvent(new CustomEvent('test-event', { detail: 'data' }));
       expect(handler).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('highlight hygiene', () => {
+    test('section change clears highlights from every live view, not just the primary', async () => {
+      // Two sections rendered at once (spread / preloaded adjacent view); the
+      // view has already navigated ahead so the primary is the NEW section.
+      const mockDoc = { querySelector: vi.fn().mockReturnValue(null) } as unknown as Document;
+      const overlayers = [
+        { remove: vi.fn(), add: vi.fn() },
+        { remove: vi.fn(), add: vi.fn() },
+      ];
+      const twoSectionView = {
+        renderer: {
+          primaryIndex: 1,
+          getContents: vi.fn().mockReturnValue([
+            { doc: mockDoc, index: 0, overlayer: overlayers[0] },
+            { doc: mockDoc, index: 1, overlayer: overlayers[1] },
+          ]),
+        },
+        book: {
+          sections: [
+            { createDocument: vi.fn().mockResolvedValue(mockDoc) },
+            { createDocument: vi.fn().mockResolvedValue(mockDoc) },
+          ],
+        },
+        language: { isCJK: false },
+        tts: null,
+        getCFI: vi.fn().mockReturnValue('cfi-string'),
+        resolveCFI: vi.fn().mockReturnValue({ anchor: vi.fn().mockReturnValue(new Range()) }),
+      } as unknown as FoliateView;
+      const c = new TTSController(mockAppService, twoSectionView, false);
+      // Every section entry (start, prev/next, auto-advance) funnels through
+      // #initTTSForSection; entering a section must scrub the TTS highlight
+      // from EVERY live view, or the outgoing section's last spoken word
+      // stays highlighted forever in the preloaded neighbor.
+      await c.initViewTTS(0);
+      expect(overlayers[0]!.remove).toHaveBeenCalledWith('tts-highlight');
+      expect(overlayers[1]!.remove).toHaveBeenCalledWith('tts-highlight');
+    });
+
+    test('reapplyCurrentHighlight never draws the sentence in word mode while playing', async () => {
+      await controller.initViewTTS(0);
+      controller.ttsClient.getCapabilities = vi.fn().mockReturnValue({
+        wordBoundaries: true,
+        mediaClock: false,
+        gapControl: false,
+        liveRateChange: false,
+      }) as unknown as typeof controller.ttsClient.getCapabilities;
+      controller.setHighlightGranularity('word');
+      controller.state = 'playing';
+      const content = (
+        mockView.renderer.getContents() as unknown as {
+          overlayer: { add: ReturnType<typeof vi.fn> };
+        }[]
+      )[0]!;
+      content.overlayer.add.mockClear();
+
+      // Between a sentence's mark and its first word boundary a page relocate
+      // triggers a re-apply; the whole sentence must not flash in.
+      controller.reapplyCurrentHighlight();
+      expect(content.overlayer.add.mock.calls.map((call) => call[0])).not.toContain(
+        'tts-highlight',
+      );
+
+      // Paused keeps the sentence re-draw (deliberate navigation UX).
+      controller.state = 'paused';
+      controller.reapplyCurrentHighlight();
+      expect(content.overlayer.add).toHaveBeenCalled();
     });
   });
 });

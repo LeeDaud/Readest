@@ -1,6 +1,8 @@
 # Testing
 
-Readest uses three test tiers, all powered by [Vitest](https://vitest.dev/).
+Readest uses several test tiers. Unit, browser, Tauri integration, and Android
+device tests use [Vitest](https://vitest.dev/); full Tauri UI E2E uses
+WebDriverIO with Mocha.
 
 ## Unit Tests (`pnpm test`)
 
@@ -28,7 +30,7 @@ pnpm test:browser
 - **Config:** `vitest.browser.config.mts`
 - **Pattern:** `src/**/*.browser.test.ts`
 - **Browser:** Chromium (headless, via `@vitest/browser-playwright`)
-- **Use for:** WASM modules (e.g. `@tursodatabase/database-wasm`), Web Worker integration, browser-specific storage APIs.
+- **Use for:** WASM modules (e.g. `@tursodatabase/database-wasm`), Web Worker integration such as bundled dictionary plugins, and browser-specific storage APIs.
 
 ## Tauri Integration Tests (`pnpm test:tauri`)
 
@@ -82,6 +84,57 @@ The `invoke()` helper accesses `window.top.__TAURI_INTERNALS__` (Vitest runs in 
 
 **Limitations:** Only custom invoke commands and plugin commands listed in the webdriver capability work. Standard Tauri JS APIs (e.g. `@tauri-apps/api`) that rely on `URL: local` may not work from the Vitest iframe.
 
+## Android Device E2E (`pnpm test:android`)
+
+Drives the **installed Readest app** on an adb-connected Android device or
+emulator: gestures are injected with `adb shell input`, and the app's state is
+probed through the WebView's **Chrome DevTools Protocol** (forwarded from the
+`webview_devtools_remote_<pid>` abstract socket). This is the only lane that
+exercises real Android touch selection, native handle behavior, and page-turn
+gestures (e.g. the issue #1553 hyphen-selection fixes).
+
+```bash
+# One-time: install a dev build on the device/emulator
+pnpm dev-android
+
+# Start an emulator if no device is attached (see `emulator -list-avds`)
+emulator -avd Pixel_9_Pro &
+
+# Run the lane (soft-skips when no adb/device/app is available)
+pnpm test:android
+
+# With several devices attached, pick one:
+ANDROID_SERIAL=emulator-5554 pnpm test:android
+```
+
+- **Config:** `vitest.android.config.mts` (node environment, serial execution, `retry: 1`)
+- **Pattern:** `src/**/*.android.test.ts`
+- **Helpers:** `src/__tests__/android/helpers/` — `adb.ts` (gestures), `cdp.ts` (DevTools client), `reader.ts` (app-level probes)
+- **Fixtures:** plain EPUBs from `src/__tests__/fixtures/data/` (e.g. `sample-alice.epub`), opened transiently via a `VIEW` intent so the device library is never modified
+- **Use for:** native text selection, touch gestures, selection handles, anything that only reproduces in the Android WebView compositor.
+
+### Conventions
+
+- **Probe, don't hardcode:** locate words/handles at runtime via CDP and derive
+  device pixels from `devicePixelRatio` — never bake in coordinates.
+- **Poll, don't sleep:** use `waitFor()` on an observable condition (selection
+  state, handle count, frame position); reserve fixed pauses for gesture
+  pacing (long-press hold, corner dwell).
+- **Discover, don't assume:** the harness finds a hyphenated on-screen
+  paragraph at runtime and derives every gesture target from live layout, so
+  any English fixture works regardless of fonts or screen size (hyphenation
+  is on by default in the app).
+- **Serial only:** one device, one app — the config disables parallelism.
+
+### CI
+
+`.github/workflows/android-e2e.yml` runs the lane on an x86_64 emulator
+(ubuntu runner with KVM): it builds a **debug** APK for `x86_64` (no signing
+secrets needed), boots a cached AVD via `reactivecircus/android-emulator-runner`,
+installs the APK, and runs `pnpm test:android`. It is intentionally not
+PR-blocking — it runs nightly, on `workflow_dispatch`, or when a PR gets the
+`e2e-android` label.
+
 ## E2E Tests (WDIO)
 
 Full end-to-end tests using WebDriverIO, for UI-level testing against the running Tauri app. Same two-step workflow as Tauri integration tests.
@@ -100,6 +153,81 @@ pnpm test:e2e
 - **Connects to:** port 4445 (embedded WebDriver server)
 - **Use for:** UI interaction tests, window management, navigation flows.
 
+## Debugging the Linux CEF Build (CDP)
+
+The Linux CEF runtime is Chromium, so the app window is a normal Chrome DevTools
+Protocol target — the same interface Chrome, Playwright and Puppeteer speak. This
+is the only way to inspect the running desktop app on Linux (WebKitWebDriver, used
+by `pnpm tauri:dev:test`, drives the wry runtime instead).
+
+```bash
+# Terminal 1: dev build with the CDP endpoint on 127.0.0.1:9222
+pnpm tauri:dev:cdp
+
+# Terminal 2
+pnpm cdp targets                                     # list debuggable targets
+pnpm cdp eval 'document.title'                       # run JS in the app window
+pnpm cdp eval 'window.__TAURI_INTERNALS__.invoke("plugin:app|version")'
+pnpm cdp click 'button[aria-label="Import Books"]'   # real pointer events
+pnpm cdp screenshot /tmp/library.png
+pnpm cdp logs 30                                     # tail the app console
+```
+
+`pnpm tauri:dev:cdp` is `pnpm tauri dev` with `READEST_CDP_PORT=9222`. Any CEF
+build honours that variable — a packaged `.deb`, the Flatpak, or `tauri build`
+output — so the same tooling works against release binaries:
+
+```bash
+READEST_CDP_PORT=9222 readest
+CDP_PORT=9222 pnpm cdp targets
+```
+
+`scripts/cdp.mjs` is dependency-free (node's global `fetch` and `WebSocket`); the
+endpoint listens on loopback only. For anything richer, connect a real client to
+the same port — `chrome://inspect` in a local Chrome, or
+`chromium.connectOverCDP('http://127.0.0.1:9222')`.
+
+### Limits
+
+- **The IPC bridge cannot be stubbed.** `window.__TAURI_INTERNALS__.invoke` is
+  defined non-writable and non-configurable, so assigning over it from `eval`
+  fails silently and the real command still runs. You can *call* it, not fake it.
+- **Native dialogs are outside the page.** The file picker is an XDG portal
+  window (`org.gnome.Nautilus` on GNOME), not a CEF surface, so CDP cannot see or
+  click it. Driving an import end-to-end needs X11 input (XTEST via python-xlib:
+  focus the chooser, `Ctrl+L`, type the path, `Return` to select, `Return` to
+  open) — or skip the picker and dispatch the app's own `import-book-files` event.
+- **Passing `--remote-debugging-port` on argv does not work.** The CEF runtime
+  keeps Chromium's remote debugging switched off unless the app asks for it, which
+  it does only for `READEST_CDP_PORT`; Chromium logs "DevTools remote debugging is
+  disallowed by the system admin" for a stray switch.
+
+## crengine XPointer Oracle (KOReader sync)
+
+KOReader stores positions as crengine XPointers; `src/utils/xcfi.ts` converts them to and from
+CFIs. The only trustworthy reference for what crengine emits is crengine itself, so
+`apps/readest.koplugin/scripts/xpointer-oracle.lua` runs headlessly inside a KOReader emulator
+build and dumps crengine's XPointer pair and text for every visible word of an EPUB:
+
+```bash
+cd <koreader-emulator>/koreader
+KO_HOME=/tmp/ko-oracle ./luajit /path/to/readest/apps/readest.koplugin/scripts/xpointer-oracle.lua \
+  /path/to/book.epub /path/to/book.crengine.json 40   # keep one word in 40
+```
+
+`src/__tests__/utils/xcfi.crengine-oracle.test.ts` then checks both sync directions for every
+sampled word: crengine's pointers must resolve to exactly that word, and a highlight on that word
+must convert back to exactly crengine's pointers. Committed fixtures live in
+`src/__tests__/fixtures/crengine/` (generated from EPUBs under `fixtures/data/`). To validate a
+local book that cannot be committed:
+
+```bash
+XPOINTER_ORACLE=/path/to/book.crengine.json pnpm test src/__tests__/utils/xcfi.crengine-oracle.test.ts
+```
+
+The JSON's `epub` field is an absolute path or a file next to the JSON. The emulator is a local
+build (`kodev` in a KOReader checkout); nothing in CI needs it.
+
 ## Test File Naming
 
 | Suffix              | Runner              | Environment           |
@@ -108,3 +236,4 @@ pnpm test:e2e
 | `*.browser.test.ts` | `pnpm test:browser` | Chromium (Playwright) |
 | `*.tauri.test.ts`   | `pnpm test:tauri`   | Tauri WebView         |
 | `*.e2e.ts`          | `pnpm test:e2e`     | Tauri app (WDIO)      |
+| `*.android.test.ts` | `pnpm test:android` | Android device (CDP)  |

@@ -15,6 +15,7 @@ import { useNotebookStore } from '@/store/notebookStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useDeviceControlStore } from '@/store/deviceStore';
 import { useScreenWakeLock } from '@/hooks/useScreenWakeLock';
+import { useScreenBrightness } from '@/app/reader/hooks/useScreenBrightness';
 import { useTransferQueue } from '@/hooks/useTransferQueue';
 import { useReplicaPull } from '@/hooks/useReplicaPull';
 import { eventDispatcher } from '@/utils/event';
@@ -60,7 +61,6 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
   const { sideBarBookKey } = useSidebarStore();
   const { hoveredBookKey } = useReaderStore();
   const { showSystemUI, dismissSystemUI } = useThemeStore();
-  const { getScreenBrightness, setScreenBrightness } = useDeviceControlStore();
   const { acquireBackKeyInterception, releaseBackKeyInterception } = useDeviceControlStore();
   const { isSideBarVisible, isSideBarPinned } = useSidebarStore();
   const { getIsSideBarVisible, setSideBarVisible } = useSidebarStore();
@@ -68,8 +68,13 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
   const { getIsNotebookVisible, setNotebookVisible } = useNotebookStore();
   const { isDarkMode, systemUIAlwaysHidden, isRoundedWindow } = useThemeStore();
 
-  useTheme({ systemUIVisible: settings.alwaysShowStatusBar, appThemeColor: 'base-100' });
-  useScreenWakeLock(settings.screenWakeLock);
+  const { onUpdateInsets } = useTheme({
+    systemUIVisible: settings.alwaysShowStatusBar,
+    appThemeColor: 'base-100',
+    themeScope: 'reader',
+  });
+  useScreenWakeLock(settings.screenWakeLock, appService?.hasWindow, appService?.isIOSApp);
+  useScreenBrightness();
   useTransferQueue(libraryLoaded, 5000);
   // Reader needs dictionaries for word-lookup, fonts for rendering, and
   // textures for the page background. Mounted here (not in the app-
@@ -87,27 +92,6 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
     initDayjs(getLocale());
   }, []);
 
-  useEffect(() => {
-    const brightness = settings.screenBrightness;
-    const autoBrightness = settings.autoScreenBrightness;
-    if (appService?.hasScreenBrightness && !autoBrightness && brightness >= 0) {
-      setScreenBrightness(brightness / 100);
-    }
-    let previousBrightness = -1;
-    if (appService?.isIOSApp) {
-      getScreenBrightness().then((b) => {
-        previousBrightness = b;
-      });
-    }
-
-    return () => {
-      if (appService?.hasScreenBrightness && !autoBrightness) {
-        setScreenBrightness(previousBrightness);
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appService]);
-
   const handleKeyDown = (event: CustomEvent) => {
     if (event.detail.keyName === 'Back') {
       const { hoveredBookKey, setHoveredBookKey } = useReaderStore.getState();
@@ -119,8 +103,7 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
       } else if (getIsNotebookVisible() && !isNotebookPinned) {
         setNotebookVisible(false);
       } else {
-        eventDispatcher.dispatch('close-reader');
-        router.back();
+        void eventDispatcher.dispatch('close-reader', { onClose: () => router.back() });
       }
       return true;
     }
@@ -159,7 +142,12 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
     if (!appService?.isMobileApp) return;
     const systemUIVisible = !!hoveredBookKey || settings.alwaysShowStatusBar;
     const visible = !!(systemUIVisible && !systemUIAlwaysHidden);
-    setSystemUIVisibility({ visible, darkMode: isDarkMode });
+    setSystemUIVisibility({ visible, darkMode: isDarkMode }).then(() => {
+      // iPhone Duo's status bar carries a side inset of its own (its strip):
+      // re-read it so the toolbar chrome clears the strip. Other devices never
+      // re-read here.
+      if (useThemeStore.getState().isIPhoneDuo) onUpdateInsets();
+    });
     if (visible) {
       showSystemUI();
     } else {
@@ -185,7 +173,7 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
       </Suspense>
     </div>
   ) : (
-    <div className={clsx('full-height', !appService?.isLinuxApp && 'bg-base-100')}></div>
+    <div className='full-height bg-base-100'></div>
   );
 };
 

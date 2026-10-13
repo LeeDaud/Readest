@@ -1,4 +1,4 @@
-import { Database, QueryResult } from 'tauri-plugin-turso';
+import { Database, LoadOptions, QueryResult } from 'tauri-plugin-turso';
 import { DatabaseService, DatabaseExecResult, DatabaseRow, DatabaseOpts } from '@/types/database';
 
 export class NativeDatabaseService implements DatabaseService {
@@ -8,8 +8,19 @@ export class NativeDatabaseService implements DatabaseService {
     this.db = db;
   }
 
-  static async open(path: string, _opts?: DatabaseOpts): Promise<NativeDatabaseService> {
-    const db = await Database.load(path);
+  static async open(path: string, opts?: DatabaseOpts): Promise<NativeDatabaseService> {
+    // Translate the cross-platform DatabaseOpts (from @readest/turso-database-common,
+    // used by WASM bindings) to tauri-plugin-turso's LoadOptions. The two interfaces
+    // have diverged: `experimental` is the same field name with compatible types
+    // (literal union vs `string[]`); `encryption` shapes differ entirely (native
+    // 'aes256cbc' + byte-array key vs WASM 'aes256gcm'/etc + hex key) and is not
+    // wired in MVP — revisit alongside any Reedy.db encryption work. Skip the
+    // translation when no relevant opts are set so existing callers preserve their
+    // plain path-string call shape.
+    const loadArg: string | LoadOptions = opts?.experimental?.length
+      ? { path, experimental: opts.experimental as string[] }
+      : path;
+    const db = await Database.load(loadArg);
     return new NativeDatabaseService(db);
   }
 
@@ -33,6 +44,14 @@ export class NativeDatabaseService implements DatabaseService {
   }
 
   async close(): Promise<void> {
-    await this.db.close();
+    // Turso is WAL-only with no auto-checkpoint and does not fold the WAL on
+    // close by itself; without this the main file never grows past its header
+    // and every written byte sits in the -wal sidecar, which file-level copy
+    // or sync of the containing directory can miss.
+    await this.execute('PRAGMA wal_checkpoint(TRUNCATE)').catch(() => {});
+    // The plugin's arg-less close() drains EVERY open connection app-wide;
+    // pass our path so closing this database cannot tear down the others
+    // (statistics.db etc. dying with "database ... not loaded", READEST-6).
+    await this.db.close(this.db.path);
   }
 }

@@ -8,7 +8,8 @@
 
 use futures_util::TryStreamExt;
 use serde::{ser::Serializer, Serialize};
-use tauri::{command, ipc::Channel};
+use tauri::{command, ipc::Channel, AppHandle, Manager};
+use tauri_plugin_fs::FsExt;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
@@ -17,6 +18,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use read_progress_stream::ReadProgressStream;
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
@@ -82,6 +84,97 @@ pub enum Error {
     ContentLength(String),
     #[error("request failed with status code {0}: {1}")]
     HttpErrorCode(u16, String),
+    #[error("permission denied: path not in filesystem scope: {0}")]
+    Forbidden(String),
+}
+
+/// Reject paths the webview must not be allowed to target: relative paths and
+/// any `..` parent-directory traversal. `fs_scope().is_allowed` is a glob match,
+/// so a `..` segment could otherwise escape an allowed prefix.
+fn has_disallowed_components(file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Resolve existing ancestors too, so a new download beneath a symlink is
+/// checked against the directory where it will actually be written.
+fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(ancestor)?;
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = ancestor.parent() else {
+                    return Err(error);
+                };
+                ancestor = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_within_app_storage(file_path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| file_path.starts_with(root))
+}
+
+/// A custom data location keeps every file beneath a folder named `Readest`,
+/// which the `**/Readest/**/*` fs capability already grants to the fs plugin.
+/// Match a whole path component so `Readest-agent.plist` stays foreign.
+fn is_within_data_dir(file_path: &Path) -> bool {
+    file_path.components().any(|c| c.as_os_str() == "Readest")
+}
+
+/// Refuse `..` before resolving, so neither traversal nor a symlink can carry
+/// a path out of the folder its spelling names.
+fn resolve_request(file_path: &str) -> std::result::Result<PathBuf, Error> {
+    if has_disallowed_components(file_path) {
+        return Err(Error::Forbidden(file_path.to_string()));
+    }
+    Ok(resolve_path(Path::new(file_path))?)
+}
+
+/// Authorize the resolved path against user grants or real application roots.
+/// Callers use the returned path for I/O, never the untrusted spelling.
+pub(crate) fn ensure_path_allowed<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    file_path: &str,
+) -> std::result::Result<PathBuf, Error> {
+    let resolved = resolve_request(file_path)?;
+    let scope = app.fs_scope();
+    if scope.is_forbidden(&resolved) {
+        return Err(Error::Forbidden(file_path.to_string()));
+    }
+    let roots: Vec<PathBuf> = [
+        app.path().app_data_dir(),
+        app.path().app_local_data_dir(),
+        app.path().app_config_dir(),
+        app.path().app_cache_dir(),
+    ]
+    .into_iter()
+    .filter_map(|root| root.ok().and_then(|root| resolve_path(&root).ok()))
+    .collect();
+    if scope.is_allowed(&resolved)
+        || is_within_app_storage(&resolved, &roots)
+        || is_within_data_dir(&resolved)
+    {
+        return Ok(resolved);
+    }
+    Err(Error::Forbidden(file_path.to_string()))
 }
 
 impl Serialize for Error {
@@ -102,7 +195,9 @@ pub struct ProgressPayload {
 }
 
 #[command]
-pub async fn download_file(
+#[allow(clippy::too_many_arguments)] // Tauri command surface mirrors the JS caller's options.
+pub async fn download_file<R: tauri::Runtime>(
+    app: AppHandle<R>,
     url: &str,
     file_path: &str,
     headers: HashMap<String, String>,
@@ -115,6 +210,9 @@ pub async fn download_file(
     use std::cmp::min;
     use tokio::io::AsyncSeekExt;
 
+    let allowed_path = ensure_path_allowed(&app, file_path)?;
+    let file_path = allowed_path.as_path();
+
     const PART_SIZE: u64 = 1024 * 1024;
 
     let client = reqwest::ClientBuilder::new()
@@ -126,7 +224,7 @@ pub async fn download_file(
     async fn single_threaded_download(
         client: &reqwest::Client,
         url: &str,
-        file_path: &str,
+        file_path: &Path,
         headers: &HashMap<String, String>,
         body: &Option<String>,
         on_progress: Channel<ProgressPayload>,
@@ -278,13 +376,17 @@ pub async fn download_file(
 }
 
 #[command]
-pub async fn upload_file(
+pub async fn upload_file<R: tauri::Runtime>(
+    app: AppHandle<R>,
     url: &str,
     file_path: &str,
     method: &str,
     headers: HashMap<String, String>,
     on_progress: Channel<ProgressPayload>,
 ) -> Result<String> {
+    let allowed_path = ensure_path_allowed(&app, file_path)?;
+    let file_path = allowed_path.as_path();
+
     let file = File::open(file_path).await?;
     let file_len = file.metadata().await.unwrap().len();
 
@@ -329,4 +431,125 @@ fn file_to_body(channel: Channel<ProgressPayload>, file: File, file_len: u64) ->
             });
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        has_disallowed_components, is_within_app_storage, is_within_data_dir, resolve_path,
+        resolve_request,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn data_dir_authorizes_custom_library_locations() {
+        // Custom data locations always keep their files beneath a `Readest`
+        // folder (#6383): iCloud Drive, Android shared storage, portable Windows.
+        for path in [
+            "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/Resources/Readest/Readest/Books/h/book.epub",
+            "/storage/emulated/0/Books/Readest/Readest/Books/h/book.epub",
+            "/Users/x/Apps/Readest-portable/Readest/Books/h/book.epub",
+            "/Users/x/Readest",
+        ] {
+            assert!(is_within_data_dir(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/Users/x/Library/LaunchAgents/Readest-agent.plist",
+            "/Users/x/Apps/Readest-portable/secrets.txt",
+            "/Users/x/.ssh/id_rsa",
+        ] {
+            assert!(!is_within_data_dir(Path::new(path)), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_does_not_authorize_escapes_from_a_readest_folder() {
+        let temp = std::env::temp_dir().join(format!("readest-data-dir-{}", std::process::id()));
+        let data = temp.join("Readest");
+        let secret = temp.join("secret");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("key"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&secret, data.join("escape")).unwrap();
+        let allowed = |path: &Path| {
+            resolve_request(path.to_str().unwrap()).is_ok_and(|p| is_within_data_dir(&p))
+        };
+        // `..` is refused before resolution, existing or not.
+        assert!(!allowed(&data.join("../secret/key")));
+        assert!(!allowed(&data.join("Books/../../secret/key")));
+        // A symlink is judged by where it lands, for reads and new downloads.
+        assert!(!allowed(&data.join("escape/key")));
+        assert!(!allowed(&data.join("escape/new/file.epub")));
+        assert!(allowed(&data.join("Books/new.epub")));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn app_storage_does_not_authorize_brand_names_in_foreign_paths() {
+        let roots = [PathBuf::from(
+            "/Users/victim/Library/Application Support/com.bilingify.readest",
+        )];
+        for path in [
+            "/Users/victim/Library/LaunchAgents/Readest-agent.plist",
+            "/Users/victim/Documents/com.bilingify.readest-secrets.txt",
+            "/Users/victim/Library/Application Support/com.bilingify.readest-other/file",
+        ] {
+            assert!(!is_within_app_storage(Path::new(path), &roots));
+        }
+        assert!(is_within_app_storage(
+            Path::new("/Users/victim/Library/Application Support/com.bilingify.readest/Readest/Books/book.epub"),
+            &roots,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlinks_before_authorizing_new_downloads() {
+        let temp = std::env::temp_dir().join(format!("readest-path-scope-{}", std::process::id()));
+        let app = temp.join("app");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, app.join("escape")).unwrap();
+        let roots = [std::fs::canonicalize(&app).unwrap()];
+        let target = resolve_path(&app.join("escape/new/file.epub")).unwrap();
+        assert!(!is_within_app_storage(&target, &roots));
+        assert!(is_within_app_storage(
+            &resolve_path(&app.join("Books/new.epub")).unwrap(),
+            &roots
+        ));
+        std::os::unix::fs::symlink(temp.join("missing"), app.join("dangling")).unwrap();
+        assert!(resolve_path(&app.join("dangling/file.epub")).is_err());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn rejects_relative_and_traversal_paths() {
+        // Relative paths can't be reasoned about against an absolute scope.
+        assert!(has_disallowed_components("relative/file.epub"));
+        assert!(has_disallowed_components("file.epub"));
+        // `..` traversal, whether the path is relative or absolute.
+        assert!(has_disallowed_components("foo/../bar"));
+        assert!(has_disallowed_components(
+            "/home/user/Readest/../../.ssh/id_rsa"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_plain_absolute_paths() {
+        assert!(!has_disallowed_components(
+            "/Users/x/Library/Caches/app/book.epub"
+        ));
+        assert!(!has_disallowed_components("/Users/x/Readest/Books/h.epub"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_plain_absolute_paths_windows() {
+        assert!(!has_disallowed_components(
+            "C:\\Users\\x\\AppData\\Roaming\\Readest\\Books\\h.epub"
+        ));
+    }
 }

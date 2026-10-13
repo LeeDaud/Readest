@@ -21,7 +21,7 @@ const SidebarHeader: React.FC<{
   const _ = useTranslation();
   const headerRef = useRef<HTMLDivElement>(null);
   const { isTrafficLightVisible } = useTrafficLight(headerRef);
-  const iconSize14 = useResponsiveSize(14);
+  const iconSize15 = useResponsiveSize(15);
   const iconSize18 = useResponsiveSize(18);
   const iconSize22 = useResponsiveSize(22);
 
@@ -42,7 +42,9 @@ const SidebarHeader: React.FC<{
         >
           <MdArrowBackIosNew size={iconSize22} />
         </button>
-        <div className='hidden sm:flex'>
+        {/* ms-1.5 matches the px-1.5 of the header bar's tool scroller, so the
+            toggler does not shift when the sidebar opens over it. */}
+        <div className='hidden sm:ms-1.5 sm:flex'>
           <SidebarToggler bookKey={bookKey} />
         </div>
       </div>
@@ -64,7 +66,7 @@ const SidebarHeader: React.FC<{
             window.innerWidth < 640 ? 'dropdown-end' : 'dropdown-center',
             'dropdown-bottom',
           )}
-          menuClassName={clsx('no-triangle mt-1', window.innerWidth < 640 ? '' : '!relative')}
+          menuClassName={clsx('no-triangle mt-1', window.innerWidth < 640 ? '' : 'relative!')}
           buttonClassName='btn btn-ghost h-8 min-h-8 w-8 p-0'
           containerClassName='h-8'
           toggleButton={<MdOutlineMenu className='fill-base-content' />}
@@ -80,7 +82,7 @@ const SidebarHeader: React.FC<{
               isPinned ? 'bg-base-300' : 'bg-base-300/65',
             )}
           >
-            {isPinned ? <MdPushPin size={iconSize14} /> : <MdOutlinePushPin size={iconSize14} />}
+            {isPinned ? <MdPushPin size={iconSize15} /> : <MdOutlinePushPin size={iconSize15} />}
           </button>
         </div>
       </div>

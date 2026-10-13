@@ -1,18 +1,34 @@
 import { Book } from '@/types/book';
 import { AppService, BaseDir } from '@/types/system';
 import { useTransferStore, TransferItem, ReplicaTransferFile } from '@/store/transferStore';
+import { useSettingsStore } from '@/store/settingsStore';
+import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
+import { isSyncCategoryEnabled } from '@/services/sync/syncCategories';
 import { TranslationFunc } from '@/hooks/useTranslation';
-import { ProgressHandler, ProgressPayload } from '@/utils/transfer';
+import { createProgressThrottle, ProgressHandler, ProgressPayload } from '@/utils/transfer';
 import { eventDispatcher } from '@/utils/event';
+import { isAbsOfflineCapable, isAudiobook } from '@/utils/audiobook';
 import { getTransferMessages } from './transferMessages';
 
 const TRANSFER_QUEUE_KEY = 'readest_transfer_queue';
 const RETRY_DELAY_BASE_MS = 2000;
+// Coalesce per-chunk progress emissions to at most ~10/sec per transfer so the
+// transfer-store fan-out cannot sustain a synchronous React update storm (a
+// buffered download emits progress once per chunk in a microtask burst, and
+// transferSpeed changes every call so the store's no-op guard cannot help)
+// (Sentry READEST-2).
+const PROGRESS_THROTTLE_MS = 100;
+// Quota failures in a batch import arrive one per book as transfers drain;
+// collapse them into one summary toast per burst instead of N identical toasts.
+const QUOTA_TOAST_FLUSH_MS = 1500;
 
 interface PersistedQueueData {
+  schemaVersion?: number;
   transfers: Record<string, TransferItem>;
   isQueuePaused: boolean;
 }
+
+const QUEUE_SCHEMA_VERSION = 1;
 
 class TransferManager {
   private static instance: TransferManager;
@@ -23,12 +39,69 @@ class TransferManager {
   private getLibrary: (() => Book[]) | null = null;
   private updateBook: ((book: Book) => Promise<void>) | null = null;
   private _: TranslationFunc | null = null;
+  private settingsUnsub: (() => void) | null = null;
+  private quotaFailureCount = 0;
+  private quotaToastTimer: ReturnType<typeof setTimeout> | null = null;
   private readyResolve: () => void = () => {};
   private readyPromise: Promise<void> = new Promise<void>((resolve) => {
     this.readyResolve = resolve;
   });
 
   private constructor() {}
+
+  /**
+   * Settings hydrate asynchronously at app start (`settings` begins as
+   * `{}`); `settings.version` truthiness is the loaded signal (same
+   * convention as useSync). Before hydration the provider is unknown, so
+   * book uploads are deferred rather than judged — acting on unknown
+   * settings could both mis-cancel and mis-allow. Replica transfers and
+   * downloads are never deferred: they are not provider-gated and the
+   * boot-time replica pull relies on waitUntilReady().
+   */
+  private isSettingsLoaded(): boolean {
+    return !!useSettingsStore.getState().settings?.version;
+  }
+
+  /**
+   * A Readest Cloud file is only reachable through its `books` row, and that
+   * row is pushed only while Books sync is on. Uploading with it off stores
+   * files no other device can ever list, while still spending quota.
+   */
+  isBookUploadAllowed(): boolean {
+    return (
+      isReadestCloudStorageActive(useSettingsStore.getState().settings) &&
+      isSyncCategoryEnabled('book')
+    );
+  }
+
+  private isDeferredBookUpload(t: TransferItem): boolean {
+    return t.kind === 'book' && t.type === 'upload' && !this.isSettingsLoaded();
+  }
+
+  /**
+   * Cancel pending book uploads when Readest Cloud is not the selected
+   * provider or Books sync is off. Idempotent (acts on pending rows only) — safe to run on
+   * every processQueue pass, which also re-settles rows another window
+   * or a rogue retry re-pended. Cancellation is visible ('cancelled'
+   * with cancelReason 'policy'), never a silent drop.
+   */
+  private reconcileUploadsWithProvider(): void {
+    if (!this.isSettingsLoaded() || this.isBookUploadAllowed()) return;
+
+    const store = useTransferStore.getState();
+    const gated = store
+      .getPendingTransfers()
+      .filter((t) => t.kind === 'book' && t.type === 'upload');
+    if (gated.length === 0) return;
+
+    gated.forEach((t) => {
+      store.setTransferStatus(t.id, 'cancelled', undefined, 'policy');
+    });
+    console.info(
+      `[cloudSync] cancelled ${gated.length} pending Readest Cloud upload(s): Readest Cloud or Books sync is off`,
+    );
+    this.persistQueue();
+  }
 
   static getInstance(): TransferManager {
     if (!TransferManager.instance) {
@@ -50,8 +123,17 @@ class TransferManager {
     this.updateBook = updateBook;
     this._ = translationFn;
     await this.loadPersistedQueue();
+    this.reconcileUploadsWithProvider();
     this.isInitialized = true;
     this.readyResolve();
+
+    // Re-gate when settings hydrate or the selected provider changes.
+    this.settingsUnsub?.();
+    this.settingsUnsub = useSettingsStore.subscribe((state, prev) => {
+      if (state.settings === prev.settings) return;
+      this.reconcileUploadsWithProvider();
+      this.processQueue();
+    });
 
     // Start processing queue
     this.processQueue();
@@ -77,6 +159,16 @@ class TransferManager {
       return null;
     }
 
+    // ABS books stream from the server; there is no local file to upload.
+    if (isAudiobook(book)) return null;
+
+    // Readest Cloud storage is not written to while a third-party
+    // provider is selected. Before settings hydrate the entry is queued
+    // and deferred; the reconcile on hydration decides its fate.
+    if (this.isSettingsLoaded() && !this.isBookUploadAllowed()) {
+      return null;
+    }
+
     const store = useTransferStore.getState();
 
     // Check if already queued or in progress
@@ -91,14 +183,42 @@ class TransferManager {
     return transferId;
   }
 
-  queueDownload(book: Book, priority: number = 10): string | null {
+  queueDownload(book: Book, priority: number = 10, isBackground: boolean = false): string | null {
     if (!this.isReady()) {
       console.warn('TransferManager not initialized');
       return null;
     }
 
+    // ABS books stream from the server; there is no cloud file to download.
+    if (isAudiobook(book)) return null;
+
     const store = useTransferStore.getState();
 
+    const existing = store.getTransferByBookHash(book.hash, 'download');
+    if (existing) {
+      return existing.id;
+    }
+
+    const transferId = store.addTransfer(book.hash, book.title, 'download', priority, isBackground);
+    this.persistQueue();
+    this.processQueue();
+    return transferId;
+  }
+
+  /**
+   * Queue an offline download of an Audiobookshelf book's media (#6256). A
+   * 'book' download row, so the shelf's cover overlay and the Transfer Queue
+   * track it like any book download; executeBookTransfer routes it to the
+   * ABS downloader instead of cloud storage.
+   */
+  queueAbsOfflineDownload(book: Book, priority: number = 10): string | null {
+    if (!this.isReady()) {
+      console.warn('TransferManager not initialized');
+      return null;
+    }
+    if (!isAbsOfflineCapable(book)) return null;
+
+    const store = useTransferStore.getState();
     const existing = store.getTransferByBookHash(book.hash, 'download');
     if (existing) {
       return existing.id;
@@ -153,7 +273,9 @@ class TransferManager {
 
     const id = store.addReplicaTransfer(replicaKind, replicaId, displayTitle, 'upload', {
       priority: opts.priority,
-      isBackground: opts.isBackground,
+      // Replica transfers are background sync by default — see the note on
+      // queueReplicaDownload.
+      isBackground: opts.isBackground ?? true,
       files,
       base,
       reincarnation: opts.reincarnation,
@@ -181,7 +303,12 @@ class TransferManager {
 
     const id = store.addReplicaTransfer(replicaKind, replicaId, displayTitle, 'download', {
       priority: opts.priority,
-      isBackground: opts.isBackground,
+      // Replica bundles (fonts, textures, dictionaries, OPDS catalogs) sync on
+      // their own schedule, not because the user asked for this file right
+      // now. Toasting each one turns a fresh device into a wall of
+      // notifications, so they are background — and therefore silent — unless
+      // a caller explicitly opts into the foreground.
+      isBackground: opts.isBackground ?? true,
       files,
       base,
     });
@@ -207,7 +334,8 @@ class TransferManager {
 
     const id = store.addReplicaTransfer(replicaKind, replicaId, displayTitle, 'delete', {
       priority: opts.priority,
-      isBackground: opts.isBackground,
+      // Background by default — see the note on queueReplicaDownload.
+      isBackground: opts.isBackground ?? true,
       files: filenames.map((logical) => ({ logical, lfp: '', byteSize: 0 })),
     });
     this.persistQueue();
@@ -222,7 +350,7 @@ class TransferManager {
       this.abortControllers.delete(transferId);
     }
 
-    useTransferStore.getState().setTransferStatus(transferId, 'cancelled');
+    useTransferStore.getState().setTransferStatus(transferId, 'cancelled', undefined, 'user');
     this.persistQueue();
   }
 
@@ -254,6 +382,26 @@ class TransferManager {
     this.persistQueue();
   }
 
+  clearPending(): void {
+    useTransferStore.getState().clearPending();
+    this.persistQueue();
+  }
+
+  clearCompleted(): void {
+    useTransferStore.getState().clearCompleted();
+    this.persistQueue();
+  }
+
+  clearFailed(): void {
+    useTransferStore.getState().clearFailed();
+    this.persistQueue();
+  }
+
+  clearAll(): void {
+    useTransferStore.getState().clearAll();
+    this.persistQueue();
+  }
+
   private async processQueue(): Promise<void> {
     if (this.isProcessing) return;
 
@@ -267,11 +415,13 @@ class TransferManager {
   }
 
   private async _processQueueInternal(): Promise<void> {
+    this.reconcileUploadsWithProvider();
+
     const store = useTransferStore.getState();
 
     if (store.isQueuePaused) return;
 
-    const pending = store.getPendingTransfers();
+    const pending = store.getPendingTransfers().filter((t) => !this.isDeferredBookUpload(t));
     const activeCount = store.getActiveTransfers().length;
     const maxConcurrent = store.maxConcurrent;
 
@@ -288,9 +438,12 @@ class TransferManager {
 
     await Promise.all(toProcess.map((transfer) => this.executeTransfer(transfer)));
 
-    // Check if more items to process
+    // Check if more items to process. Deferred book uploads (settings
+    // not yet hydrated) don't count — re-looping on them every 100ms
+    // would busy-wait; the settings subscription wakes them instead.
     const newStore = useTransferStore.getState();
-    if (newStore.getPendingTransfers().length > 0 && !newStore.isQueuePaused) {
+    const processable = newStore.getPendingTransfers().filter((t) => !this.isDeferredBookUpload(t));
+    if (processable.length > 0 && !newStore.isQueuePaused) {
       setTimeout(() => this.processQueue(), 100);
     }
   }
@@ -309,11 +462,8 @@ class TransferManager {
     store.setTransferStatus(transfer.id, 'in_progress');
     store.setActiveCount(store.getActiveTransfers().length + 1);
 
-    const progressHandler = (progress: ProgressPayload) => {
-      if (abortController.signal.aborted) return;
-
+    const progressThrottle = createProgressThrottle((progress) => {
       const percentage = progress.total > 0 ? (progress.progress / progress.total) * 100 : 0;
-
       useTransferStore
         .getState()
         .updateTransferProgress(
@@ -323,6 +473,11 @@ class TransferManager {
           progress.total,
           progress.transferSpeed,
         );
+    }, PROGRESS_THROTTLE_MS);
+
+    const progressHandler = (progress: ProgressPayload) => {
+      if (abortController.signal.aborted) return;
+      progressThrottle.push(progress);
     };
 
     try {
@@ -331,7 +486,11 @@ class TransferManager {
       } else {
         await this.executeBookTransfer(transfer, progressHandler, abortController);
       }
+      // A transfer that cannot stop mid-flight must not report success once cancelled.
+      if (abortController.signal.aborted) return;
 
+      // Land the final progress value that the throttle may still be holding.
+      progressThrottle.flush();
       useTransferStore.getState().setTransferStatus(transfer.id, 'completed');
 
       const messages = getTransferMessages(transfer, _);
@@ -353,7 +512,15 @@ class TransferManager {
       const currentStore = useTransferStore.getState();
       const currentTransfer = currentStore.transfers[transfer.id];
 
-      if (currentTransfer && currentTransfer.retryCount < currentTransfer.maxRetries) {
+      // Quota exhaustion is permanent for this account state; retrying
+      // burns three backoff rounds per book for the same 403.
+      const isQuotaError = errorMessage.includes('Insufficient storage quota');
+
+      if (
+        !isQuotaError &&
+        currentTransfer &&
+        currentTransfer.retryCount < currentTransfer.maxRetries
+      ) {
         // Schedule retry with exponential backoff
         const delay = RETRY_DELAY_BASE_MS * Math.pow(2, currentTransfer.retryCount);
         currentStore.incrementRetryCount(transfer.id);
@@ -367,28 +534,35 @@ class TransferManager {
           this.processQueue();
         }, delay);
       } else {
-        if (errorMessage.includes('Not authenticated')) {
-          eventDispatcher.dispatch('toast', {
-            type: 'error',
-            message: _('Please log in to continue'),
-          });
-        } else if (errorMessage.includes('Insufficient storage quota')) {
-          eventDispatcher.dispatch('toast', {
-            type: 'error',
-            message: _('Insufficient storage quota'),
-          });
-        } else {
-          const errorMessages = getTransferMessages(transfer, _).failure;
+        // Background work fails quietly. The success path has always honoured
+        // `isBackground`; the failure path did not, so a broken replica sync
+        // fired one toast per file (issue #5675 — sixteen "Failed to download
+        // file" toasts for sixteen fonts). The failure is still recorded on
+        // the transfer, which is what the Transfer Queue panel reads.
+        if (!transfer.isBackground) {
+          if (errorMessage.includes('Not authenticated')) {
+            eventDispatcher.dispatch('toast', {
+              type: 'error',
+              message: _('Please log in to continue'),
+            });
+          } else if (isQuotaError) {
+            this.recordQuotaFailure();
+          } else {
+            const errorMessages = getTransferMessages(transfer, _).failure;
 
-          eventDispatcher.dispatch('toast', {
-            type: 'error',
-            message: errorMessages[transfer.type],
-          });
+            eventDispatcher.dispatch('toast', {
+              type: 'error',
+              message: errorMessages[transfer.type],
+            });
+          }
         }
 
         useTransferStore.getState().setTransferStatus(transfer.id, 'failed', errorMessage);
       }
     } finally {
+      // Drop any pending throttled progress + its trailing timer (a
+      // failed/aborted transfer's stale progress must not fire after teardown).
+      progressThrottle.cancel();
       this.abortControllers.delete(transfer.id);
 
       const currentStore = useTransferStore.getState();
@@ -400,10 +574,32 @@ class TransferManager {
     }
   }
 
+  private recordQuotaFailure(): void {
+    this.quotaFailureCount += 1;
+    if (this.quotaToastTimer) clearTimeout(this.quotaToastTimer);
+    this.quotaToastTimer = setTimeout(() => this.flushQuotaToast(), QUOTA_TOAST_FLUSH_MS);
+  }
+
+  private flushQuotaToast(): void {
+    const _ = this._;
+    const count = this.quotaFailureCount;
+    this.quotaFailureCount = 0;
+    this.quotaToastTimer = null;
+    if (!count || !_) return;
+
+    eventDispatcher.dispatch('toast', {
+      type: 'error',
+      message:
+        count === 1
+          ? _('Insufficient storage quota')
+          : _('{{count}} uploads failed: insufficient storage quota', { count }),
+    });
+  }
+
   private async executeBookTransfer(
     transfer: TransferItem,
     progressHandler: (p: ProgressPayload) => void,
-    _abortController: AbortController,
+    abortController: AbortController,
   ): Promise<void> {
     const _ = this._!;
     const library = this.getLibrary!();
@@ -411,6 +607,15 @@ class TransferManager {
 
     if (!book) {
       throw new Error(_('Book not found in library'));
+    }
+
+    if (book.format === 'ABS' && transfer.type === 'download') {
+      const { downloadAbsForOffline } = await import('@/services/audiobookshelf/offline');
+      await downloadAbsForOffline(this.appService!, book, progressHandler, abortController.signal);
+      if (abortController.signal.aborted) return;
+      book.absDownloadedAt = Date.now();
+      await this.updateBook!(book);
+      return;
     }
 
     if (transfer.type === 'upload') {
@@ -541,6 +746,7 @@ class TransferManager {
 
       // Persist all transfers including completed (for history)
       const data: PersistedQueueData = {
+        schemaVersion: QUEUE_SCHEMA_VERSION,
         transfers: store.transfers,
         isQueuePaused: store.isQueuePaused,
       };

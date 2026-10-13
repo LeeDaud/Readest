@@ -64,9 +64,16 @@ export const handleA11yNavigation = (
     skipLink.setAttribute('tabindex', '0');
     skipLink.setAttribute('aria-hidden', 'false');
     skipLink.setAttribute('aria-label', options?.skipToLastPosLabel ?? '');
+    // position:absolute keeps the link out of flow; left/top:auto leave it at
+    // its static position. `left: 0` resolves against the *initial containing
+    // block* — the iframe viewport, which the paginator expands to hold every
+    // rendered column — so in an RTL book (columns flowing right-to-left) the
+    // box landed past the end of the text. expand() sizes the section from a
+    // Range over the body contents, so that stray 1×1 box stretched the section
+    // to the full iframe width and appended blank pages mid-chapter (#5924).
     Object.assign(skipLink.style, {
       position: 'absolute',
-      left: '0px',
+      left: 'auto',
       top: 'auto',
       width: '1px',
       height: '1px',
@@ -81,7 +88,15 @@ export const handleA11yNavigation = (
   }
   const skipNextSectionLinkId = 'readest-skip-link-next-section';
   if (document.body && !document.getElementById(skipNextSectionLinkId)) {
-    const skipLink = document.createElement('div');
+    // Use a <span>, not a <div>: this link is nested inside the section's last
+    // content element (see findSectionEndHost below). The paragraph-layout rule
+    // in getParagraphLayoutStyles() targets `div:not(:has(*:not(b,a,em,i,strong,
+    // u,span)))`, so a nested <div> would make the enclosing paragraph fail the
+    // `:has()` test and silently lose its line-spacing/indent overrides. <span>
+    // is in that allow-list, so the paragraph keeps matching. position:absolute
+    // still makes the inline span an out-of-flow 1×1px box, so layout/focus are
+    // unchanged.
+    const skipLink = document.createElement('span');
     skipLink.id = skipNextSectionLinkId;
     skipLink.setAttribute('cfi-inert', '');
     skipLink.setAttribute('tabindex', '0');

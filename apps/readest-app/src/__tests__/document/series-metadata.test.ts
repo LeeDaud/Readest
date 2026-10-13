@@ -54,7 +54,7 @@ describe('Calibre series metadata', () => {
     let book: BookDoc;
 
     beforeAll(async () => {
-      await import('foliate-js/pdf.js');
+      await import('@pdfjs/pdf.min.mjs');
       const pdfjsLib = (globalThis as Record<string, unknown>)['pdfjsLib'] as {
         GlobalWorkerOptions: { workerSrc: string };
       };
@@ -74,6 +74,25 @@ describe('Calibre series metadata', () => {
 
     it('preserves the title', () => {
       expect(book.metadata.title).toBe('PDF Metadata');
+    });
+  });
+
+  describe('FB2 (title-info sequence)', () => {
+    let book: BookDoc;
+
+    beforeAll(async () => {
+      book = await loadFixture('sample-metadata.fb2', 'application/x-fictionbook+xml', 'FB2');
+    });
+
+    it('extracts series name and position from the sequence element', () => {
+      const series = getSeries(book);
+      expect(series).toBeTruthy();
+      expect(series!.name).toBe('Metadata Series');
+      expect(series!.position).toBe('3');
+    });
+
+    it('preserves the title', () => {
+      expect(book.metadata.title).toBe('FB2 Metadata');
     });
   });
 

@@ -114,6 +114,13 @@
 
 **Fix Strategy:** Scope event handlers to the loaded section's index. Use unique IDs for SVG elements across overlayer instances. Minimize iframe DOM mutations during drag operations.
 
+### 13. Whole-Field-Synced Flag Reaches an Unsupported Platform
+**Pattern:** A setting is whole-field synced across devices (e.g. `dictionarySettings.providerEnabled`), so a flag enabled on one platform arrives `true` on a platform where that feature isn't supported. The lookup/runtime path correctly gates on platform support, but a *secondary consumer* (usually UI gating) reads the raw synced flag and misbehaves.
+**Example:**
+- System Dictionary enabled on macOS synced to web → web's `CustomDictionaries.tsx` locked all other dictionary toggles read-only (`lockedBySystem`) even though System Dictionary is hidden + a no-op there. The annotator's lookup path used the platform-gated `isSystemDictionaryEnabled(settings)` (registry.ts, gates on `isSystemDictionarySupported()`), but the settings UI compared the raw `providerEnabled[systemDictionary] === true`.
+
+**Fix Strategy:** Every consumer of a synced flag for a platform-specific feature must route through the *same* platform-aware gate the runtime uses — not the raw `providerEnabled[...]`/setting value. Here: `lockedBySystem = isSystemDictionaryEnabled(settings) && ...`. Search for other readers of the raw flag when fixing one.
+
 ## Debugging Workflow
 
 1. **Identify the category** from the issue description
@@ -124,3 +131,12 @@
 6. **Test in both paginated and scrolled modes** for layout changes
 7. **Test on multiple platforms** for any UI change
 8. **Run `pnpm build-check`** before submitting
+
+## Moved from MEMORY.md index
+- [CFI.compare null = app crash](cfi-compare-null-crash-findnearestcfi.md) MERGED #5533; `''` cfi is SAFE · [Minified `Module.<letter>` frames](minified-stack-module-namespace-frames.md) = `import * as` namespace
+- [Native DB close() closes ALL turso conns](native-db-close-all-not-loaded.md) MERGED #5497; "not loaded" = READEST-6 · [Turso "concurrent use forbidden"](turso-concurrent-use-forbidden.md) `op_lock` async mutex
+- [#5097/#5308 encoded href](epub-encoded-href-reserved-chars-5097.md) `decodeURI` keeps reserved chars; MERGED #5311
+- [#5273 undeclared cover.jpg](epub-undeclared-cover-entry-5273.md) MERGED #5339 + foliate#61 · [#5455 OPF `<item></item>` skipped](epub-opf-expanded-item-tags-5455.md) MERGED #5463
+- Stale settings closure: persist `useSettingsStore.getState().settings` ([#4780](webdav-connect-nullified-4780.md)) · Page margins not live #4898 in-place mutation froze memo
+- [Foliate touch-listener capture phase](foliate-touch-listener-capture-phase.md) · [iframe cross-realm instanceof](iframe-cross-realm-instanceof.md) duck-type `'closest'`
+- **Zustand v5 unstable selector snapshot** (`useStore((s) => s.x ?? [])`) loops React until error #185 (Maximum update depth); return a module-level constant instead. Found on-device in #5775 (`WebSourcesDialog`); unit tests with a mocked store cannot catch it, render with the real store.

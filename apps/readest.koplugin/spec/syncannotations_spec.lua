@@ -17,13 +17,8 @@ package.preload["ui/widget/infomessage"] = function()
     return { new = function() return {} end }
 end
 package.preload["ui/network/manager"] = function() return {} end
-package.preload["ui/uimanager"] = function()
-    return {
-        show = function() end,
-        setDirty = function() end,
-        nextTick = function(_, fn) fn() end,
-    }
-end
+package.preload["ui/uimanager"] = function() return require("spec.koreader_stubs").UIManager end
+
 package.preload["ffi/util"] = function()
     return { template = function(s) return s end }
 end
@@ -53,6 +48,27 @@ describe("readest_syncannotations", function()
     before_each(function()
         package.loaded["readest_syncannotations"] = nil
         SyncAnnotations = require("readest_syncannotations")
+    end)
+
+    it("ignores annotation responses after the document closes", function()
+        local ui = { document = { info = { has_pages = false } },
+            annotation = { annotations = {{id = "keep"}} } }
+        local response
+        local client = {pullChanges = function(_, _, cb) response = cb end}
+        SyncAnnotations:pull(ui, {}, client, "book", "meta", nil, false)
+        ui.document = nil
+        response(true, {notes = {{id = "keep", deleted_at = "2026-09-20"}}})
+        assert.are.equal(1, #ui.annotation.annotations)
+    end)
+    it("suppresses annotation failure toasts when auth owns the login prompt", function()
+        local stubs = require("spec.koreader_stubs")
+        stubs.reset()
+        local ui = { document = { info = { has_pages = false } } }
+        local client = { pullChanges = function(_, _, cb)
+            cb(false, { error = "authentication required", auth_required = true }, 401)
+        end }
+        SyncAnnotations:pull(ui, {}, client, "book", "meta", nil, true)
+        assert.are.equal(1, #stubs.UIManager._shown) -- pulling notice only
     end)
 
     describe("removeDeletedAnnotations", function()
@@ -170,6 +186,270 @@ describe("readest_syncannotations", function()
             }, BOOK_HASH)
 
             assert.are.equal(0, removed)
+        end)
+    end)
+
+    -- A note deleted in KOReader is removed from ui.annotation.annotations, so
+    -- the push walk (getAnnotations) can never see it. recordDeletion stashes a
+    -- deletedAt-stamped tombstone in the per-book sidecar so the next push tells
+    -- the server it's gone (issue #4119, push direction). Without this, the
+    -- deletion stays local and a later pull resurrects the highlight.
+    local function makeDocSettings(initial)
+        local store = initial or {}
+        return {
+            readSetting = function(_, k) return store[k] end,
+            saveSetting = function(_, k, v) store[k] = v end,
+        }
+    end
+
+    describe("pull preserves local deletions", function()
+        local function startPull(pending)
+            local doc = makeDocSettings({
+                partial_md5_checksum = "book",
+                readest_sync = { meta_hash_v1 = "meta", deleted_notes = pending },
+            })
+            local ui = {
+                doc_settings = doc,
+                document = { info = { has_pages = false }, getPageFromXPointer = function() return 1 end },
+                annotation = { annotations = {}, addItem = function(self, item)
+                    self.annotations[#self.annotations + 1] = item
+                    return #self.annotations
+                end },
+                handleEvent = function() end,
+            }
+            local respond
+            SyncAnnotations:pull(ui, {}, {
+                pullChanges = function(_, _, cb) respond = cb end,
+            }, "book", "meta", nil, false, true)
+            return ui, doc, function()
+                respond(true, { notes = {
+                    { id = "gone", type = "annotation", xpointer0 = "/one", xpointer1 = "/two" },
+                    { id = "keep", type = "annotation", xpointer0 = "/three", xpointer1 = "/four" },
+                } })
+            end
+        end
+
+        it("does not restore a highlight awaiting deletion upload", function()
+            local ui, _, respond = startPull({ { id = "gone", deletedAt = 123 } })
+            respond()
+            assert.are.equal(1, #ui.annotation.annotations)
+            assert.are.equal("keep", ui.annotation.annotations[1].id)
+        end)
+
+        it("honors deletions made while the pull is in flight", function()
+            local ui, doc, respond = startPull()
+            SyncAnnotations:recordDeletion(doc, { id = "gone", drawer = "lighten", pos0 = "/one" })
+            respond()
+            assert.are.equal(1, #ui.annotation.annotations)
+            assert.are.equal("keep", ui.annotation.annotations[1].id)
+        end)
+
+        it("remembers pending deletions acknowledged before a stale pull returns", function()
+            local ui, doc, respond = startPull({ { id = "gone", deletedAt = 123 } })
+            doc:readSetting("readest_sync").deleted_notes = nil
+            respond()
+            assert.are.equal(1, #ui.annotation.annotations)
+            assert.are.equal("keep", ui.annotation.annotations[1].id)
+        end)
+    end)
+
+    describe("recordDeletion", function()
+        it("records a tombstone for a deleted highlight", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            SyncAnnotations:recordDeletion(doc_settings, {
+                id = "n1", drawer = "lighten", pos0 = "/a/1", pos1 = "/a/2",
+                text = "hello", datetime = "2026-05-17 10:00:00",
+            })
+
+            local deleted = doc_settings:readSetting("readest_sync").deleted_notes
+            assert.are.equal(1, #deleted)
+            assert.are.equal("n1", deleted[1].id)
+            assert.are.equal("annotation", deleted[1].type)
+            assert.are.equal("/a/1", deleted[1].xpointer0)
+            assert.are.equal("/a/2", deleted[1].xpointer1)
+            assert.is_truthy(deleted[1].deletedAt)
+            assert.are.equal(deleted[1].deletedAt, deleted[1].updatedAt)
+        end)
+
+        it("derives the id for a native highlight (no stored id) from positions", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            SyncAnnotations:recordDeletion(doc_settings, {
+                drawer = "lighten", pos0 = "/x/1", pos1 = "/x/2",
+            })
+
+            local expected = SyncAnnotations:generateNoteId("book-hash-1", "annotation", "/x/1", "/x/2")
+            local deleted = doc_settings:readSetting("readest_sync").deleted_notes
+            assert.are.equal(expected, deleted[1].id)
+        end)
+
+        it("records a tombstone for a deleted bookmark", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            SyncAnnotations:recordDeletion(doc_settings, { id = "bm1", page = "/doc/bm" })
+
+            local deleted = doc_settings:readSetting("readest_sync").deleted_notes
+            assert.are.equal(1, #deleted)
+            assert.are.equal("bm1", deleted[1].id)
+            assert.are.equal("bookmark", deleted[1].type)
+            assert.are.equal("/doc/bm", deleted[1].xpointer0)
+        end)
+
+        it("dedupes by id so re-deleting the same note doesn't pile up", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            local item = { id = "n1", drawer = "lighten", pos0 = "/a/1" }
+            SyncAnnotations:recordDeletion(doc_settings, item)
+            SyncAnnotations:recordDeletion(doc_settings, item)
+
+            local deleted = doc_settings:readSetting("readest_sync").deleted_notes
+            assert.are.equal(1, #deleted)
+        end)
+
+        it("ignores items that aren't syncable notes", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            -- No drawer and a non-string page → neither highlight nor bookmark.
+            SyncAnnotations:recordDeletion(doc_settings, { page = 12 })
+
+            local readest_sync = doc_settings:readSetting("readest_sync")
+            assert.is_nil(readest_sync.deleted_notes)
+        end)
+    end)
+
+    describe("push folds tombstones", function()
+        local real_time = os.time
+        after_each(function()
+            os.time = real_time
+        end)
+
+        local function makeUi(doc_settings, annotations)
+            return {
+                doc_settings = doc_settings,
+                annotation = { annotations = annotations or {} },
+            }
+        end
+
+        it("includes recorded tombstones in the payload and clears them on success", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = {
+                    meta_hash_v1 = "meta-1",
+                    deleted_notes = {
+                        { id = "gone1", type = "annotation", xpointer0 = "/b/1", updatedAt = 50, deletedAt = 111 },
+                    },
+                },
+            })
+            local captured
+            local client = {
+                pushChanges = function(_, payload, cb)
+                    captured = payload
+                    cb(true, {})
+                end,
+            }
+            SyncAnnotations:push(makeUi(doc_settings), {}, client, false, false)
+
+            assert.is_truthy(captured)
+            assert.are.equal(1, #captured.notes)
+            assert.are.equal("gone1", captured.notes[1].id)
+            assert.are.equal(111, captured.notes[1].deletedAt)
+            -- Upgrade queued tombstones from older plugin versions too: an
+            -- unchanged remote copy must not beat the deletion's old timestamp.
+            assert.are.equal(111, captured.notes[1].updatedAt)
+            assert.are.equal("book-hash-1", captured.notes[1].bookHash)
+            assert.are.equal("meta-1", captured.notes[1].metaHash)
+            assert.is_nil(doc_settings:readSetting("readest_sync").deleted_notes)
+        end)
+
+        it("pushes only the tombstone if a stale pull already restored the highlight", function()
+            local item = { id = "gone", drawer = "lighten", pos0 = "/one", pos1 = "/two" }
+            local doc = makeDocSettings({
+                partial_md5_checksum = "book",
+                readest_sync = { meta_hash_v1 = "meta" },
+            })
+            SyncAnnotations:recordDeletion(doc, item)
+            local captured
+            SyncAnnotations:push(makeUi(doc, { item }), {}, {
+                pushChanges = function(_, payload) captured = payload end,
+            }, false, true)
+            assert.are.equal(1, #captured.notes)
+            assert.are.equal("gone", captured.notes[1].id)
+            assert.is_truthy(captured.notes[1].deletedAt)
+        end)
+
+        it("keeps deletions recorded while the request is pending", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            SyncAnnotations:recordDeletion(doc_settings, { id = "gone1", page = "/one" })
+            local callback
+            SyncAnnotations:push(makeUi(doc_settings), {}, {
+                pushChanges = function(_, _, cb) callback = cb end,
+            }, false, false)
+            SyncAnnotations:recordDeletion(doc_settings, { id = "gone2", page = "/two" })
+            callback(true, {})
+
+            local deleted = doc_settings:readSetting("readest_sync").deleted_notes
+            assert.are.equal(1, #deleted)
+            assert.are.equal("gone2", deleted[1].id)
+        end)
+
+        it("keeps edits made in the request's starting second eligible for the next push", function()
+            local started = real_time({ year = 2026, month = 9, day = 20, hour = 10, min = 0, sec = 0 })
+            local now = started
+            os.time = function(date) return date and real_time(date) or now end
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = { meta_hash_v1 = "meta-1" },
+            })
+            local item = { id = "note1", page = "/one", note = "before", datetime = "2026-09-20 09:59:00" }
+            local ui = makeUi(doc_settings, { item })
+            local settings = {}
+            local callback
+            SyncAnnotations:push(ui, settings, {
+                pushChanges = function(_, _, cb) callback = cb end,
+            }, false, false)
+            item.note = "edited while pending"
+            item.datetime_updated = "2026-09-20 10:00:00"
+            now = started + 10
+            callback(true, {})
+
+            local notes = SyncAnnotations:getAnnotations(ui, settings, "book-hash-1", "meta-1", false)
+            assert.are.equal(1, #notes)
+            assert.are.equal("edited while pending", notes[1].note)
+            assert.is_true(settings.last_notes_sync_at < started * 1000)
+        end)
+
+        it("keeps tombstones when the push fails so a later push retries", function()
+            local doc_settings = makeDocSettings({
+                partial_md5_checksum = "book-hash-1",
+                readest_sync = {
+                    meta_hash_v1 = "meta-1",
+                    deleted_notes = {
+                        { id = "gone1", type = "annotation", xpointer0 = "/b/1", deletedAt = 111 },
+                    },
+                },
+            })
+            local client = {
+                pushChanges = function(_, _payload, cb) cb(false, nil) end,
+            }
+            SyncAnnotations:push(makeUi(doc_settings), {}, client, false, false)
+
+            local deleted = doc_settings:readSetting("readest_sync").deleted_notes
+            assert.are.equal(1, #deleted)
+            assert.are.equal("gone1", deleted[1].id)
         end)
     end)
 end)

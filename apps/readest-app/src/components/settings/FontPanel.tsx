@@ -25,12 +25,14 @@ import { getSysFontsList } from '@/utils/bridge';
 import { isCJKStr } from '@/utils/lang';
 import { isTauriAppPlatform } from '@/services/environment';
 import { useResetViewSettings } from '@/hooks/useResetSettings';
+import { useKeyDownActions } from '@/hooks/useKeyDownActions';
 import { saveViewSettings } from '@/helpers/settings';
 import { SettingsPanelPanelProp } from './SettingsDialog';
 import { BoxedList, NavigationRow, SettingLabel, SettingsRow } from './primitives';
 import NumberInput from './NumberInput';
 import FontDropdown from './FontDropDown';
 import CustomFonts from './CustomFonts';
+import { Toggle } from '../primitives/toggle';
 
 const genCJKFontsList = (sysFonts: string[]) => {
   return Array.from(new Set([...sysFonts, ...CJK_SERIF_FONTS, ...CJK_SANS_SERIF_FONTS]))
@@ -171,6 +173,19 @@ const FontPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
     setFontPanelView('main-fonts');
   };
 
+  // Android Back / Esc: when the Custom Fonts sub-page is open, intercept
+  // and step back to main-fonts instead of letting <Dialog>'s own listener
+  // close the entire Settings dialog. This works because
+  // `useKeyDownActions` registers its sync `native-key-down` listener
+  // *after* <Dialog>'s, and `dispatchSync` walks listeners LIFO — so when
+  // enabled this hook claims the Back press first and `return true`
+  // consumes it; when disabled (sub-page closed) Back falls through to
+  // <Dialog> and closes the dialog as before.
+  useKeyDownActions({
+    enabled: fontPanelView === 'custom-fonts',
+    onCancel: handleBackToMain,
+  });
+
   useEffect(() => {
     onRegisterReset(handleReset);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -292,12 +307,7 @@ const FontPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
         className='flex cursor-pointer items-center justify-between px-4'
       >
         <SettingLabel>{_('Override Book Font')}</SettingLabel>
-        <input
-          type='checkbox'
-          className='toggle'
-          checked={overrideFont}
-          onChange={() => setOverrideFont(!overrideFont)}
-        />
+        <Toggle checked={overrideFont} onChange={() => setOverrideFont(!overrideFont)} />
       </label>
 
       <BoxedList title={_('Font Size')}>
@@ -330,8 +340,8 @@ const FontPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
         />
       </BoxedList>
 
-      <BoxedList title={_('Font Family')}>
-        <SettingsRow label={_('Default Font')} data-setting-id='settings.font.defaultFont'>
+      <BoxedList title={_('Preferred Font')}>
+        <SettingsRow label={_('Font Category')} data-setting-id='settings.font.defaultFont'>
           <FontDropdown
             options={fontFamilyOptions}
             selected={defaultFont}
@@ -339,7 +349,49 @@ const FontPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
             onGetFontFamily={handleFontFamilyFont}
           />
         </SettingsRow>
-        {(isCJKEnv() || view?.language.isCJK) && (
+        {/* The faces live in one child so the card's divider only separates
+            them from the category above. */}
+        <div>
+          <FontFace
+            family='serif'
+            label={_('Serif Font')}
+            options={[
+              ...customFonts,
+              ...SERIF_FONTS.filter(filterNonFreeFonts),
+              ...CJK_SERIF_FONTS,
+            ]}
+            moreOptions={sysFonts}
+            selected={serifFont}
+            onSelect={setSerifFont}
+            data-setting-id='settings.font.serifFont'
+          />
+          <FontFace
+            family='sans-serif'
+            label={_('Sans-Serif Font')}
+            options={[
+              ...customFonts,
+              ...SANS_SERIF_FONTS.filter(filterNonFreeFonts),
+              ...CJK_SANS_SERIF_FONTS,
+            ]}
+            moreOptions={sysFonts}
+            selected={sansSerifFont}
+            onSelect={setSansSerifFont}
+            data-setting-id='settings.font.sansSerifFont'
+          />
+          <FontFace
+            family='monospace'
+            label={_('Monospace Font')}
+            options={[...customFonts, ...MONOSPACE_FONTS]}
+            moreOptions={sysFonts}
+            selected={monospaceFont}
+            onSelect={setMonospaceFont}
+            data-setting-id='settings.font.monospaceFont'
+          />
+        </div>
+      </BoxedList>
+
+      {(isCJKEnv() || view?.language.isCJK) && (
+        <BoxedList title={_('CJK Font')}>
           <FontFace
             family='serif'
             label={_('CJK Font')}
@@ -348,42 +400,8 @@ const FontPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
             onSelect={setDefaultCJKFont}
             data-setting-id='settings.font.cjkFont'
           />
-        )}
-      </BoxedList>
-
-      <BoxedList title={_('Font Face')}>
-        <FontFace
-          family='serif'
-          label={_('Serif Font')}
-          options={[...customFonts, ...SERIF_FONTS.filter(filterNonFreeFonts), ...CJK_SERIF_FONTS]}
-          moreOptions={sysFonts}
-          selected={serifFont}
-          onSelect={setSerifFont}
-          data-setting-id='settings.font.serifFont'
-        />
-        <FontFace
-          family='sans-serif'
-          label={_('Sans-Serif Font')}
-          options={[
-            ...customFonts,
-            ...SANS_SERIF_FONTS.filter(filterNonFreeFonts),
-            ...CJK_SANS_SERIF_FONTS,
-          ]}
-          moreOptions={sysFonts}
-          selected={sansSerifFont}
-          onSelect={setSansSerifFont}
-          data-setting-id='settings.font.sansSerifFont'
-        />
-        <FontFace
-          family='monospace'
-          label={_('Monospace Font')}
-          options={[...customFonts, ...MONOSPACE_FONTS]}
-          moreOptions={sysFonts}
-          selected={monospaceFont}
-          onSelect={setMonospaceFont}
-          data-setting-id='settings.font.monospaceFont'
-        />
-      </BoxedList>
+        </BoxedList>
+      )}
 
       <BoxedList title={_('Custom Fonts')} data-setting-id='settings.font.fonts'>
         <NavigationRow title={_('Manage Fonts')} onClick={handleManageCustomFonts} />

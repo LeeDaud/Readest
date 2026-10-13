@@ -9,6 +9,11 @@ import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { saveSysSettings } from '@/helpers/settings';
 import { PIN_LENGTH, generatePinSalt, hashPin, isValidPin, verifyPin } from '@/libs/crypto/applock';
+import {
+  defaultBiometricUnlockOnPinSet,
+  getBiometricStatus,
+  isBiometricSupported,
+} from '@/services/biometric';
 import { useAppLockStore } from '@/store/appLockStore';
 import { useSettingsStore } from '@/store/settingsStore';
 
@@ -23,7 +28,7 @@ const fieldLabelClass = 'text-base-content/70 text-xs font-medium tracking-wide'
  */
 export default function AppLockDialog() {
   const _ = useTranslation();
-  const { envConfig } = useEnv();
+  const { envConfig, appService } = useEnv();
   const { settings } = useSettingsStore();
   const {
     pinHash,
@@ -95,6 +100,14 @@ export default function AppLockDialog() {
         await saveSysSettings(envConfig, 'pinCodeSalt', salt);
         await saveSysSettings(envConfig, 'pinCodeHash', hash);
         await saveSysSettings(envConfig, 'pinCodeEnabled', true);
+        if (isBiometricSupported(appService)) {
+          const { available } = await getBiometricStatus();
+          await saveSysSettings(
+            envConfig,
+            'biometricUnlockEnabled',
+            defaultBiometricUnlockOnPinSet({ isMobileApp: !!appService?.isMobileApp, available }),
+          );
+        }
         setStorePin(hash, salt);
         closeDialog();
       } finally {
@@ -162,6 +175,7 @@ export default function AppLockDialog() {
       await saveSysSettings(envConfig, 'pinCodeEnabled', false);
       await saveSysSettings(envConfig, 'pinCodeHash', undefined);
       await saveSysSettings(envConfig, 'pinCodeSalt', undefined);
+      await saveSysSettings(envConfig, 'biometricUnlockEnabled', undefined);
       clearPin();
       closeDialog();
     } finally {
@@ -256,7 +270,7 @@ export default function AppLockDialog() {
                   'h-10 rounded-lg px-4 text-sm font-medium',
                   'text-base-content hover:bg-base-200',
                   'transition-colors duration-150',
-                  'focus-visible:ring-base-content/15 focus-visible:outline-none focus-visible:ring-2',
+                  'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2',
                   'disabled:cursor-not-allowed disabled:opacity-60',
                   'disabled:hover:bg-transparent',
                 )}
@@ -269,7 +283,7 @@ export default function AppLockDialog() {
                 className={clsx(
                   'btn btn-primary',
                   'h-10 min-h-10 rounded-lg border-0 px-5 text-sm font-medium',
-                  'focus-visible:ring-primary/40 focus-visible:outline-none focus-visible:ring-2',
+                  'focus-visible:ring-primary/40 focus-visible:outline-hidden focus-visible:ring-2',
                   busy && 'opacity-60',
                 )}
               >

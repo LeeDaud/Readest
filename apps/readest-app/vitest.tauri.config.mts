@@ -1,3 +1,4 @@
+import path from 'path';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { defineConfig } from 'vitest/config';
 import { webdriverio } from '@vitest/browser-webdriverio';
@@ -12,7 +13,34 @@ export default defineConfig({
     'process.env': JSON.stringify(env),
   },
   resolve: {
+    alias: {
+      // pdfjs-dist itself, not a copy under `public/`: a module the bundler
+      // imports must not be published too, or Tauri embeds it twice (#6368).
+      '@pdfjs': path.resolve(__dirname, '../../packages/foliate-js/node_modules/pdfjs-dist/legacy/build'),
+    },
     conditions: ['development'],
+  },
+  optimizeDeps: {
+    include: [
+      '@supabase/supabase-js',
+      '@tauri-apps/plugin-fs',
+      '@tauri-apps/plugin-http',
+      '@tauri-apps/api/path',
+      '@tauri-apps/api/core',
+      '@zip.js/zip.js',
+      'franc-min',
+      'iso-639-2',
+      'iso-639-3',
+      'js-md5',
+      'jwt-decode',
+      'uuid',
+    ],
+    exclude: [
+      '@pdfjs/pdf.min.mjs',
+      '@readest/turso-database-wasm',
+      '@readest/turso-database-wasm-common',
+      '@readest/turso-database-common',
+    ],
   },
   test: {
     include: ['src/**/*.tauri.test.ts'],

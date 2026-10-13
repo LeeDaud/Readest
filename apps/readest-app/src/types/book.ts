@@ -1,6 +1,10 @@
+import type { InkStroke } from '@/services/handwriting/model';
 import { BookMetadata } from '@/libs/document';
 import { TTSHighlightOptions } from '@/services/tts/types';
+import { TTSHighlightGranularity } from '@/services/tts/types';
 import { TTSMediaMetadataMode } from '@/services/tts/types';
+import { TTSPlayerStyle } from '@/services/tts/types';
+import type { AnnotationLinkType } from '@/utils/deeplink';
 import { AnnotationToolType } from './annotator';
 
 export type BookFormat =
@@ -13,9 +17,16 @@ export type BookFormat =
   | 'FB2'
   | 'FBZ'
   | 'TXT'
-  | 'MD';
-export type BookNoteType = 'bookmark' | 'annotation' | 'excerpt';
-export type ReadingStatus = 'unread' | 'reading' | 'finished';
+  | 'MD'
+  | 'HTML'
+  // Streaming audiobook from an Audiobookshelf server; filePath is abs://<serverId>/<itemId>
+  | 'ABS'
+  // Streaming audiobook from an OPDS catalog; filePath is opdsaudio://<encoded entry> (#6224)
+  | 'OPDSAUDIO'
+  // Streaming audiobook from BookOrbit's audiobook API; filePath is bookorbit://<bookId> (#6224)
+  | 'BOOKORBIT';
+export type BookNoteType = 'bookmark' | 'annotation' | 'excerpt' | 'notebook' | 'ink';
+export type ReadingStatus = 'unread' | 'reading' | 'finished' | 'abandoned';
 export type HighlightStyle = 'highlight' | 'underline' | 'squiggly';
 // Predefined highlight colors, can be extended with custom hex colors
 export type HighlightColor = 'red' | 'yellow' | 'green' | 'blue' | 'violet' | string;
@@ -44,6 +55,18 @@ export const FIXED_LAYOUT_FORMATS: Set<BookFormat> = new Set(['PDF', 'CBZ']);
 export interface BookLookupIndex {
   byHash: Map<string, Book>;
   byMetaKey: Map<string, Book[]>; // key = `${metaHash}:${format}`
+  // Fallback for books whose metaHash moves with every export of the same file
+  // (calibre re-mints dc:identifier, issue #5959). key =
+  // `${getStableMetadataHash(metadata)}:${format}`, and only books that carry a
+  // volatile identifier appear here.
+  byStableKey: Map<string, Book[]>;
+  // Maps normalized absolute source path -> Book for in-place imports.
+  // Lets the importer recognize "I already have this exact file" without
+  // having to open, parse, and hash it again. Only books with a non-empty
+  // `filePath` and `!deletedAt` are indexed. The key is produced by
+  // `normalizeFilePathForIndex` so callers must use the same helper to
+  // probe; importBook handles that internally.
+  byFilePath: Map<string, Book>;
 }
 
 /**
@@ -60,6 +83,15 @@ export interface ImportBookOptions {
   overwrite?: boolean;
   /** Whether the import is transient (not stored long-term). Defaults to false. */
   transient?: boolean;
+  /**
+   * If true, do NOT copy the source file into Books/<hash>/. Instead, persist
+   * an absolute filePath on the Book and let isBookAvailable / loadBookContent
+   * fall back to it. The caller is responsible for verifying the source is
+   * already inside the user's chosen library root (customRootDir) so that the
+   * file remains stable across launches. Sidecar files (cover.png, config.json,
+   * nav.json) are still written to Books/<hash>/ as usual. Defaults to false.
+   */
+  inPlace?: boolean;
   /** Pre-built lookup index for O(1) dedup during batch imports. */
   lookupIndex?: BookLookupIndex;
 }
@@ -69,6 +101,12 @@ export interface Book {
   url?: string;
   // if Book is a transient local book we can load the book content via filePath
   filePath?: string;
+  // Other on-disk paths that resolved to this same book — a watched folder
+  // holding the same file twice under different names, or a copy left behind
+  // after a rename. Only `filePath` is ever read from; these are remembered so
+  // the auto-import scan doesn't treat a known duplicate as a new file on every
+  // pass. Device-local like `filePath`: never published to peers.
+  altFilePaths?: string[];
   // Partial md5 hash of the book file, used as the unique identifier
   hash: string;
   // Metadata md5 hash, used to aggregate different versions of the same book
@@ -80,24 +118,66 @@ export interface Book {
   group?: string; // deprecated in favor of groupId and groupName
   groupId?: string;
   groupName?: string;
+  // Field-level LWW timestamp for group membership (groupId + groupName), so an
+  // unrelated row bump cannot clobber a grouping edit. The row's updatedAt is
+  // stamped by things that have nothing to do with groups -- most notably
+  // `cloudService.uploadBook`, which bumps it on every UPLOAD -- so whole-row
+  // LWW let a peer holding a never-grouped copy win and erase the group for the
+  // whole fleet (#5911). Mirrors readingStatusUpdatedAt / coverUpdatedAt /
+  // metadataUpdatedAt.
+  groupUpdatedAt?: number | null;
   tags?: string[];
   coverImageUrl?: string | null;
+  // Partial MD5 of the local cover.png. Content-addressed cover-change signal:
+  // a peer re-downloads the cover iff its synced value differs from the local
+  // one (issue #4544). Invariant: coverHash === partialMD5(cover.png).
+  coverHash?: string | null;
 
   createdAt: number;
   updatedAt: number;
   deletedAt?: number | null;
+  /**
+   * Positive authorization to delete this book's directory from third-party
+   * file-sync providers. Must equal the current `deletedAt` tombstone; a plain
+   * tombstone hides the library row but preserves provider bytes (#5695).
+   */
+  fileSyncDeletionRequestedAt?: number | null;
 
   uploadedAt?: number | null;
   downloadedAt?: number | null;
   coverDownloadedAt?: number | null;
+  // Field-level LWW timestamp for the cover, so a page-turn that wins whole-row
+  // LWW on updatedAt cannot clobber a cover edit (mirrors readingStatusUpdatedAt).
+  coverUpdatedAt?: number | null;
   syncedAt?: number | null;
 
   lastUpdated?: number; // deprecated in favor of updatedAt
-  progress?: [number, number]; // Add progress field: [current, total], 1-based page number
+  progress?: [number, number] | null; // Add progress field: [current, total], 1-based page number
   readingStatus?: ReadingStatus;
+  readingStatusUpdatedAt?: number; // ms; bumped only when readingStatus changes
   primaryLanguage?: string;
+  // The book carries its own recorded narration (EPUB 3 Media Overlays), so the
+  // library can badge it without opening the file. Derived from the file on
+  // every import, like `format` — not user data, so it needs no LWW timestamp.
+  hasNarration?: boolean;
+  duration?: number; // total audio length in seconds (ABS audiobooks)
+  // Marks this ABS stub as a podcast show or ebook rather than an audiobook.
+  // Audio books remain unmarked (absMediaType undefined).
+  absMediaType?: 'podcast' | 'ebook';
+  // Episode count for an ABS podcast show stub. Drives the library grid's
+  // episode-count badge and lets reconcileAbsBooks detect a new episode as a
+  // change even though title/author/duration are otherwise unchanged.
+  episodeCount?: number;
+  // When this device finished downloading an ABS stub's media for offline use
+  // (audio tracks, or an ebook-only item's file). Device-local like
+  // `downloadedAt`: the files exist only here, so it never syncs.
+  absDownloadedAt?: number | null;
 
   metadata?: BookMetadata;
+  // Field-level LWW timestamp for the metadata group (title, author, tags,
+  // metadata), so a page-turn that wins whole-row LWW on updatedAt cannot
+  // clobber a metadata edit (mirrors readingStatusUpdatedAt / coverUpdatedAt).
+  metadataUpdatedAt?: number | null;
 }
 
 export interface BookGroupType {
@@ -138,6 +218,12 @@ export interface BookNote {
    * bookmarks and excerpts, and for fixed-layout formats (e.g. PDF).
    */
   global?: boolean;
+  /**
+   * Handwriting of an `ink` note: strokes pinned to the content at `cfi` (a
+   * reflowable book) or drawn on the page at `cfi` (fixed layout). See
+   * services/handwriting.
+   */
+  ink?: InkStroke[];
 
   createdAt: number;
   updatedAt: number;
@@ -165,9 +251,19 @@ export interface BookLayout {
   compactMarginRightPx: number;
   compactMarginPx?: number; // deprecated
   gapPercent: number;
+  /* Centre gap of a two-column spread in px; 0 derives it from the margins
+     and gapPercent as before. */
+  columnGapPx: number;
   scrolled: boolean;
+  scrolledDirection: 'vertical' | 'horizontal';
+  webtoonMode: boolean;
+  /* Fixed-layout only: freeze the horizontal pan offset of a zoomed page so it
+     can't drift sideways out of alignment while scrolling (#5976). */
+  lockHorizontalPan: boolean;
   noContinuousScroll: boolean;
   disableClick: boolean;
+  disableSwipe: boolean;
+  disablePullDownToBookmark: boolean;
   fullscreenClickArea: boolean;
   swapClickArea: boolean;
   disableDoubleClick: boolean;
@@ -181,6 +277,12 @@ export interface BookLayout {
   scrollingOverlap: number;
   allowScript: boolean;
   hideScrollbar: boolean;
+  /* Auto Scroll (#4998) speed as a percentage; 100 = AUTO_SCROLL_BASE_PX_PER_SEC. */
+  autoScrollSpeed: number;
+  /* True when a session was still running as the book was closed, so reopening
+     the book resumes it (#5631). Per book: written with the global write
+     skipped, and cleared by any explicit stop. */
+  autoScrollRunning: boolean;
 }
 
 export interface BookStyle {
@@ -199,6 +301,12 @@ export interface BookStyle {
   highlightOpacity: number;
   codeHighlighting: boolean;
   codeLanguage: string;
+  dialogueHighlight: boolean;
+  dialogueHighlightCustomColor: boolean;
+  dialogueHighlightColor: string;
+  dialogueHighlightCustomTextColor: boolean;
+  dialogueHighlightTextColor: string;
+  dialogueHighlightItalic: boolean;
   userStylesheet: string;
   userUIStylesheet: string;
 
@@ -213,6 +321,7 @@ export interface BookStyle {
   keepCoverSpread: boolean;
   invertImgColorInDark: boolean;
   applyThemeToPDF: boolean;
+  contrast: number;
 }
 
 export interface BookFont {
@@ -242,7 +351,9 @@ export interface BookLanguage {
   convertChineseVariant: ConvertChineseVariant;
 }
 
-export type ProgressBarMode = 'remaining' | 'progress' | 'battery' | 'time' | 'all' | 'none';
+// 'push' slides the whole strip; 'slide' and 'curl' layer the outgoing page
+// over the still incoming page (Apple Books style, needs View Transitions).
+export type PageTurnStyle = 'push' | 'slide' | 'curl';
 export interface ViewConfig {
   sideBarTab: string;
   uiLanguage: string;
@@ -256,18 +367,42 @@ export interface ViewConfig {
   showRemainingTime: boolean;
   showRemainingPages: boolean;
   showProgressInfo: boolean;
+  showStickyProgressBar: boolean;
   showCurrentTime: boolean;
   use24HourClock: boolean;
   showCurrentBatteryStatus: boolean;
   showBatteryPercentage: boolean;
-  tapToToggleFooter: boolean;
   showPaginationButtons: boolean;
-  progressStyle: 'percentage' | 'fraction';
-  progressInfoMode: ProgressBarMode;
+  progressStyle: 'percentage' | 'fraction' | 'reference';
+  referencePageCount: number;
+
+  // Styling for the header (section title) and footer (progress readout,
+  // remaining time/pages, clock, battery). See utils/headerFooterStyle.ts
+  // for how these resolve; e-ink ignores both colors.
+  /** Font size in px for the header/footer info text. */
+  headerFooterFontSize: number;
+  /** `''` follows the theme's base-content; otherwise a `#rrggbb`. */
+  headerFooterTextColor: string;
+  /**
+   * `'auto'` keeps the built-in backdrop (the scrolled-mode footer pill and
+   * nothing behind the header), `'none'` removes it everywhere, and a
+   * `#rrggbb` paints a matching chip behind both header and footer in every
+   * flow mode.
+   */
+  headerFooterBackground: string;
+  /** 0-1 alpha applied to a `#rrggbb` headerFooterBackground. */
+  headerFooterBgOpacity: number;
 
   animated: boolean;
+  pageTurnStyle: PageTurnStyle;
   isEink: boolean;
   isColorEink: boolean;
+  /**
+   * Number of page turns between automatic deep full refreshes in e-ink mode.
+   * 0 disables it. Manual refresh bindings are unusable on readers with no
+   * spare buttons, so this clears accumulated ghosting on its own.
+   */
+  einkAutoRefreshInterval: number;
 
   paragraphMode: ParagraphModeConfig;
 
@@ -280,42 +415,101 @@ export interface ViewConfig {
 
 export interface TTSConfig {
   ttsRate: number;
+  ttsSentenceGap: number;
+  ttsParagraphGap: number;
   ttsVoice: string;
+  // Prefer the book's own recorded narration (EPUB 3 Media Overlays) over
+  // synthesized speech. Defaults on, so a read-along book is read by its
+  // narrator; picking a synthetic voice while that book is open clears it.
+  // Distinct from ttsVoice because ttsVoice inherits the global default and so
+  // cannot tell "never chose" from "chose a synthetic voice for this book".
+  ttsUseNarration: boolean;
   ttsLocation: string;
-  showTTSBar: boolean;
   ttsHighlightOptions: TTSHighlightOptions;
+  ttsHighlightGranularity: TTSHighlightGranularity;
   ttsMediaMetadata: TTSMediaMetadataMode;
+  ttsPlayerStyle: TTSPlayerStyle;
+  ttsSkipInlineAnnotations: boolean;
+  // Sentence-by-sentence Read Aloud: pause after every sentence (#5233).
+  ttsPauseAfterSentence: boolean;
 }
 
 export interface TranslatorConfig {
+  translateSourceLang?: string;
   translationEnabled: boolean;
   translationProvider: string;
+  /** Prompt library entry for LLM translators; `'default'` or a prompt id. */
+  translationPromptId?: string;
   translateTargetLang: string;
   showTranslateSource: boolean;
   ttsReadAloudText: string;
+  /** Translated text font: '' follows the book, else the reader's serif/sans/mono font. */
+  translationFont: TranslationFont;
+  translationFontStyle: TranslationFontStyle;
+  /** Translated text size relative to the paragraph, in em. */
+  translationFontSize: number;
+  /** Translated text color as a hex string; '' follows the book. */
+  translationColor: string;
 }
+
+export type TranslationFont = '' | 'serif' | 'sans-serif' | 'monospace';
+export type TranslationFontStyle = 'normal' | 'italic' | 'bold' | 'bold-italic';
+
+// Markdown and plain text render the note template; JSON emits the
+// machine-readable file that Readest itself can import back (#5400).
+export type NoteExportFormat = 'markdown' | 'text' | 'json';
 
 export interface NoteExportConfig {
   includeTitle: boolean;
   includeAuthor: boolean;
   includeDate: boolean;
+  // Include a public cover image link; requires publishing the cover to the
+  // public bucket (sign-in) unless the book already has a public cover URL.
+  includeCoverImage: boolean;
   includeChapterTitles: boolean;
   includeQuotes: boolean;
+  // The sentence around each highlight, read from the book at export time.
+  includeContext: boolean;
   includeNotes: boolean;
   includePageNumber: boolean;
   includeTimestamp: boolean;
   includeChapterSeparator: boolean;
+  linkType: AnnotationLinkType;
   noteSeparator: string;
   useCustomTemplate: boolean;
   customTemplate: string;
+  // Superseded by `exportFormat`; kept so configs written before the JSON
+  // option existed still pick the right format on load.
   exportAsPlainText: boolean;
+  exportFormat: NoteExportFormat;
+  // Highlight colors/styles to omit from the export. Empty arrays export
+  // everything; storing exclusions keeps colors/styles added later included
+  // by default (#4801).
+  excludedColors: HighlightColor[];
+  excludedStyles: HighlightStyle[];
 }
 
 export interface AnnotatorConfig {
   enableAnnotationQuickActions: boolean;
   annotationQuickAction: AnnotationToolType | null;
+  // Hand the word back selected, with the toolbar, when an instant dictionary
+  // lookup closes (#6213). Off: closing it returns straight to reading (#6454).
+  keepSelectionAfterLookup: boolean;
+  annotationToolbarItems: AnnotationToolType[];
   copyToNotebook: boolean;
   noteExportConfig: NoteExportConfig;
+}
+
+export interface WordLensConfig {
+  wordLensEnabled: boolean;
+  /** Difficulty slider, 1 (fewest hints) .. 5 (most hints). */
+  wordLensLevel: number;
+  /** Hint (target) language; '' = auto (app UI language). */
+  wordLensHintLang: string;
+  /** Gloss (<rt>) font size relative to the word, in em (default 0.5). */
+  wordLensGlossFontSize: number;
+  /** Gloss (<rt>) color as a hex string; '' = default (muted, theme-adaptive). */
+  wordLensGlossColor: string;
 }
 
 export interface ScreenConfig {
@@ -337,6 +531,13 @@ export interface ProofreadRule {
   wholeWord?: boolean; // Match whole words only (uses \b word boundaries)
   caseSensitive?: boolean; // Case-sensitive matching (default true)
   onlyForTTS?: boolean; // Only replace text for TTS, not in the book display (only for book/library scope)
+  // CRDT sync fields (book/selection scope rides the book-config sync). `updatedAt`
+  // is the last-write-wins key for the per-id merge; `deletedAt` is a tombstone so a
+  // deletion survives the merge instead of being resurrected by the peer's copy.
+  // Library-scope rules sync via the settings replica (whole-field LWW) and don't
+  // need a tombstone, so these stay optional for back-compat with older configs.
+  updatedAt?: number;
+  deletedAt?: number | null;
 }
 
 export interface ProofreadRulesConfig {
@@ -358,6 +559,7 @@ export interface ViewSettings
     ScreenConfig,
     ProofreadRulesConfig,
     AnnotatorConfig,
+    WordLensConfig,
     ViewSettingsConfig {}
 
 export interface BookProgress {
@@ -366,17 +568,27 @@ export interface BookProgress {
   sectionLabel: string;
   section: PageInfo;
   pageinfo: PageInfo;
+  pageItem?: { label?: string; href?: string } | null;
   timeinfo: TimeInfo;
+  // Overall reading position in foliate's size-domain (0..1), matching the
+  // domain used by the sticky progress bar's chapter ticks.
+  fraction: number;
   index: number;
   range: Range;
   page: number;
 }
 
+export type SearchMode = 'contains' | 'whole-words' | 'regex' | 'nearby-words';
+
 export interface BookSearchConfig {
   scope: 'book' | 'section';
+  mode: SearchMode;
   matchCase: boolean;
-  matchWholeWords: boolean;
   matchDiacritics: boolean;
+  // nearby-words: maximum number of words separating the matched words
+  nearbyWords?: number;
+  /** @deprecated since schema v3 — mirrors `mode === 'whole-words'`; kept for sync wire back-compat. */
+  matchWholeWords?: boolean;
   index?: number;
   query?: string;
   acceptNode?: (node: Node) => number;
@@ -385,15 +597,47 @@ export interface BookSearchConfig {
   results?: BookSearchResult[] | BookSearchMatch[] | null;
 }
 
+export type LibrarySearchConfig = Omit<BookSearchConfig, 'mode'> & {
+  mode: SearchMode | 'fuzzy';
+};
+
+export type LibrarySearchTarget = 'books' | 'text';
+
 export interface SearchExcerpt {
   pre: string;
   match: string;
   post: string;
+  // nearby-words: the cluster window split into matched (emphasized) words and gaps
+  segments?: { text: string; emphasized: boolean }[];
 }
 
 export interface BookSearchMatch {
   cfi: string;
+  // nearby-words: per-word CFIs to highlight (>= 2); absent for single-span matches
+  cfis?: string[];
   excerpt: SearchExcerpt;
+}
+
+// Text-offset locator into a section's extracted text. Library search results
+// carry locators instead of CFIs; the CFI is resolved lazily on click so
+// searching never needs live DOM Ranges (see librarySearchService).
+export interface SearchResultLocator {
+  section: number;
+  start: number;
+  end: number;
+  // fuzzy/nearby: matched sub-spans within [start, end)
+  runs?: { start: number; end: number }[];
+}
+
+export interface LibrarySearchMatch {
+  locator: SearchResultLocator;
+  excerpt: SearchExcerpt;
+}
+
+export interface LibrarySearchSectionResult {
+  index: number;
+  label: string;
+  subitems: LibrarySearchMatch[];
 }
 
 export interface BookSearchResult {
@@ -403,7 +647,26 @@ export interface BookSearchResult {
   progress?: number;
 }
 
-export const BOOK_CONFIG_SCHEMA_VERSION = 1;
+export const BOOK_CONFIG_SCHEMA_VERSION = 3;
+
+/**
+ * The Hardcover book this file syncs to. Set explicitly from the book menu
+ * ("Link Book") or recorded from the first successful automatic match; once
+ * present it bypasses ISBN and title matching entirely (#5846). Device-local:
+ * the cloud config push only carries the columns in `transformBookConfigToDB`.
+ */
+export interface HardcoverBookLink {
+  bookId: number;
+  /** Display only — lets the menu show the linked book without a request. */
+  title: string;
+}
+
+/** The Pagebound book this file syncs to; device-local like `hardcover`. */
+export interface PageboundBookLink {
+  bookId: number;
+  uuid: string;
+  title: string;
+}
 
 export interface BookConfig {
   schemaVersion?: number;
@@ -416,6 +679,29 @@ export interface BookConfig {
   rsvpPosition?: { cfi: string; wordText: string };
   searchConfig?: Partial<BookSearchConfig>;
   viewSettings?: Partial<ViewSettings>;
+  /**
+   * A device-local recording paired with this ebook. The audio files live
+   * under Books/<hash>/audiobook/, or stream from an Audiobookshelf server
+   * (see PairedAudiobook.source); either way the pairing is deliberately
+   * excluded from cloud sync, and ordinary reading progress remains the
+   * shared cross-device state.
+   */
+  audiobook?: PairedAudiobook;
+  hardcover?: HardcoverBookLink;
+  pagebound?: PageboundBookLink;
+  /**
+   * The pages of a comic laid out as spreads of their own (wide images), by
+   * page path: a device-local cache of measuring them, so a later open skips
+   * it and a streamed comic keeps what earlier reading found. Neither sync
+   * carries it; both copy an explicit list of fields.
+   */
+  widePages?: string[];
+  /**
+   * Where a zoomed fixed-layout page was panned under the horizontal pan lock,
+   * as a fraction of its horizontal overflow, restored on reopen. Device-local
+   * like widePages: it depends on this screen's zoom and size.
+   */
+  panX?: number;
 
   lastSyncedAtConfig?: number;
   lastSyncedAtNotes?: number;
@@ -426,6 +712,73 @@ export interface BookConfig {
   updatedAt: number;
 }
 
+export interface AudiobookFile {
+  id: string;
+  name: string;
+  path: string;
+  duration: number;
+}
+
+export interface AudiobookChapter {
+  id: string;
+  fileId: string;
+  label: string;
+  start: number;
+  end: number;
+}
+
+export interface AudiobookChapterMapping {
+  ebookChapterId: string;
+  audioChapterId: string;
+}
+
+/**
+ * An audiobook streamed from an Audiobookshelf server instead of copied to
+ * the device. The pairing then has a single virtual file
+ * (`abs://<serverId>/<itemId>`) whose chapters are timed on the item's global
+ * timeline, and the track list here maps that timeline onto the server's
+ * media files; nothing under Books/<hash>/audiobook/ exists for it.
+ */
+export interface PairedAudiobookAbsSource {
+  kind: 'audiobookshelf';
+  serverId: string;
+  itemId: string;
+  tracks: {
+    index: number;
+    startOffset: number; // global seconds
+    duration: number; // seconds
+    contentUrl: string; // server-relative
+  }[];
+}
+
+/**
+ * An audiobook streamed from a BookOrbit server. One BookOrbit book owns both
+ * the ebook and the audio, so the pairing needs only that book's id; the
+ * virtual file is `bookorbit://<bookId>` and the tracks map its global
+ * timeline onto the server's assets, exactly as the ABS variant does.
+ */
+export interface PairedAudiobookBookOrbitSource {
+  kind: 'bookorbit';
+  bookId: number;
+  tracks: {
+    index: number;
+    startOffset: number; // global seconds
+    duration: number; // seconds
+    contentUrl: string; // server-relative
+  }[];
+}
+
+export interface PairedAudiobook {
+  version: 1;
+  title?: string;
+  narrator?: string;
+  files: AudiobookFile[];
+  chapters: AudiobookChapter[];
+  mappings: AudiobookChapterMapping[];
+  createdAt: number;
+  source?: PairedAudiobookAbsSource | PairedAudiobookBookOrbitSource;
+}
+
 export interface BookDataRecord {
   id: string;
   book_hash: string;
@@ -433,12 +786,30 @@ export interface BookDataRecord {
   user_id: string;
   updated_at: number | null;
   deleted_at: number | null;
+  // Server-assigned incremental-pull cursor, decoupled from updated_at (the
+  // client event time / sort key). Present on books rows from a server that
+  // ran migration 016; absent (fall back to updated_at) on older servers and
+  // on config/note records. Carried over the wire as an ISO-8601 string.
+  // See issue #4678.
+  synced_at?: string | null;
+  // Only book records carry an upload state: a book is indexed in the cloud
+  // as soon as its metadata syncs, but is unavailable to peers until its file
+  // blob is uploaded. Absent on config/note records.
+  uploaded_at?: string | null;
 }
 
 export interface BooksGroup {
   id: string;
   name: string;
   displayName: string;
+  /**
+   * True when `displayName` is an i18n key rather than user-authored text, so
+   * the rendering component must run it through `_()`. Set for groupings whose
+   * values are enums we own (reading status); never set for series, author,
+   * tag or subject names, which must render verbatim even when one of them
+   * happens to collide with a UI string.
+   */
+  localized?: boolean;
   books: Book[];
 
   updatedAt: number;

@@ -1,8 +1,13 @@
+import type { InkTool } from '@/services/handwriting/model';
+import type { BookshelfState } from './bookshelf';
 import { CustomTheme } from '@/styles/themes';
 import { CustomFont } from '@/styles/fonts';
 import { CustomTexture } from '@/styles/textures';
 import { HighlightColor, HighlightStyle, UserHighlightColor, ViewSettings } from './book';
 import { OPDSCatalog } from './opds';
+import { WebSource } from './webSource';
+import { ABSServer } from './audiobookshelf';
+import type { CustomTranslator, TranslationPrompt } from './translation';
 import type { AISettings } from '@/services/ai/types';
 import type { NotebookTab } from '@/store/notebookStore';
 import type { DictionarySettings, ImportedDictionary } from '@/services/dictionaries/types';
@@ -18,9 +23,20 @@ export const LibrarySortByType = {
   Size: 'size',
   Format: 'format',
   Published: 'published',
+  Progress: 'progress',
+  TimeRemaining: 'timeRemaining',
 } as const;
 
 export type LibrarySortByType = (typeof LibrarySortByType)[keyof typeof LibrarySortByType];
+
+/**
+ * Secondary sort key. Same options as the primary sort key plus `'none'` which
+ * disables the secondary sort. When set to `'none'` and a smart default applies
+ * (e.g. groupBy=Author -> series), the resolver in `libraryUtils` substitutes
+ * the implicit default at sort time without persisting it. See
+ * `resolveEffectiveSecondarySort`.
+ */
+export type LibrarySecondarySortByType = LibrarySortByType | 'none';
 
 export type LibraryCoverFitType = 'crop' | 'fit';
 
@@ -29,6 +45,9 @@ export const LibraryGroupByType = {
   Group: 'group',
   Series: 'series',
   Author: 'author',
+  Tag: 'tag',
+  Subject: 'subject',
+  Status: 'status',
 } as const;
 
 export type LibraryGroupByType = (typeof LibraryGroupByType)[keyof typeof LibraryGroupByType];
@@ -42,9 +61,14 @@ export interface ReadSettings {
   notebookWidth: string;
   isNotebookPinned: boolean;
   notebookActiveTab: NotebookTab;
-  autohideCursor: boolean;
   translationProvider: string;
   translateTargetLang: string;
+  /**
+   * Global Word Lens toggle: auto-download a gloss pack on demand when the
+   * pair isn't cached locally. When off, the reader never fetches packs
+   * silently; users download them explicitly from the Word Lens sub-page.
+   */
+  wordLensAutoDownload: boolean;
   highlightStyle: HighlightStyle;
   highlightStyles: Record<HighlightStyle, HighlightColor>;
 
@@ -53,6 +77,14 @@ export interface ReadSettings {
   defaultHighlightLabels: Partial<Record<HighlightColor, string>>;
   customTtsHighlightColors: string[];
   customThemes: CustomTheme[];
+
+  /** Ink color and pen width for the handwriting tool, remembered per install. */
+  handwritingColor: string;
+  handwritingWidth: number;
+  /** The drawing tool last used, and the marker's own color and width. */
+  handwritingTool: InkTool;
+  handwritingMarkerColor: string;
+  handwritingMarkerWidth: number;
 }
 
 export interface KOSyncSettings {
@@ -65,12 +97,53 @@ export interface KOSyncSettings {
   deviceName: string;
   checksumMethod: KOSyncChecksumMethod;
   strategy: KOSyncStrategy;
+  customHeaders?: Record<string, string>;
+  /**
+   * Include the book's filename, title and authors in progress uploads, in the
+   * optional `metadata` field KOReader 2026.05+ sends when "Send document
+   * metadata" is enabled. The official sync server ignores it; custom
+   * KOSync-compatible servers may use it to identify what is being read.
+   * Off by default, matching KOReader.
+   */
+  sendMetadata?: boolean;
+}
+
+export interface BookOrbitSettings {
+  enabled: boolean;
+  /** Base server origin, e.g. https://books.example.com (no /api/v1/koreader suffix). */
+  serverUrl: string;
+  username: string;
+  userkey: string;
+  password?: string;
+  deviceId: string;
+  deviceName: string;
+  strategy: KOSyncStrategy;
+  syncProgress: boolean;
+  /** Annotations and bookmarks. */
+  syncNotes: boolean;
+  syncStats: boolean;
+  syncBookStates: boolean;
+  customHeaders?: Record<string, string>;
+  /**
+   * Manual-sync opt-out (#6029). BookOrbit records a reading log entry per
+   * push, so a few hours of reading buries the real sessions under
+   * debounce-sized updates. With this off nothing is pushed until the user
+   * asks; pulls stay automatic (they add nothing server-side and are what
+   * keeps a second device in step). Default ON — settings written before this
+   * option existed keep the automatic pushes they already had.
+   */
+  autoSync?: boolean;
 }
 
 export interface ReadwiseSettings {
   enabled: boolean;
   accessToken: string;
   lastSyncedAt: number;
+  /**
+   * Send the book cover with pushed highlights (image_url). Optional so
+   * settings persisted before this option existed default to enabled.
+   */
+  includeCoverImage?: boolean;
   /**
    * Advanced: override the Readwise API base URL (e.g. for a self-hosted,
    * Readwise-compatible receiver). When unset or blank, the official
@@ -81,9 +154,51 @@ export interface ReadwiseSettings {
 
 export interface HardcoverSettings {
   enabled: boolean;
+  /** Pasted API token; empty when signed in with OAuth. */
   accessToken: string;
+  /** Device-local OAuth session; not synced (short-lived, refresh token rotates). */
+  oauth?: { accessToken: string; refreshToken?: string; expiresAt: number };
   lastSyncedAt: number;
+  // When true, progress + notes are pushed to Hardcover automatically as the
+  // user reads (debounced) instead of only via the reader menu. Default OFF;
+  // existing connected users (undefined) stay manual until they opt in.
+  autoSync?: boolean;
 }
+
+export interface PageboundSettings {
+  enabled: boolean;
+  /** Display only: the account the session belongs to. */
+  email: string;
+  /** Firebase refresh token; Pagebound has no API tokens or OAuth. */
+  refreshToken: string;
+  /** Pagebound's own API token, exchanged from a Firebase id token. */
+  apiToken: string;
+  lastSyncedAt: number;
+  autoSync?: boolean;
+}
+
+export interface NotionSettings {
+  enabled: boolean;
+  /** Notion integration token (`secret_...`). */
+  accessToken: string;
+  /**
+   * Target Notion data source id. The connection form also accepts a database
+   * container or a page containing a child database and resolves it before
+   * persisting settings.
+   */
+  databaseId: string;
+  lastSyncedAt: number;
+  /** Append a chapter heading block before each highlight (default ON). */
+  includeChapterHeading?: boolean;
+}
+
+/**
+ * Sort field for the WebDAV browser listing. 'name' reproduces the
+ * legacy directories-first/alphabetical default; the date fields drive
+ * the "pull up recent books" use case ('created' relies on the server
+ * reporting `<creationdate>`, which not all do). 'size' orders files.
+ */
+export type WebDAVBrowseSortByType = 'name' | 'modified' | 'created' | 'size';
 
 export interface WebDAVSettings {
   enabled: boolean;
@@ -91,6 +206,11 @@ export interface WebDAVSettings {
   username: string;
   password: string;
   rootPath: string;
+  // Browser sort preference, persisted so a chosen "recent first" order
+  // survives across sessions. Both optional: absent => name/ascending,
+  // matching the pre-feature default (no migration needed).
+  browseSortBy?: WebDAVBrowseSortByType;
+  browseSortAscending?: boolean;
   // Sync sub-toggles. WebDAV sync runs as a parallel channel alongside the
   // native cloud sync, KOSync, Readwise, and Hardcover; each sub-toggle
   // gates a category independently so a user can e.g. mirror progress to
@@ -98,6 +218,10 @@ export interface WebDAVSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  // When true, "Sync now" re-checks every book instead of only those whose
+  // local copy differs from the shared library.json index (the default
+  // incremental walk). An escape hatch for drift or a first full sync.
+  fullSync?: boolean;
   // Conflict policy — same vocabulary as KOSync so users only learn one.
   strategy?: KOSyncStrategy;
   // Stable per-device id (uuidv4); written into library.json so we can tell
@@ -106,99 +230,130 @@ export interface WebDAVSettings {
   // Wall-clock millisecond timestamp of the last successful end-to-end
   // sync, surfaced in the WebDAV settings sub-page.
   lastSyncedAt?: number;
-  // Diagnostic ring buffer: most recent ten "Sync now" runs, oldest first
-  // dropped when full. Persisted alongside the rest of settings so users
-  // can screenshot a failure breakdown when reporting issues. We keep the
-  // cap small both for storage hygiene and because debugging beyond ten
-  // back is rarely useful — by then the live state has long moved on.
-  syncLog?: WebDAVSyncLogEntry[];
+  // Device-local wall-clock millis of when this provider was made the
+  // selected cloud sync backend on THIS device. Anchors the mixed-fleet
+  // detection probe: any native /api/sync row newer than this means
+  // another device is still writing the gated channels.
+  providerSelectedAt?: number;
 }
 
 /**
- * Outcome category for one entry in {@link WebDAVSettings.syncLog}. We
- * keep this coarse on purpose — it drives the colour of the status pill
- * in the history panel and nothing else. Per-step counters travel in the
- * same entry for users who want detail.
- *
- * - `success`: ran to completion with `failures === 0` and at least one
- *   meaningful action (download/upload). "Up to date" runs (no work) also
- *   land here.
- * - `partial`: ran to completion but `failures > 0`. At least one book
- *   may need a re-sync to fully converge.
- * - `failure`: did not finish. Either a top-level error (auth failed,
- *   network down before any work) or every book failed.
+ * Google Drive file-sync settings. A second file-sync backend alongside
+ * {@link WebDAVSettings}, sharing the same engine, sub-toggles, and strategy
+ * vocabulary. Drive has no URL / credentials / root path (it is OAuth + a
+ * fixed `/Readest` namespace under the `drive.file` scope), and no BYO client.
+ * The OAuth token is NOT stored here — it lives in the OS keychain. `deviceId`
+ * and `lastSyncedAt` are device-local (excluded from cross-device restore).
  */
-export type WebDAVSyncLogStatus = 'success' | 'partial' | 'failure';
-
-export interface WebDAVSyncLogFailure {
-  /** Stable identifier for the book — used as React key, never displayed. */
-  hash: string;
-  /** Human-readable book title at the time of the failed attempt. */
-  title: string;
-  /**
-   * Short, single-line failure description. We deliberately strip stacks
-   * and long server XML; users want "auth failed" / "404", not a wall of
-   * text. Truncate to ~200 chars at write time so the persisted log
-   * doesn't bloat settings.json.
-   */
-  reason: string;
+export interface GoogleDriveSettings {
+  enabled: boolean;
+  /** Connected account's email (or display name), shown in the settings UI. */
+  accountLabel?: string;
+  syncProgress?: boolean;
+  syncNotes?: boolean;
+  syncBooks?: boolean;
+  fullSync?: boolean;
+  strategy?: KOSyncStrategy;
+  deviceId?: string;
+  lastSyncedAt?: number;
+  /** See {@link WebDAVSettings.providerSelectedAt}. */
+  providerSelectedAt?: number;
 }
 
-export interface WebDAVSyncLogEntry {
-  /** UUIDv4. Used as React list key and for "expand details" toggling. */
-  id: string;
-  /** Wall-clock ms when handleSyncNow began. */
-  startedAt: number;
-  /** Wall-clock ms when the run finished or aborted. */
-  finishedAt: number;
-  status: WebDAVSyncLogStatus;
-  /**
-   * What kind of run this entry records. Defaults to 'sync' when
-   * absent so log entries persisted before this field was introduced
-   * keep rendering the same way they always did. 'cleanup' is set
-   * for entries written by the WebDAV browser's batch
-   * Delete-from-server action; renderers use this to swap the badge
-   * label and pick a cleanup-specific summary line.
-   */
-  kind?: 'sync' | 'cleanup';
-  /**
-   * What kicked off this run. v1 only writes 'manual' (the Sync now
-   * button is the only entry point). The reader-hook auto-pushes are
-   * intentionally NOT logged: they fire once per page-turn and would
-   * drown out the manual-run signal users care about.
-   */
-  trigger: 'manual' | 'auto';
-  /** Counters mirroring `SyncLibraryResult` — directly screenshot-friendly. */
-  totalBooks: number;
-  booksDownloaded: number;
-  filesUploaded: number;
-  filesAlreadyInSync: number;
-  configsUploaded: number;
-  configsDownloaded: number;
-  coversUploaded: number;
-  /**
-   * Number of per-hash directories successfully removed from the
-   * server in a cleanup run. Only meaningful when `kind === 'cleanup'`;
-   * sync entries leave this undefined / zero. Kept optional to avoid
-   * a migration step on existing settings.json files.
-   */
-  booksDeleted?: number;
-  failures: number;
-  /** The same one-liner shown in the toast. Kept for at-a-glance reading. */
-  summary: string;
-  /**
-   * Top-level error message when the run aborted before processing
-   * books (auth, root not reachable, connectivity). Mutually exclusive
-   * with `failedBooks` in practice — a top-level abort means we never
-   * iterated, so per-book failures don't apply.
-   */
-  errorMessage?: string;
-  /** Per-book failure breakdown when `failures > 0`. */
-  failedBooks?: WebDAVSyncLogFailure[];
+/**
+ * S3-compatible object-store file-sync settings — the third file-sync
+ * backend alongside {@link WebDAVSettings} and {@link GoogleDriveSettings},
+ * sharing the same engine, sub-toggles, and strategy vocabulary. Covers any
+ * SigV4 endpoint: Cloudflare R2, AWS S3, MinIO, Backblaze B2. Addressing is
+ * path-style (`<endpoint>/<bucket>/<key>`). Credentials live here like
+ * WebDAV's (same encrypted cross-device credential-sync semantics).
+ */
+export interface S3Settings {
+  enabled: boolean;
+  /** Service endpoint origin, e.g. `https://<account-id>.r2.cloudflarestorage.com`. */
+  endpoint: string;
+  /** SigV4 region; 'auto' works for R2/MinIO, AWS wants the bucket region. */
+  region?: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  syncProgress?: boolean;
+  syncNotes?: boolean;
+  syncBooks?: boolean;
+  fullSync?: boolean;
+  strategy?: KOSyncStrategy;
+  deviceId?: string;
+  lastSyncedAt?: number;
+  /** See {@link WebDAVSettings.providerSelectedAt}. */
+  providerSelectedAt?: number;
 }
 
-/** Maximum entries retained in {@link WebDAVSettings.syncLog}. */
-export const WEBDAV_SYNC_LOG_LIMIT = 10;
+/**
+ * Microsoft OneDrive file-sync settings. An OAuth-based file-sync backend
+ * alongside {@link GoogleDriveSettings}, storing data in the Graph App Folder
+ * (approot). No URL / credentials / root path and no BYO client; the OAuth
+ * token lives in the OS keychain (native) or sessionStorage (web), never here.
+ * `deviceId`/`lastSyncedAt`/`providerSelectedAt` are device-local.
+ */
+export interface OneDriveSettings {
+  enabled: boolean;
+  /** Connected account's userPrincipalName/email, shown in the settings UI. */
+  accountLabel?: string;
+  syncProgress?: boolean;
+  syncNotes?: boolean;
+  syncBooks?: boolean;
+  fullSync?: boolean;
+  strategy?: KOSyncStrategy;
+  deviceId?: string;
+  lastSyncedAt?: number;
+  /** See {@link WebDAVSettings.providerSelectedAt}. */
+  providerSelectedAt?: number;
+}
+
+/**
+ * iCloud Drive file-sync settings. Available only in the iOS/macOS Tauri
+ * apps: the backend is the app's ubiquity container, synced by the OS. No
+ * credentials and no OAuth — the device's iCloud session is the account.
+ * `deviceId`/`lastSyncedAt`/`providerSelectedAt` are device-local.
+ */
+export interface ICloudSettings {
+  enabled: boolean;
+  syncProgress?: boolean;
+  syncNotes?: boolean;
+  syncBooks?: boolean;
+  fullSync?: boolean;
+  strategy?: KOSyncStrategy;
+  deviceId?: string;
+  lastSyncedAt?: number;
+  /** See {@link WebDAVSettings.providerSelectedAt}. */
+  providerSelectedAt?: number;
+}
+
+/**
+ * Readest Cloud's own library-sync switch. Readest Cloud used to be the
+ * derived fallback — "on" whenever no third-party provider was enabled —
+ * because exactly one provider could own the library channels. Providers are
+ * now independently selectable (#5062), so Readest Cloud needs a flag of its
+ * own.
+ *
+ * `enabled` is DELIBERATELY optional with no default (this slice must never
+ * enter `DEFAULT_SYSTEM_SETTINGS`): an absent value falls back to the old
+ * derivation, so upgrading users keep exactly the behaviour they had and no
+ * migration has to rewrite anyone's settings. It is written only once the user
+ * touches a Cloud Sync checkbox.
+ *
+ * Device-local, like the other providers' `enabled` flags.
+ */
+export interface ReadestCloudSettings {
+  enabled?: boolean;
+  /**
+   * Device-local wall-clock millis of when this device turned Readest Cloud
+   * off. Anchors the mixed-fleet probe: a native /api/sync row newer than this
+   * means another device is still writing the channels this one stopped
+   * writing. Excluded from cross-device restore.
+   */
+  disabledAt?: number;
+}
 
 /**
  * User-facing sync categories. 'progress' gates the existing book-config
@@ -217,8 +372,11 @@ export type SyncCategory =
   | 'font'
   | 'texture'
   | 'opds_catalog'
+  | 'abs_server'
+  | 'custom_translator'
   | 'settings'
-  | 'credentials';
+  | 'credentials'
+  | 'stats';
 
 export const SYNC_CATEGORIES: readonly SyncCategory[] = [
   'book',
@@ -228,7 +386,10 @@ export const SYNC_CATEGORIES: readonly SyncCategory[] = [
   'font',
   'texture',
   'opds_catalog',
+  'abs_server',
+  'custom_translator',
   'settings',
+  'stats',
   'credentials',
 ] as const;
 
@@ -239,6 +400,12 @@ export interface KeyBinding {
   id: string;
   /** Human-readable label shown in settings. */
   label: string;
+  /** DOM modifier state. Optional so persisted single-key bindings remain valid. */
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  shiftKey?: boolean;
+  metaKey?: boolean;
+  altGraphKey?: boolean;
 }
 
 export interface HardwarePageTurnerSettings {
@@ -248,6 +415,8 @@ export interface HardwarePageTurnerSettings {
     pageNext: KeyBinding | null;
     sectionPrev: KeyBinding | null;
     sectionNext: KeyBinding | null;
+    /** E-ink full screen refresh (clears ghosting). Optional: absent on settings persisted before the feature existed. */
+    refresh?: KeyBinding | null;
   };
 }
 
@@ -256,18 +425,61 @@ export interface SystemSettings {
   migrationVersion: number;
   localBooksDir: string;
   customRootDir?: string;
+  /**
+   * Absolute paths the user has registered as "external library folders" —
+   * directories managed by the user (or another reader app, e.g. Duokan,
+   * Calibre, Moon+ Reader) that Readest should read in place instead of
+   * copying into Books/<hash>/. Each entry must be an absolute path; entries
+   * are matched as path-prefix roots when ingesting a file. Device-local
+   * (path is meaningful only on this filesystem) and excluded from cloud
+   * settings backups via `BACKUP_SETTINGS_BLACKLIST`.
+   */
+  externalLibraryFolders?: string[];
+  /**
+   * Absolute paths of the external library folders the user has opted into
+   * auto-import for. On library open and whenever the app regains focus,
+   * Readest re-scans each of these and imports any newly-added book files.
+   * A subset of {@link externalLibraryFolders} (auto-import requires the
+   * folder to be read in place). Set per-folder from the Import-from-Folder
+   * dialog. Desktop + Android only. Device-local (paths are meaningful only
+   * on this filesystem) and excluded from cloud settings backups via
+   * `BACKUP_SETTINGS_BLACKLIST`.
+   */
+  autoImportFolders?: string[];
+  /**
+   * The subset of {@link autoImportFolders} the user imported with "Import all
+   * into library" (flatten). Auto-imported books from those folders go straight
+   * to the library root; every other watched folder mirrors its subfolders as
+   * groups, matching the dialog's default "Create groups from subfolders" —
+   * which is also what a folder watched before this list existed falls back to.
+   * Device-local, and excluded from cloud settings backups alongside
+   * {@link autoImportFolders}.
+   */
+  autoImportFlattenFolders?: string[];
 
   keepLogin: boolean;
-  autoUpload: boolean;
   alwaysOnTop: boolean;
   openBookInNewWindow: boolean;
   autoCheckUpdates: boolean;
+  updateChannel: 'stable' | 'nightly';
   screenWakeLock: boolean;
+  autohideCursor: boolean;
   screenBrightness: number;
   autoScreenBrightness: boolean;
+  swipeBrightnessGesture: boolean;
   hardwarePageTurner: HardwarePageTurnerSettings;
+  /**
+   * Replay a connected controller's buttons and sticks as key events in the
+   * reader. Off is a real need on handhelds whose own remapper (Steam Input on
+   * the Steam Deck) already binds those buttons to keys, so every press would
+   * otherwise land twice (issue #5979).
+   */
+  gamepadEnabled: boolean;
+  /** Mouse wheel down turns to the previous page in paginated mode (#6439). */
+  reverseWheelPaging: boolean;
+  /** Hide the e-ink library's Previous/Next buttons; keys still page. */
+  hideBookshelfPageButtons: boolean;
   alwaysShowStatusBar: boolean;
-  alwaysInForeground: boolean;
   openLastBooks: boolean;
   lastOpenBooks: string[];
   autoImportBooksOnOpen: boolean;
@@ -275,18 +487,58 @@ export interface SystemSettings {
   savedBookCoverForLockScreenPath: string;
   telemetryEnabled: boolean;
   discordRichPresenceEnabled: boolean;
+  bookshelves?: BookshelfState;
   libraryViewMode: LibraryViewModeType;
   librarySortBy: LibrarySortByType;
   librarySortAscending: boolean;
+  /**
+   * Whether the primary sort uses a smart default derived from `libraryGroupBy`.
+   * When `true` and grouping by Series, the effective primary sort becomes
+   * Series at sort time (the stored `librarySortBy` is left unchanged so users
+   * who later turn auto off keep their previous explicit pick). Flipped to
+   * `false` the moment the user picks any primary sort in the menu.
+   */
+  librarySortByAuto: boolean;
+  libraryThenSortBy: LibrarySecondarySortByType;
+  /** Sort order of the secondary ("Then by") key, independent of `librarySortAscending` (#5119). */
+  libraryThenSortAscending: boolean;
   libraryGroupBy: LibraryGroupByType;
   libraryCoverFit: LibraryCoverFitType;
   libraryAutoColumns: boolean;
   libraryColumns: number;
+  librarySkeuomorphicCovers: boolean;
+  /**
+   * When true, the library hides real cover images and shows a plain
+   * title/author panel instead. Privacy escape hatch for when the shelf is
+   * visible to others.
+   */
+  libraryHideCovers: boolean;
+  /** Show the recently-read carousel at the top of the library (issue #3797). */
+  libraryRecentShelfEnabled: boolean;
+  /**
+   * Library page background texture, configured independently from the reader
+   * background (issue #4743). When any of these is undefined the library
+   * inherits the corresponding `globalViewSettings.background*` value, so an
+   * existing user's bookshelf looks unchanged until they pick a library
+   * texture. Device-local (the texture *selection* never syncs, matching the
+   * reader's `backgroundTextureId`); only the imported image binaries sync via
+   * the `texture` replica kind. Resolved by `getLibraryViewSettings`.
+   */
+  libraryBackgroundTextureId?: string;
+  libraryBackgroundOpacity?: number;
+  libraryBackgroundSize?: string;
   customFonts: CustomFont[];
   customTextures: CustomTexture[];
   customDictionaries: ImportedDictionary[];
   dictionarySettings: DictionarySettings;
   opdsCatalogs: OPDSCatalog[];
+  absServers: ABSServer[];
+  /** User-configured translation backends; synced as `custom_translator`. */
+  customTranslators?: CustomTranslator[];
+  /** User translation prompts; synced as `translation_prompt`. */
+  translationPrompts?: TranslationPrompt[];
+  /** Saved sites for the "From Web Browser" import (#5775). Device-local. */
+  webSources?: WebSource[];
   metadataSeriesCollapsed: boolean;
   metadataOthersCollapsed: boolean;
   metadataDescriptionCollapsed: boolean;
@@ -304,11 +556,28 @@ export interface SystemSettings {
   pinCodeEnabled?: boolean;
   pinCodeHash?: string;
   pinCodeSalt?: string;
+  /**
+   * Mobile-only. When true AND a PIN lock is configured AND the device
+   * has enrolled biometrics, the app-lock screen prompts for biometrics
+   * (fingerprint / Face ID) first and falls back to the PIN. No effect on
+   * desktop/web (no biometric plugin). `undefined` is treated as `false`
+   * so existing PIN users are never silently switched to biometric.
+   */
+  biometricUnlockEnabled?: boolean;
 
   kosync: KOSyncSettings;
+  bookorbit: BookOrbitSettings;
   readwise: ReadwiseSettings;
   hardcover: HardcoverSettings;
+  pagebound: PageboundSettings;
+  notion: NotionSettings;
+  /** Optional by design — see {@link ReadestCloudSettings}. Never defaulted. */
+  readestCloud?: ReadestCloudSettings;
   webdav: WebDAVSettings;
+  googleDrive: GoogleDriveSettings;
+  s3: S3Settings;
+  onedrive: OneDriveSettings;
+  icloud: ICloudSettings;
 
   aiSettings: AISettings;
   /**

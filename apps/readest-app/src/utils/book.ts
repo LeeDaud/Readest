@@ -1,4 +1,4 @@
-import { BookMetadata, EXTS } from '@/libs/document';
+import { BookMetadata, CalibreCustomColumn, EXTS } from '@/libs/document';
 import {
   Book,
   BOOK_CONFIG_SCHEMA_VERSION,
@@ -15,6 +15,16 @@ import { md5 } from './md5';
 
 export const getDir = (book: Book) => {
   return `${book.hash}`;
+};
+/**
+ * The `<hash>` dir a Books/-relative path lives in, or undefined for a
+ * root-level file (library metadata). Accepts host separators, so a Windows
+ * `readDirectory` path (`hash\cover.png`) resolves the same as a POSIX one.
+ */
+export const getBookDirOfPath = (path: string) => {
+  const normalized = path.replace(/\\/g, '/');
+  const slashIdx = normalized.indexOf('/');
+  return slashIdx < 0 ? undefined : normalized.slice(0, slashIdx);
 };
 export const getLibraryFilename = () => {
   return 'library.json';
@@ -113,6 +123,14 @@ export const flattenContributors = (
       : formatLanguageMap(contributors?.name);
 };
 
+export const getContributorNames = (
+  contributors: string | string[] | Contributor | Contributor[] | undefined,
+): string[] => {
+  if (!contributors) return [];
+  const values = Array.isArray(contributors) ? contributors : [contributors];
+  return [...new Set(values.map((value) => flattenContributors(value).trim()).filter(Boolean))];
+};
+
 // biome-ignore format: keep the language codes compact on a single line
 const LASTNAME_AUTHOR_SORT_LANGS = [ 'ar', 'bo', 'de', 'en', 'es', 'fr', 'hi', 'it', 'nl', 'pl', 'pt', 'ru', 'th', 'tr', 'uk' ];
 
@@ -158,6 +176,47 @@ export const formatDescription = (description?: string | LanguageMap) => {
     .trim();
 };
 
+/**
+ * The series position, or undefined when the book has none. Tolerates the two
+ * shapes found in real libraries: readerStore/bookService default a missing
+ * calibre:series_index to 0 (so 0 means "no position"), and indices edited
+ * before the metadata form coerced numbers were persisted (and synced) as
+ * strings like "2".
+ */
+export const getSeriesIndex = (seriesIndex?: number | string): number | undefined => {
+  const index = typeof seriesIndex === 'string' ? parseFloat(seriesIndex) : seriesIndex;
+  return typeof index === 'number' && Number.isFinite(index) && index > 0 ? index : undefined;
+};
+
+export const formatSeries = (series?: string, seriesIndex?: number) => {
+  const name = series?.trim();
+  if (!name) return '';
+  const index = getSeriesIndex(seriesIndex);
+  return index !== undefined ? `${name} #${index}` : name;
+};
+
+/**
+ * Book metadata as inert `data-*` attributes for Custom Reader UI CSS (#5776):
+ * the running header and HeaderBar only print the title, so series readers
+ * append "Series #2" themselves via `attr()`. Series attributes are omitted
+ * (undefined, so React drops them) for standalone books, keeping
+ * `[data-book-series]` presence checks meaningful. Persisted metadata is not
+ * runtime-validated (backup restore, sync index), so a non-string series is
+ * treated as absent rather than thrown on.
+ */
+export const getBookDataAttributes = (
+  title?: string,
+  metadata?: Pick<BookMetadata, 'series' | 'seriesIndex'>,
+) => {
+  const series =
+    typeof metadata?.series === 'string' ? metadata.series.trim() || undefined : undefined;
+  return {
+    'data-book-title': title || undefined,
+    'data-book-series': series,
+    'data-book-series-index': series ? getSeriesIndex(metadata?.seriesIndex) : undefined,
+  };
+};
+
 export const formatPublisher = (publisher: string | LanguageMap) => {
   return typeof publisher === 'string' ? publisher : formatLanguageMap(publisher);
 };
@@ -182,6 +241,155 @@ export const getPrimaryLanguage = (lang: string | string[] | undefined) => {
   return 'en';
 };
 
+/** The group-membership fields resolved together by {@link pickFresherGroup}. */
+export interface BookGroupFields {
+  groupId?: string;
+  groupName?: string;
+  groupUpdatedAt?: number | null;
+}
+
+/**
+ * Field-level last-writer-wins for group membership (issue #5911), the client
+ * mirror of `resolveGroupMerge` in `pages/api/sync.ts`. Shared by the native
+ * cloud merge (`useBooksSync`) and the third-party file-sync merge
+ * (`services/sync/file/merge.ts`) so both backends resolve a group the same way.
+ *
+ * Group membership used to ride the row's `updatedAt`, which is stamped by
+ * operations that have nothing to do with grouping — above all
+ * `cloudService.uploadBook`, which bumps it on every UPLOAD. A peer holding a
+ * never-grouped copy of a row could therefore win whole-row LWW and erase the
+ * group, and the emptied row then propagated to every other device.
+ *
+ * Resolution, in order:
+ *   1. Different stamps → the newer stamp wins. This is what makes a real
+ *      grouping edit — including a removal — propagate regardless of who won
+ *      the row (#4942).
+ *   2. Equal stamps, one side grouped and the other not → the GROUPED side
+ *      wins. On a tie an absent group is ambiguous: "never grouped" and
+ *      "ungrouped by a client too old to stamp" are indistinguishable, and the
+ *      legacy fleet is entirely unstamped (0 === 0). Erasing a real group is
+ *      unrecoverable; losing an un-group is not, and the next stamped edit
+ *      resolves it.
+ *   3. Equal stamps and both sides agree about having a group → the row winner,
+ *      preserving the historical behaviour for two genuinely competing groups.
+ */
+export const pickFresherGroup = <T extends BookGroupFields>(
+  local: T,
+  remote: T,
+  remoteRowWins: boolean,
+): BookGroupFields => {
+  const localMs = local.groupUpdatedAt ?? 0;
+  const remoteMs = remote.groupUpdatedAt ?? 0;
+  let winner: T;
+  if (localMs !== remoteMs) {
+    winner = remoteMs > localMs ? remote : local;
+  } else {
+    const localHasGroup = !!local.groupId || !!local.groupName;
+    const remoteHasGroup = !!remote.groupId || !!remote.groupName;
+    if (localHasGroup !== remoteHasGroup) {
+      winner = localHasGroup ? local : remote;
+    } else {
+      winner = remoteRowWins ? remote : local;
+    }
+  }
+  return {
+    groupId: winner.groupId,
+    groupName: winner.groupName,
+    groupUpdatedAt: winner.groupUpdatedAt,
+  };
+};
+
+/**
+ * Move a book into a group, or out of one when both are undefined. Only the
+ * group's own clock is stamped: `updatedAt` is the Date Read sort key and
+ * regrouping is not reading (#6414). A removal MUST be stamped too — an
+ * unstamped ungrouped row loses to a grouped peer by design (#5911).
+ */
+export const setBookGroup = (
+  book: Book,
+  groupId: string | undefined,
+  groupName: string | undefined,
+  now = Date.now(),
+) => {
+  book.groupId = groupId;
+  book.groupName = groupName;
+  book.groupUpdatedAt = now;
+};
+
+/**
+ * Stamp a delete so every device hides the book, erasing its reading progress
+ * when the caller asks for a purge.
+ *
+ * `updatedAt` is bumped on purpose here, unlike the group/metadata/cover clocks
+ * (#6414): the cloud merge is whole-row last-write-wins, and a delete used to
+ * leave `updatedAt` alone — so the row's own older page-turn progress outranked
+ * the tombstone, the next pull cleared `deletedAt`, and the book came back with
+ * its progress, as if the delete (and the purge) had done nothing (#6663). The
+ * demo-shelf comment in useBooksSync names the same mechanism.
+ */
+export const markBookDeleted = (book: Book, deletedAt: number, purge: boolean) => {
+  book.deletedAt = deletedAt;
+  // A library tombstone alone is not permission to destroy bytes on a
+  // third-party file mirror. Bind the explicit cloud-and-device intent to this
+  // exact tombstone so the file-sync engine can distinguish it from a
+  // local-only or indirectly-created delete (#5695, the third recurrence of
+  // #5084).
+  book.fileSyncDeletionRequestedAt = deletedAt;
+  book.downloadedAt = null;
+  book.coverDownloadedAt = null;
+  // Strictly above any future-dated stamp a fast-clocked peer left on the row:
+  // lowering it would hand the merge back to the cloud row (ties go to it).
+  book.updatedAt = Math.max(deletedAt, (book.updatedAt ?? 0) + 1);
+  // null (not undefined, which JSON drops) clears it in the cloud too (#6532).
+  if (purge) book.progress = null;
+};
+
+/**
+ * The latest local edit on any of a book row's clocks. Group, metadata and
+ * cover edits stamp only their own clock and leave `updatedAt` alone (#6414),
+ * so the sync push has to look at all of them to know the row changed.
+ */
+export const getBookChangedAt = (book: Book): number =>
+  Math.max(
+    book.updatedAt ?? 0,
+    book.groupUpdatedAt ?? 0,
+    book.metadataUpdatedAt ?? 0,
+    book.coverUpdatedAt ?? 0,
+  );
+
+/** True when `resolved` names a different group than `current` does. */
+export const bookGroupDiffers = (current: BookGroupFields, resolved: BookGroupFields): boolean =>
+  (current.groupId ?? undefined) !== (resolved.groupId ?? undefined) ||
+  (current.groupName ?? undefined) !== (resolved.groupName ?? undefined);
+
+// Immutably apply edited metadata to a book, returning a NEW book object.
+// Callers must not mutate the existing book in place: <BookCover> is memoized
+// and compares fields off the book, so an in-place mutation makes the memo's
+// previous snapshot point to the same object and skips re-rendering the cover.
+export const getBookWithUpdatedMetadata = (
+  book: Book,
+  metadata: BookMetadata,
+  tags?: string[],
+): Book => {
+  const updatedBook: Book = {
+    ...book,
+    metadata,
+    ...(tags ? { tags: [...tags] } : {}),
+    title: formatTitle(metadata.title),
+    author: formatAuthors(metadata.author),
+    primaryLanguage: getPrimaryLanguage(metadata.language),
+    // The metadata group merges on its own clock so a page turn elsewhere
+    // (which dominates updatedAt) cannot clobber this edit (issue #5438), and
+    // updatedAt stays put so the edit doesn't reorder Date Read (#6414).
+    metadataUpdatedAt: Date.now(),
+  };
+  const newCoverImageUrl = metadata.coverImageBlobUrl || metadata.coverImageUrl;
+  if (newCoverImageUrl) {
+    updatedBook.coverImageUrl = newCoverImageUrl;
+  }
+  return updatedBook;
+};
+
 export const formatDate = (date: string | number | Date | null | undefined, isUTC = false) => {
   if (!date) return;
   const userLang = getUserLang();
@@ -194,6 +402,31 @@ export const formatDate = (date: string | number | Date | null | undefined, isUT
     });
   } catch {
     return;
+  }
+};
+
+export const formatCalibreColumnValue = (column: CalibreCustomColumn): string => {
+  const { datatype, value, extra } = column;
+  if (Array.isArray(value)) return value.join(', ');
+  switch (datatype) {
+    case 'rating': {
+      // 0-10 in half stars, like calibre's own rendering
+      const rating = typeof value === 'number' ? value : 0;
+      return '★'.repeat(Math.floor(rating / 2)) + (rating % 2 ? '½' : '');
+    }
+    case 'series':
+      return extra != null ? `${value} [${extra}]` : String(value);
+    case 'datetime':
+      return formatDate(String(value), true) || '';
+    case 'comments':
+      return String(value)
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    case 'bool':
+      return value ? '✓' : '✗';
+    default:
+      return String(value);
   }
 };
 
@@ -227,6 +460,23 @@ export const getCurrentPage = (book: Book, progress: BookProgress) => {
       ? pageinfo.current + 1
       : 0;
 };
+
+/**
+ * A book is "currently reading" iff it has real reading progress and has not
+ * been parked. Importing a book sets timestamps but never `progress` (only
+ * opening it does), so the progress gate drops freshly-added-but-unopened
+ * books; the status gate drops finished, abandoned (on hold) and
+ * manually-marked-unread books. A book actively being read has `readingStatus`
+ * either `undefined` (cleared from 'unread' on first open) or `'reading'`, both
+ * of which pass. Shared by the library's recently-read shelf and the
+ * home-screen bookshelf widget so the two surfaces stay in sync.
+ */
+export const isCurrentlyReadingBook = (book: Book): boolean =>
+  !book.deletedAt &&
+  book.progress != null &&
+  book.readingStatus !== 'finished' &&
+  book.readingStatus !== 'abandoned' &&
+  book.readingStatus !== 'unread';
 
 export const getBookDirFromWritingMode = (writingMode: WritingMode) => {
   switch (writingMode) {
@@ -281,7 +531,7 @@ const normalizeIdentifier = (identifier: string) => {
   return identifier;
 };
 
-const getPreferredIdentifier = (identifiers: string[] | Identifier[]) => {
+const getPreferredIdentifier = (identifiers: (string | Identifier)[]) => {
   for (const scheme of ['uuid', 'calibre', 'isbn']) {
     const found = identifiers.find((identifier) =>
       typeof identifier === 'string'
@@ -296,7 +546,7 @@ const getPreferredIdentifier = (identifiers: string[] | Identifier[]) => {
 };
 
 const getIdentifiersList = (
-  identifiers: undefined | string | string[] | Identifier | Identifier[],
+  identifiers: undefined | string | Identifier | (string | Identifier)[],
 ) => {
   if (!identifiers) return [];
   if (Array.isArray(identifiers)) {
@@ -324,13 +574,17 @@ export interface MetadataHashInfo {
   metaHash: string;
 }
 
-export const getMetadataHashInfo = (metadata: BookMetadata): MetadataHashInfo | undefined => {
+export const getMetadataHashInfo = (
+  metadata: BookMetadata,
+  filename?: string,
+): MetadataHashInfo | undefined => {
   if (!metadata) return;
   try {
     const title = getTitleForHash(metadata.title);
     const authors = getAuthorsList(metadata.author);
     const identifiers = getIdentifiersList(metadata.altIdentifier || metadata.identifier);
-    const hashSource = `${title}|${authors.join(',')}|${identifiers.join(',')}`;
+    let hashSource = `${title}|${authors.join(',')}|${identifiers.join(',')}`;
+    if (filename) hashSource += `|${filename}`;
     const metaHash = md5(hashSource.normalize('NFC'));
     return { title, authors, identifiers, hashSource, metaHash };
   } catch (error) {
@@ -339,6 +593,45 @@ export const getMetadataHashInfo = (metadata: BookMetadata): MetadataHashInfo | 
   return;
 };
 
-export const getMetadataHash = (metadata: BookMetadata) => {
-  return getMetadataHashInfo(metadata)?.metaHash;
+export const getMetadataHash = (metadata: BookMetadata, filename?: string) => {
+  return getMetadataHashInfo(metadata, filename)?.metaHash;
+};
+
+// A bare UUID identifies an export, not a book: calibre mints a fresh one on
+// every conversion, so every AO3 / FanFicFare re-download of the same work
+// carries a different `dc:identifier` (issue #5959).
+const VOLATILE_IDENTIFIER = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const isVolatileIdentifier = (identifier: string | Identifier) =>
+  VOLATILE_IDENTIFIER.test(
+    typeof identifier === 'string' ? normalizeIdentifier(identifier) : identifier.value,
+  );
+
+/**
+ * Metadata hash computed with volatile identifiers left out, so two exports of
+ * the same book still hash alike. Returns undefined when the metadata carries
+ * no volatile identifier — `getMetadataHash` is already stable for those and
+ * the caller has nothing extra to look up.
+ *
+ * This is a local, import-time key only. Never use it as a sync key:
+ * `getMetadataHash` is a wire format shared with the sync server and with the
+ * KOReader plugin (which caches it as `meta_hash_v1`), so its output has to
+ * stay byte-identical across versions and across the two implementations.
+ */
+export const getStableMetadataHash = (metadata: BookMetadata) => {
+  if (!metadata) return;
+  try {
+    const identifier = metadata.altIdentifier || metadata.identifier;
+    const all = identifier ? (Array.isArray(identifier) ? identifier : [identifier]) : [];
+    const stable = all.filter((id) => !isVolatileIdentifier(id));
+    if (stable.length === all.length) return;
+    const title = getTitleForHash(metadata.title);
+    const authors = getAuthorsList(metadata.author);
+    const identifiers = getIdentifiersList(stable);
+    const hashSource = `${title}|${authors.join(',')}|${identifiers.join(',')}`;
+    return md5(hashSource.normalize('NFC'));
+  } catch (error) {
+    console.error('Error generating stable metadata hash:', error);
+  }
+  return;
 };
