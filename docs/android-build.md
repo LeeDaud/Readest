@@ -12,7 +12,7 @@
 pnpm tauri android build --apk --debug --target aarch64 --ci
 ```
 
-`src-tauri/tauri.android.conf.json` 将名称设为 Z-Reader，并使用 `.zreader` 调试包名后缀。调试版最低 Android 8.0（API 26），用于 ARM64 手机。前端构建不会运行上游的 sourcemap 上传命令。
+`src-tauri/tauri.android.conf.json` 沿用 Readest 名称，并使用 `.zreader` 调试包名后缀。调试版最低 Android 8.0（API 26），用于 ARM64 手机。构建前通过 `scripts/prepare-android-branding.mjs` 同步上游图标和 Readest 名称，前端构建不会运行上游的 sourcemap 上传命令。
 
 `packages/turso-ext` 保留 upstream 0.6.1 的源代码和许可证，只修正构建脚本按目标平台决定是否链接 `advapi32`，以支持 Windows 主机编译 Android。
 
@@ -21,6 +21,9 @@ pnpm tauri android build --apk --debug --target aarch64 --ci
 工具链和日志保存在忽略的 `.validation/` 中。首次构建在 Rust 原生库成功后遇到 Windows 创建符号链接权限限制。兼容流程将已编译的 `target/aarch64-linux-android/debug/libreadestlib.so` 复制到 `src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/`，仅对打包副本执行 NDK `llvm-strip --strip-debug`，再执行：
 
 ```powershell
+# 在 apps/readest-app 下先同步名称和上游图标
+node scripts/prepare-android-branding.mjs
+# 然后在 src-tauri/gen/android 下组装
 ./gradlew.bat assembleArm64Debug -x rustBuildArm64Debug
 ```
 
@@ -34,4 +37,6 @@ pnpm tauri android build --apk --debug --target aarch64 --ci
 
 已有移动端入口及共享下载流程专项测试 22 项通过，静态前端构建、类型与 Lint 通过。Android 模拟器验证见 [2026-10-14 Android 验证记录](validation-android-2026-10-14.md)，真实手机和 Z-Library 账号下载仍需验证。
 
-本次 APK 为 `artifacts/android/Z-Reader-0.12.12-arm64-debug.apk`，207,793,549 字节，SHA256 为 `87B49542DAF32EF10C44D86CB7AD75536317AA095C83C40C90CD8672FC525DE9`。包名 `com.bilingify.readest.zreader`，版本 `0.12.12-zreader-dev`（12012），APK v2 签名与 16 KB ZIP 对齐检查通过。此产物是调试验收包；正式发布需要自己的签名与 release 构建。
+此前 APK 为 `artifacts/android/Z-Reader-0.12.12-arm64-debug.apk`，207,793,549 字节，SHA256 为 `87B49542DAF32EF10C44D86CB7AD75536317AA095C83C40C90CD8672FC525DE9`。包名 `com.bilingify.readest.zreader`，版本 `0.12.12-zreader-dev`（12012），APK v2 签名与 16 KB ZIP 对齐检查通过。此历史产物仍使用旧名称；新的 Readest 名称产物另存，避免混淆。正式发布需要自己的签名与 release 构建。
+
+最新产物：`artifacts/android/Readest-0.12.12-zlibrary-arm64-debug.apk`，209,107,671 字节，SHA256 为 `686443C1608E720134CCB7C9BA8E32F31549FA0FA96FEFA49AE201F13D27A080`。aapt 核验名称为 Readest，包名、版本与 ABI 不变；APK v2 签名和 16 KB ZIP 对齐检查通过。Android 图标从上游已提交资源复制；此次离线 Gradle 组装通过（20 秒）。再次安装时设备列表为空，未完成新资源包的模拟器安装显示验证。前次完整流程验证记录仍保留，不等同于本次新包实测。

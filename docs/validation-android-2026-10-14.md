@@ -1,5 +1,7 @@
 # Android 验证记录 · 2026-10-14
 
+本文以下流程记录对应旧名称安装包。后续整理已恢复 Readest 名称并同步上游原图标，新包构建、签名和对齐检查通过；重新安装时无已连接设备，未重复执行 Android 运行流程。新产物信息见 [Android 构建说明](android-build.md)。
+
 ## 安装包
 
 - 产物：`artifacts/android/Z-Reader-0.12.12-arm64-debug.apk`，207,793,549 字节（约 198 MiB）。

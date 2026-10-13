@@ -1,7 +1,7 @@
 {
-  "productName": "Z-Reader",
+  "productName": "Readest",
   "build": {
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "node scripts/prepare-android-branding.mjs && pnpm build"
   },
   "bundle": {
     "android": {

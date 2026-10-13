@@ -1,6 +1,14 @@
-# Z-Reader
+# Readest · Z-Library 集成 Fork
 
-Fork Readest，保留渲染引擎和跨平台能力，UI 层重构为微信读书设计风格，并集成 Z-Library 书源。
+Fork Readest，保留渲染引擎和跨平台能力，并集成 Z-Library 书源。应用名称和图标沿用 Readest；已有微信读书主题代码保留，后续优先减少与上游无关的改动。
+
+## 分支维护
+
+- `upstream` 指向 `https://github.com/readest/readest.git`，用于获取和合并更新。
+- `codex/zlibrary-integration` 为本 Fork 的集成维护分支，保留现有本地与上游提交历史。
+- `master` 保留整理前的状态，不重置或改写历史。
+- 目前尚未配置自己的远程 `origin`，不要向 `upstream` 推送本 Fork 的功能。
+- Android 调试包保留 `.zreader` 包名后缀以便共存，显示名称仍为 Readest。
 
 ## 目标
 
