@@ -147,16 +147,23 @@ describe('downloadNovel', () => {
   });
 
   it('keeps failed images as placeholders without remote URLs', async () => {
-    const page = chapterPage(1).replace(
-      '<div id="content">',
-      '<div id="content"><img src="https://cdn.example.org/x.jpg"/><figure><img src="/y.png"/></figure>',
-    );
-    const book = await downloadNovel(toc({ chapters: toc().chapters.slice(0, 5) }), TOC_URL, {
-      fetchPage: makeFetchPage({ [`${BASE}/novel/7/1`]: page }),
-    });
-    const files = await unzipEpub(book.file);
-    expect(files.get('OEBPS/chapter1.xhtml')).not.toContain('src="https://cdn.example.org');
-    expect(files.get('OEBPS/chapter1.xhtml')).not.toContain('src="/y.png');
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValue(new TypeError('Image unavailable'));
+    try {
+      const page = chapterPage(1).replace(
+        '<div id="content">',
+        '<div id="content"><img src="https://cdn.example.org/x.jpg"/><figure><img src="/y.png"/></figure>',
+      );
+      const book = await downloadNovel(toc({ chapters: toc().chapters.slice(0, 5) }), TOC_URL, {
+        fetchPage: makeFetchPage({ [`${BASE}/novel/7/1`]: page }),
+      });
+      const files = await unzipEpub(book.file);
+      expect(files.get('OEBPS/chapter1.xhtml')).not.toContain('src="https://cdn.example.org');
+      expect(files.get('OEBPS/chapter1.xhtml')).not.toContain('src="/y.png');
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   it('keeps going when a chapter fails and inserts a placeholder', async () => {

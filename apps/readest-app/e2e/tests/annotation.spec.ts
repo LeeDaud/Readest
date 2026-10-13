@@ -256,6 +256,7 @@ test.describe('Annotation', () => {
     await reader.selectHighlightColor('green');
     await expect(noteBubbles).toHaveCount(1);
 
+    await reader.dismissPopup();
     await clickHighlight();
     await reader.popupTool('Delete Highlight').click();
 

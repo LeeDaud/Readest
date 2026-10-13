@@ -81,6 +81,9 @@ android {
     }
     buildTypes {
         getByName("debug") {
+            // Keep the Z-Reader development package separate from installed Readest.
+            applicationIdSuffix = ".zreader"
+            versionNameSuffix = "-zreader-dev"
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true

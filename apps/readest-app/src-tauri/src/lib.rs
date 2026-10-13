@@ -55,6 +55,7 @@ mod transfer_file;
 mod web_browser;
 #[cfg(desktop)]
 mod window_state;
+mod zlibrary;
 #[cfg(target_os = "windows")]
 use tauri::webview::ScrollBarStyle;
 use tauri::{command, Emitter, WebviewUrl, WebviewWindowBuilder, Window};
@@ -675,6 +676,9 @@ pub fn run() {
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             discord_rpc::clear_book_presence,
             clip_url::clip_url,
+            zlibrary::open_zlibrary,
+            zlibrary::pending_zlibrary_downloads,
+            zlibrary::acknowledge_zlibrary_download,
             web_browser::open_web_browser,
             browser_fetch::fetch_web_browser_resource,
             media_proxy::get_media_proxy_base,

@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import ImportMenuPopup, { getMenuPosition } from '@/app/library/components/ImportMenuPopup';
 
+const pushMock = vi.hoisted(() => vi.fn());
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push: pushMock }) }));
+
 vi.mock('@/hooks/useTranslation', () => ({
   useTranslation: () => (key: string) => key,
 }));
@@ -30,6 +33,7 @@ const renderPopup = (props: Partial<React.ComponentProps<typeof ImportMenuPopup>
 };
 
 beforeEach(() => {
+  pushMock.mockClear();
   useEnvMock.mockReturnValue({ appService: { isOnlineCatalogsAccessible: true } });
 });
 
@@ -40,12 +44,20 @@ afterEach(() => {
 });
 
 describe('ImportMenuPopup', () => {
+  it('opens Z-Library and dismisses the popup', () => {
+    const { onClose } = renderPopup();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Z-Library' }));
+    expect(pushMock).toHaveBeenCalledWith('/zlibrary');
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it('shows the same always-available options as the library header menu', () => {
     renderPopup();
 
     expect(screen.getByRole('menuitem', { name: 'From Local File' })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: 'From Feed URL' })).toBeTruthy();
     expect(screen.getByRole('menuitem', { name: 'Online Library' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Z-Library' })).toBeTruthy();
     expect(screen.queryByRole('menuitem', { name: 'From Directory' })).toBeNull();
     expect(screen.queryByRole('menuitem', { name: 'From Web Browser' })).toBeNull();
   });

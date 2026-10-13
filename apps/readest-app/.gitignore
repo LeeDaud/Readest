@@ -41,6 +41,7 @@ Entitlements*.plist
 
 # local confs
 tauri.*.conf.json
+!tauri.android.conf.json
 # tracked exception: the direct-distribution iCloud overlay ships in the repo
 !tauri.macos-nonestore.conf.json
 

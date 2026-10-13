@@ -15,3 +15,8 @@ export const SAMPLE_EPUB = path.join(
   fixturesDir,
   '../../src/__tests__/fixtures/data/sample-alice.epub',
 );
+
+export const SAMPLE_PDF = path.join(
+  fixturesDir,
+  '../../src/__tests__/fixtures/data/sample-alice.pdf',
+);

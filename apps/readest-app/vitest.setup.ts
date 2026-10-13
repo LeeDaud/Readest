@@ -1,3 +1,11 @@
+// Node's Response creates Node Blobs, while jsdom's File only recognizes its
+// own Blob class. Mixing them turns ZIP/EPUB bytes into "[object Blob]".
+const responseBlob = Response.prototype.blob;
+Response.prototype.blob = async function () {
+  const blob = await responseBlob.call(this);
+  return blob instanceof Blob ? blob : new Blob([await blob.arrayBuffer()], { type: blob.type });
+};
+
 // jsdom does not implement the CSS namespace; foliate-js TTS uses CSS.escape
 // (mark[name="…"] lookups). Provide the standard polyfill so those paths work.
 const globalWithCSS = globalThis as { CSS?: { escape?: (value: string) => string } };

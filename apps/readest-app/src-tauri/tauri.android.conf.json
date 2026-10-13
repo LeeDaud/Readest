@@ -1,0 +1,12 @@
+{
+  "productName": "Z-Reader",
+  "build": {
+    "beforeBuildCommand": "pnpm build"
+  },
+  "bundle": {
+    "android": {
+      "minSdkVersion": 26,
+      "debugApplicationIdSuffix": ".zreader"
+    }
+  }
+}

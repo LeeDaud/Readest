@@ -1,4 +1,3 @@
-import * as React from 'react';
 import * as ToggleGroupPrimitive from '@radix-ui/react-toggle-group';
 
 interface SegmentedControlProps {
@@ -21,10 +20,12 @@ export function SegmentedControl({
 }: SegmentedControlProps) {
   return (
     <ToggleGroupPrimitive.Root
-      type="single"
+      type='single'
       value={value}
-      onValueChange={(v) => { if (v) onValueChange(v); }}
-      className="inline-flex rounded-lg bg-[var(--wr-current-bg,var(--wr-bg-green))] p-0.5"
+      onValueChange={(v) => {
+        if (v) onValueChange(v);
+      }}
+      className='inline-flex rounded-lg bg-[var(--wr-current-bg,var(--wr-bg-green))] p-0.5'
     >
       {options.map((opt) => (
         <ToggleGroupPrimitive.Item

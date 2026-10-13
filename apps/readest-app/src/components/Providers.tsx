@@ -37,6 +37,7 @@ import { DropdownProvider } from '@/context/DropdownContext';
 import { CommandPaletteProvider, CommandPalette } from '@/components/command-palette';
 import AtmosphereOverlay from '@/components/AtmosphereOverlay';
 import AppLockScreen from '@/components/AppLockScreen';
+import ZLibraryDownloadBridge from '@/components/ZLibraryDownloadBridge';
 import CarMediaLibraryBridge from '@/components/CarMediaLibraryBridge';
 import FileSyncReport from '@/components/FileSyncReport';
 import AppLockDialog from '@/components/settings/AppLockDialog';
@@ -271,6 +272,7 @@ const Providers = ({ children }: { children: React.ReactNode }) => {
                   style={appShellHidden ? { display: 'none' } : undefined}
                 >
                   {children}
+                  {!appShellHidden && <ZLibraryDownloadBridge />}
                   <CommandPalette />
                   <AtmosphereOverlay />
                   <PassphrasePrompt />

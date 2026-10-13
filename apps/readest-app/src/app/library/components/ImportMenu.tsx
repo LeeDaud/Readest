@@ -1,4 +1,5 @@
 import clsx from 'clsx';
+import { useRouter } from 'next/navigation';
 import { MdLanguage, MdMenuBook, MdRssFeed } from 'react-icons/md';
 import { LuLibrary } from 'react-icons/lu';
 import { IoFileTray } from 'react-icons/io5';
@@ -29,6 +30,7 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
   onOpenFeeds,
 }) => {
   const _ = useTranslation();
+  const router = useRouter();
   const { appService } = useEnv();
 
   const handleImportFromFiles = () => {
@@ -69,6 +71,14 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
       )}
       onCancel={() => setIsDropdownOpen?.(false)}
     >
+      <MenuItem
+        label='Z-Library'
+        Icon={<MdLanguage className='h-5 w-5' />}
+        onClick={() => {
+          setIsDropdownOpen?.(false);
+          router.push('/zlibrary');
+        }}
+      />
       <MenuItem
         label={_('From Local File')}
         Icon={<IoFileTray className='h-5 w-5' />}
