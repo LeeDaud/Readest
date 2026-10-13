@@ -47,6 +47,7 @@ import { getICloudContainerStatus } from '@/utils/bridge';
 import { navigateToLogin, navigateToProfile } from '@/utils/nav';
 import { eventDispatcher } from '@/utils/event';
 import ABSForm from './integrations/ABSForm';
+import ZLibraryForm from './integrations/ZLibraryForm';
 import BookOrbitForm from './integrations/BookOrbitForm';
 import KOSyncForm from './integrations/KOSyncForm';
 import ReadwiseForm from './integrations/ReadwiseForm';
@@ -80,6 +81,7 @@ import SubPageHeader from './SubPageHeader';
 import { BoxedList, NavigationRow, SectionTitle, SettingLabel, Tips } from './primitives';
 
 type SubPage =
+  | 'zlibrary'
   | 'kosync'
   | 'bookorbit'
   | 'webdav'
@@ -227,6 +229,7 @@ const IntegrationsPanel: React.FC = () => {
       return;
     }
     if (
+      requestedSubPage === 'zlibrary' ||
       requestedSubPage === 'kosync' ||
       requestedSubPage === 'bookorbit' ||
       requestedSubPage === 'webdav' ||
@@ -255,6 +258,17 @@ const IntegrationsPanel: React.FC = () => {
   // SubPageHeader's "Integrations" label lands at the exact same Y position
   // as the list-view's h2 — clicking a row reads as a navigation morph
   // rather than a layout shift.
+  if (subPage === 'zlibrary')
+    return (
+      <div className='my-4 w-full'>
+        <SubPageHeader
+          parentLabel={_('Integrations')}
+          currentLabel='Z-Library'
+          onBack={() => setSubPage(null)}
+        />
+        <ZLibraryForm />
+      </div>
+    );
   if (subPage === 'kosync')
     return (
       <div className='my-4 w-full'>
@@ -843,6 +857,12 @@ const IntegrationsPanel: React.FC = () => {
         <SectionTitle className='mb-2'>{_('Content Sources')}</SectionTitle>
         <div className='card eink-bordered border-base-200 bg-base-100 overflow-hidden border'>
           <div className='divide-base-200 divide-y'>
+            <IntegrationRow
+              icon={RiBookOpenLine}
+              title='Z-Library'
+              status='配置网站与访问顺序'
+              onClick={() => setSubPage('zlibrary')}
+            />
             <IntegrationRow
               icon={RiRssLine}
               title={_('OPDS Catalogs')}

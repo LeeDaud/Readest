@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ImportMenuPopup, { getMenuPosition } from '@/app/library/components/ImportMenuPopup';
 
 const pushMock = vi.hoisted(() => vi.fn());
+vi.mock('@/hooks/useOpenZLibrary', () => ({ useOpenZLibrary: () => pushMock }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: pushMock }) }));
 
 vi.mock('@/hooks/useTranslation', () => ({
@@ -33,7 +34,8 @@ const renderPopup = (props: Partial<React.ComponentProps<typeof ImportMenuPopup>
 };
 
 beforeEach(() => {
-  pushMock.mockClear();
+  pushMock.mockReset();
+  pushMock.mockResolvedValue(undefined);
   useEnvMock.mockReturnValue({ appService: { isOnlineCatalogsAccessible: true } });
 });
 
@@ -47,7 +49,7 @@ describe('ImportMenuPopup', () => {
   it('opens Z-Library and dismisses the popup', () => {
     const { onClose } = renderPopup();
     fireEvent.click(screen.getByRole('menuitem', { name: 'Z-Library' }));
-    expect(pushMock).toHaveBeenCalledWith('/zlibrary');
+    expect(pushMock).toHaveBeenCalledWith();
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 

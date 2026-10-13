@@ -16,6 +16,7 @@ const CAPTURE_JS: &str = include_str!("web_browser_capture.js");
 #[derive(Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebBrowserOptions {
+    pub fallback_urls: Option<Vec<String>>,
     pub background: Option<String>,
     pub foreground: Option<String>,
     pub is_eink: Option<bool>,
@@ -535,6 +536,11 @@ pub async fn open_web_browser(
     std::fs::create_dir_all(&download_dir).map_err(|e| e.to_string())?;
     let request = WebBrowserRequest {
         url: parsed.to_string(),
+        fallback_urls: options.fallback_urls.map(|urls| {
+            urls.into_iter()
+                .filter_map(|url| parse_browsable_url(&url).ok().map(|url| url.to_string()))
+                .collect()
+        }),
         download_dir: download_dir.to_string_lossy().into_owned(),
         capture_script: CAPTURE_JS.to_string(),
         background: options.background,

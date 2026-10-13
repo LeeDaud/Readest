@@ -5,6 +5,7 @@ import WebKit
 /// the plugin's `models.rs`. Every label the chrome renders comes from JS.
 final class WebBrowserArgs: Decodable {
   let url: String
+  let fallbackUrls: [String]?
   let downloadDir: String
   let captureScript: String
   let background: String?
@@ -71,6 +72,43 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   private var openBookHash: String?
   private var finished = false
   private var capturing = false
+  private var entryIndex = 0
+  private var entryPending = false
+  private var entryNavigation: WKNavigation?
+  private var entryTimeout: DispatchWorkItem?
+  private var entryUrls: [URL] {
+    ([args.url] + (args.fallbackUrls ?? [])).prefix(10).compactMap { value in
+      guard let url = URL(string: value), url.scheme == "https" || url.scheme == "http" else { return nil }
+      return url
+    }
+  }
+
+  private func loadEntry(_ url: URL) {
+    entryPending = args.fallbackUrls != nil
+    entryNavigation = webView.load(URLRequest(url: url))
+    entryTimeout?.cancel()
+    if entryPending {
+      let work = DispatchWorkItem { [weak self] in self?.failEntry() }
+      entryTimeout = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
+    }
+  }
+
+  private func failEntry() {
+    guard entryPending, !finished else { return }
+    entryPending = false
+    entryTimeout?.cancel()
+    webView.stopLoading()
+    guard entryIndex + 1 < entryUrls.count else {
+      setStatus(state: "unavailable", filename: args.label("sitesUnavailable", "All configured websites failed to load"), bookHash: nil)
+      return
+    }
+    entryIndex += 1
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, !self.finished else { return }
+      self.loadEntry(self.entryUrls[self.entryIndex])
+    }
+  }
 
   var onDownload: ((WebBrowserDownloadEvent) -> Void)?
   var onFinish: ((String?, WebBrowserPage?) -> Void)?
@@ -104,7 +142,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     // The plugin rejects unparseable URLs before presenting; this guard
     // only keeps a malformed string from crashing the controller.
     if let url = URL(string: args.url) {
-      webView.load(URLRequest(url: url))
+      loadEntry(url)
     }
   }
 
@@ -356,7 +394,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
       "downloading": "Downloading", "importing": "Importing", "added": "Added to library",
       "failed": "Import failed", "unsupported": "Not a supported book format",
     ]
-    bannerLabel.text = "\(args.label(state, fallback[state] ?? state)) \u{00B7} \(filename)"
+    bannerLabel.text = state == "unavailable" ? filename : "\(args.label(state, fallback[state] ?? state)) \u{00B7} \(filename)"
     openBookHash = state == "added" ? bookHash : nil
     bannerOpen.isHidden = openBookHash == nil
     bannerHeight.constant = 44
@@ -365,7 +403,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     } else {
       UIView.animate(withDuration: 0.2) { self.view.layoutIfNeeded() }
     }
-    if state != "downloading" && state != "importing" {
+    if state != "downloading" && state != "importing" && state != "unavailable" {
       let work = DispatchWorkItem { [weak self] in self?.hideBanner() }
       bannerHideWork = work
       DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
@@ -387,7 +425,11 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   @objc private func closeTapped() { finish(nil) }
   @objc private func backTapped() { webView.goBack() }
   @objc private func reloadTapped() {
-    if webView.isLoading { webView.stopLoading() } else { webView.reload() }
+    if webView.isLoading {
+      entryPending = false
+      entryTimeout?.cancel()
+      webView.stopLoading()
+    } else { webView.reload() }
   }
   @objc private func openTapped() { finish(openBookHash) }
 
@@ -424,6 +466,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   }
 
   private func finish(_ hash: String?, page: WebBrowserPage? = nil) {
+    entryTimeout?.cancel()
     if finished { return }
     finished = true
     bannerHideWork?.cancel()
@@ -434,6 +477,21 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   }
 
   // MARK: - WKNavigationDelegate
+
+  func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    if navigation === entryNavigation {
+      entryPending = false
+      entryTimeout?.cancel()
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    if navigation === entryNavigation && (error as NSError).code != NSURLErrorCancelled { failEntry() }
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    if navigation === entryNavigation && (error as NSError).code != NSURLErrorCancelled { failEntry() }
+  }
 
   func webView(
     _ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
@@ -470,6 +528,12 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
   ) {
     if navigationResponse.isForMainFrame {
+      if entryPending, let status = (navigationResponse.response as? HTTPURLResponse)?.statusCode,
+         status == 404 || status >= 500 {
+        decisionHandler(.cancel)
+        failEntry()
+        return
+      }
       let disposition =
         (navigationResponse.response as? HTTPURLResponse)?
         .value(forHTTPHeaderField: "Content-Disposition")?.lowercased() ?? ""

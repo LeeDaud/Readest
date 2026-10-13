@@ -445,6 +445,8 @@ pub struct ClipUrlResponse {
 #[serde(rename_all = "camelCase")]
 pub struct WebBrowserRequest {
     pub url: String,
+    #[serde(default)]
+    pub fallback_urls: Option<Vec<String>>,
     pub download_dir: String,
     pub capture_script: String,
     #[serde(default)]

@@ -44,6 +44,40 @@ fn supported(name: &str) -> bool {
     )
 }
 
+/// Desktop entry selection cannot observe WebView2 network failures directly.
+/// Probe in native HTTP, preserving authentication/challenge responses as reachable.
+#[tauri::command]
+pub async fn resolve_zlibrary_entry<R: tauri::Runtime>(
+    window: WebviewWindow<R>,
+    urls: Vec<String>,
+) -> Result<String, String> {
+    trusted(&window)?;
+    if urls.is_empty() || urls.len() > 10 {
+        return Err("Configure between one and ten Z-Library websites".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    for entry in urls {
+        let url = tauri::Url::parse(&entry).map_err(|_| "Invalid website URL")?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("Use an HTTPS website URL without embedded credentials".into());
+        }
+        if let Ok(response) = client.get(url.clone()).send().await {
+            if !response.status().is_server_error() && response.status().as_u16() != 404 {
+                return Ok(url.to_string());
+            }
+        }
+    }
+    Err("所有 Z-Library 网站均连接失败，请在设置中检查网站列表".into())
+}
+
 #[tauri::command]
 pub async fn open_zlibrary<R: tauri::Runtime>(
     app: AppHandle<R>,
@@ -80,7 +114,7 @@ pub async fn open_zlibrary<R: tauri::Runtime>(
         let handle = app.clone();
         let requests = std::sync::Mutex::new(Vec::<(String, PathBuf, String)>::new());
         let builder = WebviewWindowBuilder::new(&app, "zlibrary-browser", WebviewUrl::External(url))
-            .title("Z-Library · Z-Reader")
+            .title("Z-Library · Readest")
             .inner_size(1100.0, 800.0)
             .on_navigation(|url| url.scheme() == "https")
             // Keep target=_blank links in this browser so the download handler applies.

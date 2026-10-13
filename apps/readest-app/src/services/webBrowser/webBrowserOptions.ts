@@ -26,9 +26,12 @@ export type WebBrowserLabelKey =
   | 'added'
   | 'failed'
   | 'unsupported'
-  | 'open';
+  | 'open'
+  | 'sitesUnavailable';
 
 export interface WebBrowserOptions {
+  /** Initial entry failover only; not used for later browsing or downloads. */
+  fallbackUrls?: string[];
   /** `#rrggbb` — theme base-100. */
   background: string;
   /** `#rrggbb` — theme base-content. */
@@ -61,6 +64,7 @@ export function getWebBrowserOptions(_: Translate, isEink: boolean): WebBrowserO
       failed: _('Import failed'),
       unsupported: _('Not a supported book format'),
       open: _('Open'),
+      sitesUnavailable: '所有配置的网站均连接失败，请在设置中检查网站列表',
     },
   };
 }

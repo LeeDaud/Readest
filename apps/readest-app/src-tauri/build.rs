@@ -63,6 +63,7 @@ fn main() {
             "clear_book_presence",
             "clip_url",
             "open_zlibrary",
+            "resolve_zlibrary_entry",
             "pending_zlibrary_downloads",
             "acknowledge_zlibrary_download",
             "open_web_browser",

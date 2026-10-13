@@ -39,4 +39,6 @@ node scripts/prepare-android-branding.mjs
 
 此前 APK 为 `artifacts/android/Z-Reader-0.12.12-arm64-debug.apk`，207,793,549 字节，SHA256 为 `87B49542DAF32EF10C44D86CB7AD75536317AA095C83C40C90CD8672FC525DE9`。包名 `com.bilingify.readest.zreader`，版本 `0.12.12-zreader-dev`（12012），APK v2 签名与 16 KB ZIP 对齐检查通过。此历史产物仍使用旧名称；新的 Readest 名称产物另存，避免混淆。正式发布需要自己的签名与 release 构建。
 
-最新产物：`artifacts/android/Readest-0.12.12-zlibrary-arm64-debug.apk`，209,107,671 字节，SHA256 为 `686443C1608E720134CCB7C9BA8E32F31549FA0FA96FEFA49AE201F13D27A080`。aapt 核验名称为 Readest，包名、版本与 ABI 不变；APK v2 签名和 16 KB ZIP 对齐检查通过。Android 图标从上游已提交资源复制；此次离线 Gradle 组装通过（20 秒）。再次安装时设备列表为空，未完成新资源包的模拟器安装显示验证。前次完整流程验证记录仍保留，不等同于本次新包实测。
+恢复品牌后的产物：`artifacts/android/Readest-0.12.12-zlibrary-arm64-debug.apk`，209,107,671 字节，SHA256 为 `686443C1608E720134CCB7C9BA8E32F31549FA0FA96FEFA49AE201F13D27A080`。aapt 核验名称为 Readest，包名、版本与 ABI 不变；APK v2 签名和 16 KB ZIP 对齐检查通过。Android 图标从上游已提交资源复制；此次离线 Gradle 组装通过（20 秒）。再次安装时设备列表为空，未完成新资源包的模拟器安装显示验证。前次完整流程验证记录仍保留，不等同于本次新包实测。
+
+最新多网址配置产物：`artifacts/android/Readest-0.12.12-zlibrary-sites-arm64-debug.apk`，208,107,613 字节，SHA256 为 `2B3192D97E60EAA630FF92FD20B792FE377074F48A594EE5092DE7D39319E28D`。名称、包名、版本和上游图标延续；签名与对齐检查通过。设置中保存网站列表，书架菜单直接进入并按顺序尝试备用站点。见 [多网址验证记录](validation-zlibrary-sites-2026-10-14.md)；本次无连接设备，尚未实测新包的自动换站流程。

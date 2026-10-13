@@ -67,6 +67,7 @@ describe('getWebBrowserOptions', () => {
         'openInBrowser',
         'reload',
         'signOut',
+        'sitesUnavailable',
         'stop',
         'unsupported',
       ].sort(),

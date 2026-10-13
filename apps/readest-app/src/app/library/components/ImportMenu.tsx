@@ -1,5 +1,6 @@
 import clsx from 'clsx';
-import { useRouter } from 'next/navigation';
+import { useOpenZLibrary } from '@/hooks/useOpenZLibrary';
+import { eventDispatcher } from '@/utils/event';
 import { MdLanguage, MdMenuBook, MdRssFeed } from 'react-icons/md';
 import { LuLibrary } from 'react-icons/lu';
 import { IoFileTray } from 'react-icons/io5';
@@ -30,7 +31,7 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
   onOpenFeeds,
 }) => {
   const _ = useTranslation();
-  const router = useRouter();
+  const openZLibrary = useOpenZLibrary();
   const { appService } = useEnv();
 
   const handleImportFromFiles = () => {
@@ -76,7 +77,13 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
         Icon={<MdLanguage className='h-5 w-5' />}
         onClick={() => {
           setIsDropdownOpen?.(false);
-          router.push('/zlibrary');
+          void openZLibrary().catch((err) => {
+            eventDispatcher.dispatch('toast', {
+              type: 'error',
+              message: err instanceof Error ? err.message : String(err),
+              timeout: 5000,
+            });
+          });
         }}
       />
       <MenuItem

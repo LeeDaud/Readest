@@ -677,6 +677,7 @@ pub fn run() {
             discord_rpc::clear_book_presence,
             clip_url::clip_url,
             zlibrary::open_zlibrary,
+            zlibrary::resolve_zlibrary_entry,
             zlibrary::pending_zlibrary_downloads,
             zlibrary::acknowledge_zlibrary_download,
             web_browser::open_web_browser,

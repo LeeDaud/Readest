@@ -421,6 +421,8 @@ export interface HardwarePageTurnerSettings {
 }
 
 export interface SystemSettings {
+  /** Ordered Z-Library entry URLs, shared by the settings UI and book import. */
+  zlibraryUrls?: string[];
   version: number;
   migrationVersion: number;
   localBooksDir: string;

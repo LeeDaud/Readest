@@ -242,6 +242,7 @@
     "allow-clear-book-presence",
     "allow-clip-url",
     "allow-open-zlibrary",
+    "allow-resolve-zlibrary-entry",
     "allow-pending-zlibrary-downloads",
     "allow-acknowledge-zlibrary-download",
     "allow-open-web-browser",

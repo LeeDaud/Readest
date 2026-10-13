@@ -24,6 +24,10 @@ import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceError
+import android.webkit.WebResourceResponse
+import android.webkit.SslErrorHandler
+import android.net.http.SslError
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -46,6 +50,7 @@ import org.json.JSONObject
 @InvokeArg
 class WebBrowserArgs {
     var url: String? = null
+    var fallbackUrls: List<String>? = null
     var downloadDir: String? = null
     var captureScript: String? = null
     var background: String? = null
@@ -118,6 +123,34 @@ class WebBrowserController(
     private var finished = false
     private var capturing = false
     private val hideBannerRunnable = Runnable { banner?.visibility = View.GONE }
+    private var entryIndex = 0
+    private var entryPending = args.fallbackUrls != null
+    private var entryNavigation: String? = null
+    private val entryUrls = (listOfNotNull(args.url) + (args.fallbackUrls ?: emptyList()))
+        .filter { it.startsWith("https://") || it.startsWith("http://") }.distinct().take(10)
+    private val entryTimeout = Runnable { failEntry() }
+
+    private fun failEntry() {
+        if (!entryPending || finished) return
+        entryPending = false
+        mainHandler.removeCallbacks(entryTimeout)
+        if (entryIndex + 1 >= entryUrls.size) {
+            webView?.stopLoading()
+            setStatus("unavailable", label("sitesUnavailable", "All configured websites failed to load"), null)
+            return
+        }
+        entryIndex += 1
+        // Queue navigation so the previous error page's onPageFinished cannot
+        // mark the next entry successful before it has even started loading.
+        mainHandler.post {
+            if (finished) return@post
+            webView?.stopLoading()
+            entryNavigation = entryUrls[entryIndex]
+            entryPending = true
+            mainHandler.postDelayed(entryTimeout, 20_000L)
+            webView?.loadUrl(entryUrls[entryIndex])
+        }
+    }
 
     private fun label(key: String, fallback: String): String =
         args.labels?.get(key)?.takeIf { it.isNotEmpty() } ?: fallback
@@ -176,6 +209,8 @@ class WebBrowserController(
         dlg.setContentView(root)
         dialog = dlg
         dlg.show()
+        entryNavigation = urlStr
+        if (entryPending) mainHandler.postDelayed(entryTimeout, 20_000L)
         wv.loadUrl(urlStr)
     }
 
@@ -234,7 +269,13 @@ class WebBrowserController(
         bar.addView(titles)
 
         reloadButton = iconButton(act, R.drawable.ic_browser_refresh, label("reload", "Reload")) {
-            webView?.let { if (loading) it.stopLoading() else it.reload() }
+            webView?.let {
+                if (loading) {
+                    entryPending = false
+                    mainHandler.removeCallbacks(entryTimeout)
+                    it.stopLoading()
+                } else it.reload()
+            }
         }
         bar.addView(reloadButton)
         menuButton = iconButton(act, R.drawable.ic_browser_more, label("menu", "More")) { showMenu(act) }
@@ -392,11 +433,11 @@ class WebBrowserController(
             "downloading" to "Downloading", "importing" to "Importing", "added" to "Added to library",
             "failed" to "Import failed", "unsupported" to "Not a supported book format",
         )
-        bannerText?.text = "${label(state, fallback[state] ?: state)} · $filename"
+        bannerText?.text = if (state == "unavailable") filename else "${label(state, fallback[state] ?: state)} · $filename"
         openBookHash = if (state == "added") bookHash else null
         bannerOpen?.visibility = if (openBookHash != null) View.VISIBLE else View.GONE
         banner?.visibility = View.VISIBLE
-        if (state != "downloading" && state != "importing") {
+        if (state != "downloading" && state != "importing" && state != "unavailable") {
             mainHandler.postDelayed(hideBannerRunnable, BANNER_HIDE_MS)
         }
     }
@@ -440,6 +481,7 @@ class WebBrowserController(
             }
 
             override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                if (entryPending) entryNavigation = url
                 setLoading(true)
                 setHost(url)
             }
@@ -447,6 +489,30 @@ class WebBrowserController(
             override fun onPageFinished(view: WebView, url: String?) {
                 setLoading(false)
                 setProgress(100)
+            }
+
+            override fun onPageCommitVisible(view: WebView, url: String?) {
+                if (entryPending && url == entryNavigation) {
+                    entryPending = false
+                    mainHandler.removeCallbacks(entryTimeout)
+                }
+            }
+
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (request.isForMainFrame && request.url.toString() == entryNavigation) failEntry()
+                super.onReceivedError(view, request, error)
+            }
+
+            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                // Keep login/anti-bot challenges (401/403/429) on the current site.
+                if (request.isForMainFrame && request.url.toString() == entryNavigation &&
+                    (response.statusCode == 404 || response.statusCode >= 500)) failEntry()
+                super.onReceivedHttpError(view, request, response)
+            }
+
+            override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+                handler.cancel()
+                if (error.url == entryNavigation) failEntry()
             }
         }
 
@@ -550,6 +616,7 @@ class WebBrowserController(
     // MARK: lifecycle
 
     private fun finish(hash: String?, page: WebBrowserPage? = null) {
+        mainHandler.removeCallbacks(entryTimeout)
         if (finished) return
         finished = true
         mainHandler.removeCallbacks(hideBannerRunnable)
