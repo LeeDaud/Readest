@@ -489,6 +489,10 @@ const FoliateViewer: React.FC<{
         // and then used by useMouseEvent and useTouchEvent
         // and more gesture events can be detected in the iframeEventHandlers
         detail.doc.isEventListenersAdded = true;
+        const readingActivity = () =>
+          document.dispatchEvent(new CustomEvent('reader-activity', { detail: { bookKey } }));
+        for (const name of ['pointerdown', 'keydown', 'wheel'])
+          detail.doc.addEventListener(name, readingActivity, { passive: true });
         detail.doc.addEventListener('keydown', handleKeydown.bind(null, bookKey));
         detail.doc.addEventListener('keyup', handleKeyup.bind(null, bookKey));
         detail.doc.addEventListener('mousedown', handleMousedown.bind(null, bookKey));

@@ -18,6 +18,7 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { eventDispatcher } from '@/utils/event';
 
 const nowSec = () => Math.floor(Date.now() / 1000);
+let activeReadingKey: string | null = null;
 
 // Statistics are best-effort telemetry: a failed write or sync (e.g. the
 // statistics DB torn down mid-flight on app teardown -> "database ... not
@@ -36,6 +37,7 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
   const coreRef = useRef(new TrackerCore(DEFAULT_STATS_TRACKING_CONFIG));
   const dbRef = useRef<StatisticsDb | null>(null);
   const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastActivityRef = useRef(0);
   const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // While this book is being read aloud, TtsStatsRecorder owns the clock and
   // this tracker stands down — otherwise TTS auto-follow's relocations would
@@ -129,7 +131,10 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
   };
 
   const openPageAt = (info: { current?: number; total: number } | undefined) => {
-    if (!info) return;
+    if (!info || document.visibilityState === 'hidden') return;
+    if (!activeReadingKey) activeReadingKey = bookKey;
+    if (activeReadingKey !== bookKey) return;
+    lastActivityRef.current = nowSec();
     void persist(coreRef.current.onPage((info.current ?? 0) + 1, info.total || 1, nowSec()));
     armIdle();
   };
@@ -171,6 +176,8 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
       if (document.visibilityState === 'hidden') {
         if (idleRef.current) clearTimeout(idleRef.current);
         void persist(coreRef.current.onHide(nowSec()));
+      } else if (!ttsPlayingRef.current) {
+        openPageAt(getBookProgress(bookKey)?.pageinfo);
       }
     };
     document.addEventListener('visibilitychange', onVis);
@@ -178,9 +185,60 @@ export default function ReadingStatsTracker({ bookKey }: { bookKey: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bookMd5]);
 
+  // Reader iframe interactions are forwarded with book identity. Only one
+  // visible book owns the manual-reading clock in a split view.
+  useEffect(() => {
+    const activity = (event: Event) => {
+      const detail = (event as CustomEvent<{ bookKey?: string }>).detail;
+      const target =
+        event.target instanceof Element
+          ? event.target.closest('[data-reading-book-key]')?.getAttribute('data-reading-book-key')
+          : null;
+      const key = detail?.bookKey ?? target ?? activeReadingKey;
+      if (key !== bookKey) {
+        if (event.type === 'reader-activity' && detail?.bookKey) {
+          if (idleRef.current) clearTimeout(idleRef.current);
+          void persist(coreRef.current.onHide(nowSec()));
+        }
+        return;
+      }
+      activeReadingKey = bookKey;
+      if (!ttsPlayingRef.current) openPageAt(getBookProgress(bookKey)?.pageinfo);
+    };
+    for (const name of ['reader-activity', 'pointerdown', 'keydown', 'wheel'])
+      document.addEventListener(name, activity);
+    return () => {
+      for (const name of ['reader-activity', 'pointerdown', 'keydown', 'wheel'])
+        document.removeEventListener(name, activity);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey, bookMd5]);
+
+  // Immutable chunks keep active scrolling on the same page from hitting
+  // the per-event safety cap, without extending the inactivity deadline.
+  useEffect(() => {
+    const heartbeat = setInterval(() => {
+      const now = nowSec();
+      if (
+        activeReadingKey !== bookKey ||
+        document.visibilityState === 'hidden' ||
+        ttsPlayingRef.current ||
+        now - lastActivityRef.current >= DEFAULT_STATS_TRACKING_CONFIG.idleTimeoutSeconds
+      )
+        return;
+      const info = getBookProgress(bookKey)?.pageinfo;
+      if (!info) return;
+      void persist(coreRef.current.onClose(now));
+      coreRef.current.onPage((info.current ?? 0) + 1, info.total || 1, now);
+    }, 60_000);
+    return () => clearInterval(heartbeat);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey, bookMd5]);
+
   // Book close (unmount).
   useEffect(() => {
     return () => {
+      if (activeReadingKey === bookKey) activeReadingKey = null;
       if (idleRef.current) clearTimeout(idleRef.current);
       if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
       runBestEffort(

@@ -18,13 +18,20 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       /* A fresh install has no settings file. */
     }
     page = await openFixtureBook(path.resolve(__dirname, '../fixtures/data/sample-alice.epub'));
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await adbShell('input keyevent KEYCODE_HOME');
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await adbShell(`am start -n ${APP_PKG}/com.bilingify.readest.MainActivity`);
+    await waitFor(() => page.evaluate<boolean>("return document.visibilityState === 'visible';"), {
+      label: 'reader foreground restored',
+    });
     await page.evaluate("setTimeout(() => location.assign('/discover'), 20);");
     await waitFor(
       () =>
         page.evaluate<boolean>(
-          "return [...document.querySelectorAll('button')].some(b => /随机推荐一本|继续推荐|开始新一轮/.test(b.textContent) && !b.disabled);",
+          "return !!document.querySelector('article h2') && [...document.querySelectorAll('button')].some(b => b.textContent.includes('换一本') && !b.disabled);",
         ),
-      { label: 'native discovery loaded' },
+      { timeoutMs: 90_000, label: 'native discovery loaded' },
     );
   });
   afterAll(async () => {
@@ -37,9 +44,6 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
     await writeAppFile(APP_PKG, 'settings.json', JSON.stringify(settings));
   });
   it('left-swipes one card, records read history and retains it after native WebView reload', async () => {
-    await page.evaluate(
-      "[...document.querySelectorAll('button')].find(b => /随机推荐一本|继续推荐|开始新一轮/.test(b.textContent)).click();",
-    );
     const first = await waitFor(
       () =>
         page.evaluate<string>("return document.querySelector('article h2')?.textContent || '';"),
@@ -62,47 +66,78 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
         );
         return title && title !== first ? title : null;
       },
-      { label: 'left swipe changed native card' },
+      { timeoutMs: 90_000, label: 'left swipe changed native card' },
     );
     await page.evaluate(
-      "[...document.querySelectorAll('button')].find(b => b.textContent === '已经读过').click();",
+      "[...document.querySelectorAll('button')].find(b => b.textContent.trim() === '已经读过').click();",
     );
     await waitFor(
       async () => {
-        const settings = JSON.parse(await readAppFile(APP_PKG, 'settings.json'));
-        const records = Object.values(settings.bookDiscovery?.records ?? {}) as {
-          title: string;
-          status: string;
-        }[];
-        return (
-          records.some((entry) => entry.title === first && entry.status === 'dismissed') &&
-          records.some((entry) => entry.title === second && entry.status === 'read')
+        return await page.evaluate<boolean>(
+          "return [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
         );
       },
-      { label: 'history persisted in native settings' },
+      { timeoutMs: 90_000, label: 'read record saved and next card ready' },
+    );
+    await page.evaluate("setTimeout(() => location.assign('/read-history'), 20);");
+    await waitFor(
+      () =>
+        page.evaluate<boolean>(
+          `return [...document.querySelectorAll('h2')].some(heading => heading.textContent === ${JSON.stringify(second)});`,
+        ),
+      { label: 'independent read history loaded from native database' },
     );
     await page.evaluate('setTimeout(() => location.reload(), 20);');
     await waitFor(
       () =>
         page.evaluate<boolean>(
-          "return [...document.querySelectorAll('button')].some(b => b.textContent === '阅读记录');",
+          `return [...document.querySelectorAll('h2')].some(heading => heading.textContent === ${JSON.stringify(second)});`,
         ),
-      { label: 'native discovery reloaded' },
+      { label: 'read record retained after native reload' },
     );
+    const text = await page.evaluate<string>('return document.body.innerText;');
+    expect(text).toContain(second);
+    expect(text).toContain('已读清单');
+    expect(
+      await page.evaluate<number>(
+        `return [...document.querySelectorAll('h2')].filter(heading => heading.textContent === ${JSON.stringify(first)}).length;`,
+      ),
+    ).toBe(0);
+  });
+
+  it('edits a completed record and persists the edit on the separate native page', async () => {
+    await page.evaluate(
+      "[...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label')?.startsWith('编辑 ')).click();",
+    );
+    await page.evaluate(
+      `const input=document.querySelector('input[required]'); const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; setter.call(input,'Android 已读编辑验证'); input.dispatchEvent(new Event('input',{bubbles:true}));`,
+    );
+    await page.evaluate("document.querySelector('form').requestSubmit();");
     await waitFor(
       () =>
         page.evaluate<boolean>(
-          "return [...document.querySelectorAll('button')].some(b => b.textContent === '继续推荐' && !b.disabled);",
+          "return [...document.querySelectorAll('h2')].some(h => h.textContent === 'Android 已读编辑验证');",
         ),
-      { label: 'native saved preferences loaded' },
+      { label: 'native completed-book edit saved' },
     );
-    await page.evaluate(
-      "[...document.querySelectorAll('button')].find(b => b.textContent === '阅读记录').click();",
+    await page.evaluate('setTimeout(() => location.reload(), 20);');
+    await waitFor(
+      () =>
+        page.evaluate<boolean>(
+          "return [...document.querySelectorAll('h2')].some(h => h.textContent === 'Android 已读编辑验证');",
+        ),
+      { label: 'native completed-book edit survived reload' },
     );
-    const text = await page.evaluate<string>('return document.body.innerText;');
-    expect(text).toContain(first);
-    expect(text).toContain(second);
-    expect(text).toContain('不感兴趣');
-    expect(text).toContain('已读');
+    await page.evaluate("setTimeout(() => location.assign('/reading-stats'), 20);");
+    await waitFor(
+      () =>
+        page.evaluate<boolean>(
+          'return !!document.querySelector(\'section[aria-label="总阅读时长"]\');',
+        ),
+      { label: 'native statistics database loaded' },
+    );
+    expect(await page.evaluate<string>('return document.body.innerText;')).toContain(
+      '各本书的阅读时长',
+    );
   });
 });

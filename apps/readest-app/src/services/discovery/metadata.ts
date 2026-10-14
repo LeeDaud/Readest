@@ -1,10 +1,9 @@
-import { isTauriAppPlatform } from '@/services/environment';
 import { matchesWork } from './recommendations';
 import type { DiscoveryBook, DiscoveryMetadata } from './types';
+import { openLibraryJson, parseDescription } from './openLibrary';
 
-const CACHE_KEY = 'readest-discovery-metadata-v1';
+const CACHE_KEY = 'readest-discovery-metadata-v2';
 const TTL = 7 * 24 * 60 * 60 * 1000;
-let nextRequestAt = 0;
 const pending = new Map<string, Promise<DiscoveryMetadata | null>>();
 
 export function parseOpenLibraryMetadata(
@@ -36,7 +35,7 @@ export function parseOpenLibraryMetadata(
       url: `https://openlibrary.org/works/${key}`,
     };
     if (Number.isSafeInteger(item.cover_i) && item.cover_i > 0)
-      result.coverUrl = `https://covers.openlibrary.org/b/id/${item.cover_i}-M.jpg`;
+      result.coverUrl = `https://covers.openlibrary.org/b/id/${item.cover_i}-M.jpg?default=false`;
     if (
       typeof item.ratings_average === 'number' &&
       Number.isFinite(item.ratings_average) &&
@@ -72,14 +71,20 @@ function readCache(): Record<string, CacheEntry> {
 export function loadDiscoveryMetadata(book: DiscoveryBook): Promise<DiscoveryMetadata | null> {
   const cache = readCache();
   const cached = cache[book.id];
-  if (cached && Number.isFinite(cached.at) && Date.now() - cached.at < TTL) {
+  if (
+    cached &&
+    Number.isFinite(cached.at) &&
+    Date.now() - cached.at < (cached.value === null ? 5 * 60 * 1000 : TTL)
+  ) {
     const value = cached.value;
     if (
       value === null ||
       (value?.source === 'Open Library' &&
         /^https:\/\/openlibrary\.org\/works\/OL\d+W$/.test(value.url) &&
         (!value.coverUrl ||
-          /^https:\/\/covers\.openlibrary\.org\/b\/id\/\d+-M\.jpg$/.test(value.coverUrl)) &&
+          /^https:\/\/covers\.openlibrary\.org\/b\/id\/\d+-M\.jpg\?default=false$/.test(
+            value.coverUrl,
+          )) &&
         (value.rating === undefined ||
           (typeof value.rating === 'number' &&
             Number.isFinite(value.rating) &&
@@ -93,9 +98,6 @@ export function loadDiscoveryMetadata(book: DiscoveryBook): Promise<DiscoveryMet
   const existing = pending.get(book.id);
   if (existing) return existing;
   const task = (async () => {
-    const delay = Math.max(0, nextRequestAt - Date.now());
-    nextRequestAt = Math.max(Date.now(), nextRequestAt) + 1100;
-    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     const url = new URL('https://openlibrary.org/search.json');
     url.searchParams.set('title', book.titleAliases?.[0] ?? book.title);
     url.searchParams.set(
@@ -104,15 +106,8 @@ export function loadDiscoveryMetadata(book: DiscoveryBook): Promise<DiscoveryMet
     );
     url.searchParams.set('limit', '10');
     url.searchParams.set('fields', 'key,title,author_name,cover_i,ratings_average,ratings_count');
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    try {
-      const fetcher = isTauriAppPlatform()
-        ? (await import('@tauri-apps/plugin-http')).fetch
-        : globalThis.fetch;
-      const response = await fetcher(url.href, { signal: controller.signal });
-      if (!response.ok) throw new Error('在线资料暂不可用，请稍后重试');
-      const value = parseOpenLibraryMetadata(book, await response.json());
+    {
+      const value = parseOpenLibraryMetadata(book, await openLibraryJson(url.href));
       try {
         const entries = readCache();
         entries[book.id] = { at: Date.now(), value };
@@ -124,16 +119,58 @@ export function loadDiscoveryMetadata(book: DiscoveryBook): Promise<DiscoveryMet
         );
         localStorage.setItem(CACHE_KEY, JSON.stringify(bounded));
       } catch {
-        /* Metadata cache is optional; reading history is stored separately in settings. */
+        /* Metadata cache is optional; reading history is stored in its own database. */
       }
       return value;
-    } finally {
-      clearTimeout(timeout);
     }
   })();
   pending.set(book.id, task);
   void task.finally(() => pending.delete(book.id)).catch(() => {});
   return task;
+}
+
+export async function loadBookDetails(
+  book: DiscoveryBook,
+  signal?: AbortSignal,
+): Promise<DiscoveryBook> {
+  const metadata = book.metadata ?? (await loadDiscoveryMetadata(book)) ?? undefined;
+  signal?.throwIfAborted();
+  const workId = book.workId ?? metadata?.url.split('/').pop();
+  if (!workId || !/^OL\d+W$/.test(workId)) return { ...book, metadata };
+  let work: unknown;
+  try {
+    work = await openLibraryJson(`https://openlibrary.org/works/${workId}.json`, signal);
+  } catch {
+    signal?.throwIfAborted();
+    return { ...book, metadata };
+  }
+  let summary = parseDescription(work) || book.summary;
+  if (!summary && book.editionId && /^OL\d+M$/.test(book.editionId))
+    summary = parseDescription(
+      await openLibraryJson(`https://openlibrary.org/books/${book.editionId}.json`, signal),
+    );
+  const covers =
+    work && typeof work === 'object' && 'covers' in work && Array.isArray(work.covers)
+      ? work.covers
+      : [];
+  const cover = covers.find(
+    (value) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0,
+  );
+  return {
+    ...book,
+    workId,
+    summary,
+    metadata: metadata
+      ? {
+          ...metadata,
+          coverUrl:
+            metadata.coverUrl ??
+            (cover
+              ? `https://covers.openlibrary.org/b/id/${cover}-M.jpg?default=false`
+              : undefined),
+        }
+      : undefined,
+  };
 }
 
 export function doubanSearchUrl(book: Pick<DiscoveryBook, 'title' | 'author'>): string {

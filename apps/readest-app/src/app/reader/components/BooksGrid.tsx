@@ -190,6 +190,10 @@ const BookCellInner: React.FC<BookCellProps> = ({
   return (
     <div
       id={`gridcell-${bookKey}`}
+      data-reading-book-key={bookKey}
+      onPointerDown={() =>
+        document.dispatchEvent(new CustomEvent('reader-activity', { detail: { bookKey } }))
+      }
       // Layered page turns (slide/curl) snapshot this element, so the page
       // header and footer rendered as siblings of the viewer turn with the
       // page in both layers.

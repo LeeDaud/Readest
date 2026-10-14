@@ -15,6 +15,9 @@ export interface DiscoveryBook {
   summary: string;
   titleAliases?: string[];
   authorAliases?: string[];
+  workId?: string;
+  editionId?: string;
+  metadata?: DiscoveryMetadata;
 }
 export type DiscoveryStatus = 'read' | 'dismissed' | 'selected';
 export interface DiscoveryRecord {
@@ -23,6 +26,9 @@ export interface DiscoveryRecord {
   author: string;
   status: DiscoveryStatus;
   updatedAt: number;
+  readAt?: string;
+  titleAliases?: string[];
+  authorAliases?: string[];
 }
 export interface DiscoveryPreferences {
   version: 1;
