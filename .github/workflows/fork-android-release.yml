@@ -1,0 +1,194 @@
+name: Fork Android validation and release
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch or commit to validate'
+        default: codex/zlibrary-integration
+        required: true
+        type: string
+      pull_request:
+        description: 'Upgrade PR number (empty for already merged code)'
+        default: ''
+        type: string
+      publish:
+        description: 'Merge validated PR and publish the prerelease; otherwise create a draft'
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      pull_request:
+        default: ''
+        type: string
+      publish:
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: fork-android-${{ inputs.source_ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    name: Validate Android fork
+    if: github.repository == 'LeeDaud/Readest'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+      version: ${{ steps.identity.outputs.version }}
+    env:
+      HUSKY: '0'
+      npm_config_manage_package_manager_versions: 'false'
+      READEST_ANDROID_PACKAGE: com.bilingify.readest.zreader
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Verify integration and identify source
+        id: identity
+        run: |
+          node scripts/verify-fork.mjs
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          version=$(node -p "require('./apps/readest-app/package.json').version")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: zulu
+          java-version: '17'
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
+        with:
+          packages: platform-tools
+      - run: sdkmanager 'platforms;android-36' 'build-tools;36.1.0' 'ndk;28.2.13676358'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @readest/readest-app setup-vendors
+      - name: Type check and fork regressions
+        run: |
+          pnpm --filter @readest/readest-app exec tsc --noEmit
+          pnpm --filter @readest/readest-app exec biome lint src/services/discovery src/services/forkUpdatePolicy.ts src/helpers/updater.ts src/hooks/useOpenZLibrary.ts src/app/discover
+          pnpm --filter @readest/readest-app test --run src/__tests__/helpers/updater.test.ts src/__tests__/helpers/forkUpdatePolicy.test.ts src/__tests__/components/UpdaterWindow.test.tsx src/__tests__/components/AboutWindow.test.tsx src/__tests__/app/discover.test.tsx src/__tests__/services/discovery.test.ts src/__tests__/app/library/zlibrary-mobile.test.tsx src/__tests__/services/zlibrarySites.test.ts src/__tests__/services/zlibraryDownloads.test.ts src/__tests__/services/webBrowser/webBrowser.test.ts src/__tests__/hooks/useWebBrowserDownloads.test.tsx src/__tests__/components/settings/ZLibraryForm.test.tsx
+      - name: Generate Android scaffolding and restore tracked customizations
+        working-directory: apps/readest-app
+        run: |
+          mv src-tauri/gen/android "$RUNNER_TEMP/android-tracked"
+          pnpm tauri android init --ci
+          git restore --source=HEAD -- src-tauri/gen/android
+      - name: Configure fixed signing certificate
+        env:
+          KEYSTORE: ${{ secrets.FORK_ANDROID_KEYSTORE_BASE64 }}
+          KEY_PASSWORD: ${{ secrets.FORK_ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FORK_ANDROID_KEY_ALIAS }}
+        run: |
+          test -n "$KEYSTORE" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
+          printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/fork-signing.jks"
+          printf 'keyAlias=%s\npassword=%s\nstoreFile=%s\n' "$KEY_ALIAS" "$KEY_PASSWORD" "$RUNNER_TEMP/fork-signing.jks" > apps/readest-app/src-tauri/gen/android/keystore.properties
+      - name: Build and verify ARM64 package
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          pnpm tauri android build --apk --debug --target aarch64 --ci
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-debug src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/libreadestlib.so
+          find src-tauri/gen/android/app/build/outputs/apk -name '*debug.apk' -delete
+          (cd src-tauri/gen/android && ./gradlew assembleArm64Debug -x rustBuildArm64Debug --no-daemon)
+          mkdir -p ../../.fork-ci
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug.apk' | head -n 1)
+          test -n "$apk"
+          "$ANDROID_HOME/build-tools/36.1.0/apksigner" verify "$apk"
+          "$ANDROID_HOME/build-tools/36.1.0/zipalign" -c -P 16 4 "$apk"
+          "$ANDROID_HOME/build-tools/36.1.0/aapt" dump badging "$apk" | grep "package: name='com.bilingify.readest.zreader'"
+          cp "$apk" "../../.fork-ci/Readest-$VERSION-zlibrary-arm64-debug.apk"
+          cd ../../.fork-ci && sha256sum *.apk > SHA256SUMS
+      - name: Build native emulator package
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          pnpm tauri android build --apk --debug --target x86_64 --ci
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug.apk' -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)
+          echo "EMULATOR_APK=$PWD/$apk" >> "$GITHUB_ENV"
+      - name: Enable emulator KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Android import and reading validation
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            adb install -r "$EMULATOR_APK"
+            adb shell pm path com.bilingify.readest.zreader
+            cd apps/readest-app && pnpm test:android --reporter=default --reporter=json --outputFile=../../.fork-ci/android-tests.json
+      - name: Reject silently skipped device tests
+        run: |
+          node -e "const r=require('./.fork-ci/android-tests.json'); if(!r.numTotalTests || r.numPendingTests || r.numPassedTests!==r.numTotalTests) process.exit(1)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fork-android-package
+          path: .fork-ci/
+          if-no-files-found: error
+      - name: Clean signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/fork-signing.jks" apps/readest-app/src-tauri/gen/android/keystore.properties
+  stage-release:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fork-android-package
+          path: .fork-ci
+      - name: Stage or publish verified fork prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          tag="fork-v$VERSION-r1"
+          if [[ "$PUBLISH" == true ]]; then
+            if [[ -n "$PULL_REQUEST" ]]; then
+              [[ "$PULL_REQUEST" =~ ^[0-9]+$ ]]
+              gh pr merge "$PULL_REQUEST" --merge --match-head-commit "$SOURCE_SHA"
+            fi
+            git fetch origin codex/zlibrary-integration
+            git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
+          fi
+          printf 'Readest Z-Library integration, upstream baseline %s.\n\nAndroid ARM64 debug package with a fixed fork certificate. CI validates native import/reading and fork regressions; real-site login/download requires device acceptance.\n\nSource: %s\n' "$VERSION" "$SOURCE_SHA" > .fork-ci/release-notes.md
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$SOURCE_SHA" --draft --prerelease --title "Readest $VERSION · Z-Library Fork" --notes-file .fork-ci/release-notes.md
+          fi
+          test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+          gh release upload "$tag" .fork-ci/*.apk .fork-ci/SHA256SUMS .fork-ci/android-tests.json --clobber
+          if [[ "$PUBLISH" == true ]]; then gh release edit "$tag" --draft=false; fi

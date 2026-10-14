@@ -1,0 +1,87 @@
+name: Fork upstream synchronization
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+jobs:
+  synchronize:
+    if: github.repository == 'LeeDaud/Readest' && vars.FORK_SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      branch: ${{ steps.merge.outputs.branch }}
+      pr: ${{ steps.pr.outputs.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: codex/zlibrary-integration
+          fetch-depth: 0
+      - name: Detect latest stable upstream release
+        id: upstream
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        with:
+          script: |
+            const {data} = await github.rest.repos.getLatestRelease({owner:'readest',repo:'readest'});
+            if (data.draft || data.prerelease || !/^v\d+\.\d+\.\d+$/.test(data.tag_name)) throw Error('Unexpected upstream release');
+            core.setOutput('tag', data.tag_name);
+      - name: Merge upstream without overwriting fork changes
+        id: merge
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          HUSKY: '0'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags https://github.com/readest/readest.git "refs/tags/$UPSTREAM_TAG"
+          upstream=$(git rev-parse 'FETCH_HEAD^{commit}')
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          branch="codex/upstream-$UPSTREAM_TAG"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "$branch"
+            git switch --detach FETCH_HEAD
+            git merge-base --is-ancestor "$upstream" HEAD
+          else
+            git switch -c "$branch"
+            git merge --no-edit "$upstream"
+            node scripts/verify-fork.mjs
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - name: Open or reuse upgrade pull request
+        if: steps.merge.outputs.changed == 'true'
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          SOURCE_BRANCH: ${{ steps.merge.outputs.branch }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        with:
+          script: |
+            const args={owner:context.repo.owner,repo:context.repo.repo};
+            const {data:prs}=await github.rest.pulls.list({...args,state:'open',head:`${context.repo.owner}:${process.env.SOURCE_BRANCH}`,base:'codex/zlibrary-integration'});
+            const pr=prs[0] ?? (await github.rest.pulls.create({...args,head:process.env.SOURCE_BRANCH,base:'codex/zlibrary-integration',title:`Sync Readest ${process.env.UPSTREAM_TAG}`,body:'Preserves the Z-Library integration and book discovery. Android validation and a draft fork package are built in this workflow; failures stop publication.'})).data;
+            core.setOutput('number',pr.number);
+  validate-and-stage:
+    needs: synchronize
+    if: needs.synchronize.outputs.changed == 'true'
+    uses: ./.github/workflows/fork-android-release.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      source_ref: ${{ needs.synchronize.outputs.branch }}
+      pull_request: ${{ needs.synchronize.outputs.pr }}
+      publish: ${{ vars.FORK_AUTO_PUBLISH == 'true' }}
+    secrets: inherit
