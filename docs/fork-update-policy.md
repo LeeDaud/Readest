@@ -4,7 +4,7 @@
 
 ## 当前：手动安装本项目版本
 
-目前未配置自己的 origin、发布服务和更新签名。因此 `src/services/forkUpdatePolicy.ts` 固定关闭更新，不提供用户开关：
+现已配置 `origin` 为 LeeDaud/Readest，并将已有 Android 调试签名安全保存为本 Fork 的 Actions Secrets，用于覆盖安装连续性。专用 CI 可验证并暂存 GitHub Release 安装包，但应用内更新清单及验证公钥尚未接入。因此 `src/services/forkUpdatePolicy.ts` 继续固定关闭应用更新，不提供用户开关：
 
 - NativeAppService 不声明可用应用更新能力，设置中的更新渠道选项不显示。
 - `checkForAppUpdates` 对自动、手动、stable 和 nightly 均直接返回，不访问官方服务、不显示新版本提示。
