@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { FORK_UPDATES_DISABLED, FORK_UPDATE_MESSAGE } from '@/services/forkUpdatePolicy';
 import Image from 'next/image';
 import { invoke } from '@tauri-apps/api/core';
 import { useEnv } from '@/context/EnvContext';
@@ -144,8 +145,13 @@ export const AboutWindow = () => {
                 {versionInfo}
               </button>
             </div>
-            <div className='my-1 h-5'>
-              {!updateStatus && (
+            <div className='my-1 min-h-5'>
+              {FORK_UPDATES_DISABLED && (
+                <p className='text-neutral-content max-w-sm px-4 text-xs leading-relaxed'>
+                  {FORK_UPDATE_MESSAGE}
+                </p>
+              )}
+              {!FORK_UPDATES_DISABLED && !updateStatus && (
                 <button
                   className='btn btn-sm btn-primary cursor-pointer p-1 text-xs'
                   onClick={appService?.hasUpdater ? handleCheckUpdate : handleShowRecentUpdates}

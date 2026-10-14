@@ -1,5 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import semver from 'semver';
+// Preserve upstream updater algorithm coverage separately from this fork's disabled policy.
+vi.mock('@/services/forkUpdatePolicy', () => ({ FORK_UPDATES_DISABLED: false }));
 
 // ── Mocks for Tauri and internal modules ─────────────────────────
 const mockCheck = vi.fn();

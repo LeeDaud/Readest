@@ -5,6 +5,7 @@ import { useEnv } from '@/context/EnvContext';
 import { useEffect, useState } from 'react';
 import { type as osType, arch as osArch } from '@tauri-apps/plugin-os';
 import { check, Update } from '@tauri-apps/plugin-updater';
+import { FORK_UPDATES_DISABLED, FORK_UPDATE_MESSAGE } from '@/services/forkUpdatePolicy';
 import { relaunch, exit } from '@tauri-apps/plugin-process';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { Command } from '@tauri-apps/plugin-shell';
@@ -386,7 +387,7 @@ export const UpdaterContent = ({
         setError(_('Failed to check for updates'));
       }
     };
-    if (appService?.hasUpdater && checkUpdate) {
+    if (!FORK_UPDATES_DISABLED && appService?.hasUpdater && checkUpdate) {
       checkForUpdates();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -411,6 +412,7 @@ export const UpdaterContent = ({
   }, [latestVersion, lastVersion, checkUpdate]);
 
   useEffect(() => {
+    if (FORK_UPDATES_DISABLED) return;
     const fetchChangelogs = async (fromVersion: string): Promise<Changelog[]> => {
       try {
         const fetch = isTauriAppPlatform() ? tauriFetch : window.fetch;
@@ -476,7 +478,7 @@ export const UpdaterContent = ({
   }, []);
 
   const handleDownloadInstall = async () => {
-    if (!update) {
+    if (FORK_UPDATES_DISABLED || !update) {
       return;
     }
     let downloaded = 0;
@@ -533,6 +535,9 @@ export const UpdaterContent = ({
     );
   }
 
+  if (FORK_UPDATES_DISABLED) {
+    return <p className='text-base-content p-6 text-sm leading-relaxed'>{FORK_UPDATE_MESSAGE}</p>;
+  }
   if (!newVersion) {
     return null;
   }

@@ -1,3 +1,4 @@
+import { FORK_UPDATES_DISABLED } from '@/services/forkUpdatePolicy';
 import {
   exists,
   mkdir,
@@ -587,6 +588,7 @@ export class NativeAppService extends BaseAppService {
   override hasSafeAreaInset = OS_TYPE === 'ios' || OS_TYPE === 'android';
   override hasHaptics = OS_TYPE === 'ios' || OS_TYPE === 'android';
   override hasUpdater =
+    !FORK_UPDATES_DISABLED &&
     OS_TYPE !== 'ios' &&
     !process.env['NEXT_PUBLIC_DISABLE_UPDATER'] &&
     !window.__READEST_UPDATER_DISABLED;

@@ -8,6 +8,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
+const forkPolicy = vi.hoisted(() => ({ disabled: false }));
+vi.mock('@/services/forkUpdatePolicy', () => ({
+  get FORK_UPDATES_DISABLED() {
+    return forkPolicy.disabled;
+  },
+  FORK_UPDATE_MESSAGE: '请安装本项目发布的安装包更新',
+}));
 
 const { mockInstallNightlyUpdate } = vi.hoisted(() => ({
   mockInstallNightlyUpdate: vi.fn(),
@@ -102,6 +109,7 @@ const RELEASE_NOTES = {
 };
 
 beforeEach(() => {
+  forkPolicy.disabled = false;
   mockLocale = 'en';
   mockOS = 'macos';
   vi.mocked(tauriDownload).mockReset();
@@ -119,6 +127,19 @@ afterEach(() => {
 });
 
 describe('UpdaterContent — auto-translated changelog', () => {
+  it.each([
+    'android',
+    'macos',
+  ])('blocks stale update dialogs and downloads on fork %s builds', async (platform) => {
+    forkPolicy.disabled = true;
+    mockOS = platform;
+    render(<UpdaterContent latestVersion='99.0.0' />);
+    expect(await screen.findByText('请安装本项目发布的安装包更新')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'DOWNLOAD & INSTALL' })).toBeNull();
+    expect(window.fetch).not.toHaveBeenCalled();
+    expect(tauriDownload).not.toHaveBeenCalled();
+    expect(installPackage).not.toHaveBeenCalled();
+  });
   it('contains a stable Android download failure and does not install a partial APK', async () => {
     mockOS = 'android';
     const failure = new Error('Response stream interrupted');

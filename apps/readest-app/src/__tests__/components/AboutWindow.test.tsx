@@ -87,6 +87,11 @@ const openDialog = async () => {
 };
 
 describe('AboutWindow version label', () => {
+  it('explains fork manual updates and removes the upstream update action', async () => {
+    await openDialog();
+    expect(screen.getByText(/当前为 Z-Library 集成版/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Check Update' })).toBeNull();
+  });
   beforeEach(() => {
     mockWriteTextToClipboard.mockClear();
     mockDispatch.mockClear();

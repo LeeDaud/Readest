@@ -45,4 +45,6 @@ node scripts/prepare-android-branding.mjs
 
 上一版访问 UI 产物：artifacts/android/Readest-0.12.12-zlibrary-ui-arm64-debug.apk，208,205,917 字节，SHA256 为 E99B65AE7733C14FFEEB9C30F4019B8C66231A298DF9BE0BCF798F2121A37DBA。签名与对齐检查通过。新增网站列表、名称、换站反馈、底部下载状态和分别重试功能。参见 [访问 UI 验证记录](validation-zlibrary-ui-2026-10-14.md)；原生 UI 尚需手机验收。
 
-最新发现书籍产物：`artifacts/android/Readest-0.12.12-discover-arm64-debug.apk`，208,222,301 字节，SHA256 为 `472A8E274187059AEB7A2EAE2A7A2CB87604AE4C29AE04A71211567287E85016`。加入外部书单单卡片推荐、左滑不感兴趣、已读记录、Open Library 评分与 Z-Library 带词搜索。签名与对齐检查通过；参见 [发现书籍验证记录](validation-discovery-2026-10-14.md)，新包实机流程待验收。
+发现书籍产物：`artifacts/android/Readest-0.12.12-discover-arm64-debug.apk`，208,222,301 字节，SHA256 为 `472A8E274187059AEB7A2EAE2A7A2CB87604AE4C29AE04A71211567287E85016`。加入外部书单单卡片推荐、左滑不感兴趣、已读记录、Open Library 评分与 Z-Library 带词搜索。签名与对齐检查通过；参见 [发现书籍验证记录](validation-discovery-2026-10-14.md)，新包实机流程待验收。
+
+最新更新保护产物：`artifacts/android/Readest-0.12.12-fork-updates-arm64-debug.apk`，208,222,301 字节，SHA256 为 `14F805E0AD8E7B320290BB3892FA31961DFC13A06BD7E479696221BE20B8354A`。关闭上游版本检查、更新提示及安装入口，防止官方二进制替代 Fork。签名与上一版一致、对齐检查通过；详见 [Fork 更新策略与验证](fork-update-policy.md)，尚需实机覆盖安装验证。

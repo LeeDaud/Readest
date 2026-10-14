@@ -1,4 +1,5 @@
 import semver from 'semver';
+import { FORK_UPDATES_DISABLED } from '@/services/forkUpdatePolicy';
 import { check } from '@tauri-apps/plugin-updater';
 import { type as osType, arch as osArch } from '@tauri-apps/plugin-os';
 import { fetch } from '@tauri-apps/plugin-http';
@@ -140,6 +141,7 @@ export const checkForAppUpdates = async (
   isAutoCheck = true,
   updateChannel: 'stable' | 'nightly' = 'stable',
 ): Promise<boolean> => {
+  if (FORK_UPDATES_DISABLED) return false;
   const lastCheck = localStorage.getItem(LAST_CHECK_KEY);
   const now = Date.now();
   if (isAutoCheck && lastCheck && now - parseInt(lastCheck, 10) < CHECK_UPDATE_INTERVAL_SEC * 1000)
@@ -218,6 +220,7 @@ export const getLastShownReleaseNotesVersion = () => {
 };
 
 export const checkAppReleaseNotes = async (isAutoCheck = true) => {
+  if (FORK_UPDATES_DISABLED) return false;
   const currentVersion = getAppVersion();
   const lastShownVersion = getLastShownReleaseNotesVersion();
   if ((lastShownVersion && semver.gt(currentVersion, lastShownVersion)) || !isAutoCheck) {
