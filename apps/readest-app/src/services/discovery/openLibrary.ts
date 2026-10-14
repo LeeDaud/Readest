@@ -11,61 +11,70 @@ interface OpenLibraryDoc {
   author_name?: unknown;
   editions?: unknown;
 }
+class ConnectionError extends Error {
+  constructor(cause: unknown) {
+    super('无法连接在线书籍服务，请检查网络后重试', { cause });
+  }
+}
 export async function openLibraryJson(url: string, signal?: AbortSignal): Promise<unknown> {
   if (new URL(url).origin !== 'https://openlibrary.org') throw Error('无效的书籍资料地址');
   const task = requestTail
     .catch(() => {})
     .then(async () => {
-      signal?.throwIfAborted();
-      const delay = Math.max(0, lastRequest + 1100 - Date.now());
-      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      signal?.throwIfAborted();
-      lastRequest = Date.now();
-      let controller = new AbortController();
-      const abort = () => controller.abort();
-      signal?.addEventListener('abort', abort, { once: true });
-      let timeout = setTimeout(abort, 8000);
-      try {
-        const native = isTauriAppPlatform();
-        const fetcher = native ? (await import('@tauri-apps/plugin-http')).fetch : globalThis.fetch;
-        let response: Response;
-        try {
-          response = await fetcher(url, { signal: controller.signal });
-        } catch {
-          signal?.throwIfAborted();
-          if (!native) throw Error('无法连接在线书籍服务，请检查网络后重试');
-          // The WebView honors Android's network/proxy configuration, which
-          // can differ from the native HTTP client's connection.
-          clearTimeout(timeout);
-          controller = new AbortController();
-          timeout = setTimeout(abort, 8000);
-          try {
-            response = await globalThis.fetch(url, { signal: controller.signal });
-          } catch {
-            signal?.throwIfAborted();
-            throw Error('无法连接在线书籍服务，请检查网络后重试');
-          }
-        }
+      const waitForSlot = async () => {
         signal?.throwIfAborted();
-        if (!response.ok) {
-          if (response.status === 429) {
-            const seconds = Number(response.headers.get('Retry-After'));
-            lastRequest =
-              Date.now() + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 10000);
-          }
-          throw Error(
-            response.status === 429 ? '书籍服务繁忙，请稍后重试' : '在线书籍资料暂不可用，请重试',
-          );
-        }
+        const delay = Math.max(0, lastRequest + 1100 - Date.now());
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        signal?.throwIfAborted();
+        lastRequest = Date.now();
+      };
+      const read = async (fetcher: typeof globalThis.fetch) => {
+        signal?.throwIfAborted();
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal?.addEventListener('abort', abort, { once: true });
+        const timeout = setTimeout(abort, 8000);
         try {
-          return await response.json();
-        } catch {
+          let response: Response;
+          try {
+            response = await fetcher(url, { signal: controller.signal });
+          } catch (error) {
+            signal?.throwIfAborted();
+            throw new ConnectionError(error);
+          }
           signal?.throwIfAborted();
-          throw Error('在线书籍资料暂不可用，请重试');
+          if (!response.ok) {
+            if (response.status === 429) {
+              const seconds = Number(response.headers.get('Retry-After'));
+              lastRequest =
+                Date.now() + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 10000);
+            }
+            throw Error(
+              response.status === 429 ? '书籍服务繁忙，请稍后重试' : '在线书籍资料暂不可用，请重试',
+            );
+          }
+          try {
+            return await response.json();
+          } catch (error) {
+            signal?.throwIfAborted();
+            throw new ConnectionError(error);
+          }
+        } finally {
+          clearTimeout(timeout);
+          signal?.removeEventListener('abort', abort);
         }
-      } finally {
-        clearTimeout(timeout);
-        signal?.removeEventListener('abort', abort);
+      };
+      await waitForSlot();
+      if (!isTauriAppPlatform()) return read(globalThis.fetch);
+      try {
+        return await read((await import('@tauri-apps/plugin-http')).fetch);
+      } catch (error) {
+        signal?.throwIfAborted();
+        if (!(error instanceof ConnectionError)) throw error;
+        // Recover connection and body-stream failures through Android's
+        // WebView network stack; cancellation and HTTP errors never retry.
+        await waitForSlot();
+        return read(globalThis.fetch);
       }
     });
   requestTail = task;

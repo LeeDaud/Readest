@@ -31,6 +31,18 @@ it('reports a connection error after both transports fail instead of propagating
   );
 });
 
+it('recovers when native headers arrive but reading the response body fails', async () => {
+  const nativeResponse = new Response('');
+  vi.spyOn(nativeResponse, 'json').mockRejectedValue('request body cancelled');
+  mocks.native.mockResolvedValue(nativeResponse);
+  mocks.web.mockResolvedValue(new Response(JSON.stringify({ docs: [] })));
+  const { openLibraryJson } = await import('@/services/discovery/openLibrary');
+  await expect(openLibraryJson('https://openlibrary.org/search.json')).resolves.toEqual({
+    docs: [],
+  });
+  expect(mocks.web).toHaveBeenCalledOnce();
+});
+
 it('does not retry a cancelled recommendation or hide server rate limiting', async () => {
   const controller = new AbortController();
   mocks.native.mockImplementation(async () => {
