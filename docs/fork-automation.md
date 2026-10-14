@@ -25,6 +25,8 @@ Secrets：`FORK_ANDROID_KEYSTORE_BASE64`、`FORK_ANDROID_KEY_PASSWORD`、`FORK_A
 
 默认 `FORK_AUTO_PUBLISH=false`：自动创建 PR、验证并生成草稿，不自动合并或公开发行。待首次流程通过并启用后，`FORK_AUTO_PUBLISH=true` 会让后续版本在同样验证门槛后合并 PR、发布测试版。
 
+当前仓库已完成首轮验证并合并 0.12.16，两个开关现均为 true，后续稳定版本走完整自动同步与测试版发布。若需要恢复人工合并，将 `FORK_AUTO_PUBLISH` 改为 false；关闭所有定时同步则将 `FORK_SYNC_ENABLED` 改为 false。
+
 手动流程的 `publish=true` 同样必须先完成全套检查。PR 合并使用已验证 head SHA，遵守维护分支保护；发布前再次确认此 SHA 已进入维护分支。没有 PR 的手动发布也必须是维护分支已有的提交。
 
 Release tag 由基线版本与源码 SHA 前 12 位组成，例如 `fork-v0.12.16-abcdef012345`。一个修订一个 tag，不覆盖已经公开发布的版本。包为 Android ARM64 debug，Release 标记 prerelease；包含 APK、SHA256 和模拟器测试结果。发布说明明确上游基线、源码、Fork 功能和真实网站验收范围。

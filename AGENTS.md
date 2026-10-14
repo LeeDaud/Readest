@@ -87,7 +87,11 @@ src-tauri/                 # Rust 后端（不动）
 - [ ] Phase 3: 排版与字体系统
 - [ ] Phase 4: 书架/设置/标注换皮
 - [ ] Phase 5: E-Ink 兼容 + 收尾
-- [ ] Phase 6: Z-Library 集成
+- [x] Phase 6: 应用内 Z-Library、多入口回退、下载导入（Android 基础验收通过，真实站点另测）
+- [x] 单卡片书籍推荐、左滑不感兴趣、已读记录和 Open Library 评分
+- [x] 合并 Readest 0.12.16，维护分支同步至 LeeDaud/Readest；专用 Android 验证及测试版自动发布已启用
+
+当前维护与默认分支为 `codex/zlibrary-integration`。自动化与验收记录见 `docs/fork-automation.md`、`docs/validation-upstream-0.12.16-2026-10-14.md`；应用内官方自动更新仍关闭。
 
 ### 子模块清单（需要 clone）
 

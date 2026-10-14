@@ -48,3 +48,5 @@ node scripts/prepare-android-branding.mjs
 发现书籍产物：`artifacts/android/Readest-0.12.12-discover-arm64-debug.apk`，208,222,301 字节，SHA256 为 `472A8E274187059AEB7A2EAE2A7A2CB87604AE4C29AE04A71211567287E85016`。加入外部书单单卡片推荐、左滑不感兴趣、已读记录、Open Library 评分与 Z-Library 带词搜索。签名与对齐检查通过；参见 [发现书籍验证记录](validation-discovery-2026-10-14.md)，新包实机流程待验收。
 
 最新更新保护产物：`artifacts/android/Readest-0.12.12-fork-updates-arm64-debug.apk`，208,222,301 字节，SHA256 为 `14F805E0AD8E7B320290BB3892FA31961DFC13A06BD7E479696221BE20B8354A`。关闭上游版本检查、更新提示及安装入口，防止官方二进制替代 Fork。签名与上一版一致、对齐检查通过；详见 [Fork 更新策略与验证](fork-update-policy.md)，尚需实机覆盖安装验证。
+
+最新发布为 [Readest 0.12.16 Z-Library 测试版](https://github.com/LeeDaud/Readest/releases/tag/fork-v0.12.16-a374996d1c01)，云端包 `Readest-0.12.16-zlibrary-arm64-debug.apk`，227,705,637 字节，SHA256 `f94ab29e2818696a7559029692eb03af8eb31e32ac5702c2d0d4ba8ec96f2dd5`。固定签名、包名和 16 KB ZIP 对齐已校验，19 项原生模拟器测试通过，包括推荐手势与记录持久化；见 [升级验证记录](validation-upstream-0.12.16-2026-10-14.md)。
