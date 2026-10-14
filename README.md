@@ -1,3 +1,15 @@
+## Readest · Z-Library 集成 Fork
+
+本仓库为 [LeeDaud/Readest](https://github.com/LeeDaud/Readest)，基于 Readest 开发，名称与图标沿用上游，主要面向 Android App。
+
+- 应用内 Z-Library 浏览、多个入口顺序回退、下载后自动入库。
+- 书架之外的单卡片推荐、左滑不感兴趣、已读记录与 Open Library 评分。
+- 关闭官方 App 更新入口，使用 [本仓库 Releases](https://github.com/LeeDaud/Readest/releases) 的集成安装包。
+
+维护分支为 `codex/zlibrary-integration`；`main` 保留上游镜像。当前 APK 为测试版，保留 `.zreader` 包名及固定调试签名。升级与发布流程见 [Fork 自动化](docs/fork-automation.md)，手机自动更新渠道尚未启用。原版商店安装包不包含上述集成功能。
+
+以下保留上游项目介绍与原始署名。
+
 <div align="center">
   <a href="https://readest.com?utm_source=github&utm_medium=referral&utm_campaign=readme" target="_blank">
     <img src="https://github.com/readest/readest/blob/main/apps/readest-app/src-tauri/icons/icon.png?raw=true" alt="Readest Logo" width="20%" />

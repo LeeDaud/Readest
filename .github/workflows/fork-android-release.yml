@@ -92,6 +92,7 @@ jobs:
           pnpm --filter @readest/readest-app exec tsc --noEmit
           pnpm --filter @readest/readest-app exec biome lint src/services/discovery src/services/forkUpdatePolicy.ts src/helpers/updater.ts src/hooks/useOpenZLibrary.ts src/app/discover
           pnpm --filter @readest/readest-app test --run src/__tests__/helpers/updater.test.ts src/__tests__/helpers/forkUpdatePolicy.test.ts src/__tests__/components/UpdaterWindow.test.tsx src/__tests__/components/AboutWindow.test.tsx src/__tests__/app/discover.test.tsx src/__tests__/services/discovery.test.ts src/__tests__/app/library/zlibrary-mobile.test.tsx src/__tests__/services/zlibrarySites.test.ts src/__tests__/services/zlibraryDownloads.test.ts src/__tests__/services/webBrowser/webBrowser.test.ts src/__tests__/hooks/useWebBrowserDownloads.test.tsx src/__tests__/components/settings/ZLibraryForm.test.tsx
+          pnpm --filter @readest/readest-app test --run src/__tests__/services/ingest-service.test.ts src/__tests__/pages/api/sync-page-count-merge.test.ts src/__tests__/utils/library-utils.test.ts src/__tests__/app/library/library-utils-extended.test.ts
       - name: Generate Android scaffolding and restore tracked customizations
         working-directory: apps/readest-app
         run: |
@@ -104,9 +105,12 @@ jobs:
           KEY_PASSWORD: ${{ secrets.FORK_ANDROID_KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.FORK_ANDROID_KEY_ALIAS }}
         run: |
+          umask 077
           test -n "$KEYSTORE" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
           printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/fork-signing.jks"
           printf 'keyAlias=%s\npassword=%s\nstoreFile=%s\n' "$KEY_ALIAS" "$KEY_PASSWORD" "$RUNNER_TEMP/fork-signing.jks" > apps/readest-app/src-tauri/gen/android/keystore.properties
+          keytool -exportcert -alias "$KEY_ALIAS" -keystore "$RUNNER_TEMP/fork-signing.jks" -storepass:env KEY_PASSWORD -file "$RUNNER_TEMP/fork-certificate.der"
+          echo "FORK_CERT_SHA256=$(sha256sum "$RUNNER_TEMP/fork-certificate.der" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: Build and verify ARM64 package
         working-directory: apps/readest-app
         env:
@@ -124,6 +128,9 @@ jobs:
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug.apk' | head -n 1)
           test -n "$apk"
           "$ANDROID_HOME/build-tools/36.1.0/apksigner" verify "$apk"
+          "$ANDROID_HOME/build-tools/36.1.0/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/fork-apk-certs.txt"
+          actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/fork-apk-certs.txt")
+          test "$actual" = "$FORK_CERT_SHA256"
           "$ANDROID_HOME/build-tools/36.1.0/zipalign" -c -P 16 4 "$apk"
           "$ANDROID_HOME/build-tools/36.1.0/aapt" dump badging "$apk" | grep "package: name='com.bilingify.readest.zreader'"
           "$ANDROID_HOME/build-tools/36.1.0/aapt" dump badging "$apk" | grep "native-code: 'arm64-v8a'"
@@ -153,6 +160,7 @@ jobs:
           script: |
             adb install -r "$EMULATOR_APK"
             adb shell pm path com.bilingify.readest.zreader
+            adb shell settings put secure long_press_timeout 400
             cd apps/readest-app && pnpm test:android --reporter=default --reporter=json --outputFile=../../.fork-ci/android-tests.json
       - name: Reject silently skipped device tests
         run: |
@@ -166,6 +174,16 @@ jobs:
       - name: Clean signing material
         if: always()
         run: rm -f "$RUNNER_TEMP/fork-signing.jks" apps/readest-app/src-tauri/gen/android/keystore.properties
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fork-android-diagnostics
+          path: |
+            .fork-ci/diagnostics/
+            .fork-ci/android-tests.json
+          include-hidden-files: true
+          if-no-files-found: ignore
       - name: Record candidate validation result
         if: always() && steps.identity.outputs.sha != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
@@ -200,6 +218,7 @@ jobs:
           PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
+          (cd .fork-ci && sha256sum -c SHA256SUMS)
           tag="fork-v$VERSION-${SOURCE_SHA:0:12}"
           if [[ "$PUBLISH" == true ]]; then
             if [[ -n "$PULL_REQUEST" ]]; then
