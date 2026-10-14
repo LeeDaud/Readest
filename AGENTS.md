@@ -7,7 +7,7 @@ Fork Readest，保留渲染引擎和跨平台能力，并集成 Z-Library 书源
 - `upstream` 指向 `https://github.com/readest/readest.git`，用于获取和合并更新。
 - `codex/zlibrary-integration` 为本 Fork 的集成维护分支，保留现有本地与上游提交历史。
 - `master` 保留整理前的状态，不重置或改写历史。
-- 目前尚未配置自己的远程 `origin`，不要向 `upstream` 推送本 Fork 的功能。
+- `origin` 指向 `https://github.com/LeeDaud/Readest.git`，用于保存本 Fork；不要向 `upstream` 推送本 Fork 的功能。
 - Android 调试包保留 `.zreader` 包名后缀以便共存，显示名称仍为 Readest。
 
 ## 目标

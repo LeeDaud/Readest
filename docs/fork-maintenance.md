@@ -4,14 +4,15 @@
 
 当前工作分支为 `codex/zlibrary-integration`，包含原有本地提交、Readest 0.12.12 上游合并及 Z-Library 集成提交。`master` 保留分支整理前的状态。没有重写历史或重新初始化项目。
 
-`upstream` 为 `https://github.com/readest/readest.git`，只作为上游更新来源。目前没有配置自己的远程 `origin`，本次没有创建或发布 GitHub Fork。拥有自己的 Fork URL 后，将它配置为 `origin`，再推送集成分支；不要将本地功能推送到 `upstream`。
+`upstream` 为 `https://github.com/readest/readest.git`，只作为上游更新来源。`origin` 已配置为用户创建的公开 Fork `https://github.com/LeeDaud/Readest.git`。首次同步与升级安排见 [同步规划](fork-sync-plan-2026-10-14.md)；不要将本地功能推送到 `upstream`。
 
 在工作区干净时更新上游：
 
 ```powershell
 git switch codex/zlibrary-integration
 git fetch upstream
-git merge upstream/main
+# 优先合并已核实的稳定发布标签；仅跟踪开发版时使用 upstream/main
+git merge <稳定发布标签>
 git submodule update --init --recursive
 pnpm install
 ```
