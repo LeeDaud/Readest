@@ -137,6 +137,16 @@ it('preserves the visible card when history cannot be saved', async () => {
   expect(mocks.records).toHaveLength(0);
 });
 
+it('shows the native failure on first entry and retries without clearing stored history', async () => {
+  mocks.next.mockRejectedValueOnce('连接书籍服务失败');
+  render(<DiscoverPage />);
+  expect((await screen.findByRole('alert')).textContent).toContain('连接书籍服务失败');
+  expect(screen.queryByRole('article')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: '重试' }));
+  await screen.findByRole('article');
+  expect(mocks.remove).not.toHaveBeenCalled();
+});
+
 it('requests external covers with CORS for isolated WebViews and removes failed images', async () => {
   mocks.next.mockResolvedValueOnce({
     book: {

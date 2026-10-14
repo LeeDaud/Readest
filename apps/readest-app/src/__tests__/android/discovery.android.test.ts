@@ -155,4 +155,112 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       '各本书的阅读时长',
     );
   });
+
+  it('uses the WebView fallback when the Android HTTP client fails with a string error', async () => {
+    await page.evaluate("setTimeout(() => location.assign('/discover'), 20);");
+    await waitFor(
+      () =>
+        page.evaluate<boolean>(
+          "return !!document.querySelector('article') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
+        ),
+      { timeoutMs: 90_000, label: 'native discovery ready for connection failure' },
+    );
+    await page.evaluate(`
+      window.__discoverySavedRequest = window.Request;
+      window.__discoverySavedFetch = window.fetch;
+      window.__discoveryNativeFailed = false;
+      window.__discoveryWebFallback = false;
+      // invoke is deliberately non-writable in a real Tauri WebView. Exercise
+      // the real HTTP plugin with a refused loopback connection instead.
+      window.Request = class extends window.__discoverySavedRequest {
+        constructor(url, options) {
+          const refused = String(url).startsWith('https://openlibrary.org/');
+          super(refused ? 'http://127.0.0.1:1/discovery-connection-failure' : url, options);
+          if (refused) window.__discoveryNativeFailed = true;
+        }
+      };
+      window.fetch = (url, ...args) => {
+        if (String(url).startsWith('https://openlibrary.org/search.json')) {
+          window.__discoveryWebFallback = true;
+          return Promise.resolve(new Response(JSON.stringify({ numFound: 1, docs: [{
+            key: '/works/OL900000001W', title: 'Android 网络回退验证', author_name: ['测试作者']
+          }] }), { headers: { 'Content-Type': 'application/json' } }));
+        }
+        return window.__discoverySavedFetch(url, ...args);
+      };
+      document.querySelector('input[type="checkbox"]').click();
+    `);
+    try {
+      await waitFor(
+        () =>
+          page.evaluate<boolean>(
+            "return document.querySelector('article h2')?.textContent === 'Android 网络回退验证';",
+          ),
+        { timeoutMs: 45_000, label: 'native string failure recovered through WebView' },
+      );
+      expect(
+        await page.evaluate<boolean>(
+          'return window.__discoveryNativeFailed && window.__discoveryWebFallback;',
+        ),
+      ).toBe(true);
+      expect(await page.evaluate<boolean>("return !!document.querySelector('[role=alert]');")).toBe(
+        false,
+      );
+    } catch (error) {
+      console.error(
+        'Android discovery recovery diagnostic',
+        await page.evaluate(`
+        return {
+          title: document.querySelector('article h2')?.textContent,
+          alert: document.querySelector('[role=alert]')?.textContent,
+          nativeFailed: window.__discoveryNativeFailed,
+          webFallback: window.__discoveryWebFallback,
+          languageEnabled: document.querySelector('input[type="checkbox"]')?.checked
+        };
+      `),
+      );
+      throw error;
+    } finally {
+      await page.evaluate(`
+        window.Request = window.__discoverySavedRequest;
+        window.fetch = window.__discoverySavedFetch;
+      `);
+    }
+  });
+
+  it('loads covers in the last native grid row after scrolling and a page remount', async () => {
+    for (let pass = 0; pass < 2; pass++) {
+      await page.evaluate("setTimeout(() => location.assign('/library'), 20);");
+      await waitFor(
+        () =>
+          page.evaluate<boolean>(
+            "return !!document.querySelector('[data-shelf-layout=grid] img.cover-image');",
+          ),
+        { label: 'native grid mounted with imported covers' },
+      );
+      await page.evaluate(`
+        const scroller = document.querySelector('[data-virtuoso-scroller]');
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+      `);
+      await waitFor(
+        () =>
+          page.evaluate<boolean>(`
+        const rows = [...document.querySelectorAll('[data-shelf-layout=grid]')].filter(row => row.querySelector('img.cover-image'));
+        const images = [...(rows.at(-1)?.querySelectorAll('img.cover-image') ?? [])];
+        return images.length > 0 && images.every(img => img.complete && img.naturalWidth > 0 && img.loading === 'eager');
+      `),
+        { label: 'last-row native cover images decoded' },
+      );
+      if (pass === 0) {
+        await page.evaluate("setTimeout(() => location.assign('/reading-stats'), 20);");
+        await waitFor(
+          () =>
+            page.evaluate<boolean>(
+              "return location.pathname === '/reading-stats' && !!document.querySelector('section');",
+            ),
+          { label: 'library unmounted before return' },
+        );
+      }
+    }
+  });
 });

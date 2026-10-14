@@ -82,3 +82,31 @@ it('does not advance pagination on a failed request and labels the finite offlin
   expect(result?.offline).toBe(true);
   expect(await store.getValue('queue-v1:literature:chi')).toBeUndefined();
 });
+
+it('keeps buffered recommendations usable when a native background request fails', async () => {
+  const queue = new OnlineQueue(store, 'literature', false);
+  await queue.next([]);
+  for (let index = 0; index < 16; index++) await queue.next([]);
+  let rejectRequest!: (reason: unknown) => void;
+  mocks.fetch.mockImplementationOnce(
+    () =>
+      new Promise((_resolve, reject) => {
+        rejectRequest = reject;
+      }),
+  );
+  const prefetch = queue.prefetch().catch(() => {});
+  await vi.waitFor(() => expect(rejectRequest).toBeTypeOf('function'));
+  const next = queue.next([]);
+  rejectRequest('error sending request');
+  await prefetch;
+  expect((await next)?.offline).toBe(false);
+});
+
+it('gives a useful connection error when native requests fail after offline books were seen', async () => {
+  const { DISCOVERY_CATALOG } = await import('@/services/discovery/catalog');
+  for (const book of DISCOVERY_CATALOG) await store.markSeen(book);
+  mocks.fetch.mockRejectedValue('error sending request');
+  await expect(new OnlineQueue(store, 'all', false).next([])).rejects.toThrow(
+    '无法连接在线书籍服务',
+  );
+});

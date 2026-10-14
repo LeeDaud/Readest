@@ -52,6 +52,10 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
     const hideCovers = shelfHideCovers ?? defaultShelfCovers.hideCovers;
     const displayCoverUrl = hideCovers ? null : coverImageUrl;
 
+    // The grid already virtualizes offscreen rows. A second lazy-loading gate
+    // can leave zero-sized fit images waiting indefinitely in Android WebViews.
+    const loading = mode === 'grid' ? 'eager' : 'lazy';
+
     const shouldShowSpine = showSpine && !hideCovers && imageLoaded && !imageError;
 
     const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
@@ -127,7 +131,7 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
                 src={displayCoverUrl}
                 alt={book.title}
                 fill={true}
-                loading='lazy'
+                loading={loading}
                 draggable={false}
                 className={clsx(
                   'cover-image crop-cover-img object-cover',
@@ -157,7 +161,7 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
                   width={0}
                   height={0}
                   sizes='100vw'
-                  loading='lazy'
+                  loading={loading}
                   draggable={false}
                   className={clsx(
                     'cover-image fit-cover-img h-auto max-h-full w-auto max-w-full shadow-md',
@@ -178,7 +182,7 @@ const BookCover: React.FC<BookCoverProps> = memo<BookCoverProps>(
         <div
           className={clsx(
             'fallback-cover absolute inset-0 p-2',
-            displayCoverUrl && !imageError && 'invisible',
+            displayCoverUrl && imageLoaded && !imageError && 'invisible',
             'text-neutral-content text-center font-serif font-medium',
             isPreview ? 'bg-base-200/50' : 'bg-base-100',
             imageClassName,

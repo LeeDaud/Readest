@@ -61,7 +61,7 @@ export class OnlineQueue {
       const state = await this.load();
       const query = this.queries[state.topic];
       if (!query) return;
-      const offsets = state.offsets ?? { [query.subject]: state.offset };
+      const offsets = { ...(state.offsets ?? { [query.subject]: state.offset }) };
       const exhausted = [...(state.exhausted ?? [])];
       const offset = offsets[query.subject] ?? 0;
       const url = new URL('https://openlibrary.org/search.json');
@@ -125,7 +125,12 @@ export class OnlineQueue {
   ): Promise<{ book: DiscoveryBook; offline: boolean } | null> {
     // Yield rather than spin indefinitely when all fetched results are excluded.
     for (let batch = 0; batch < 4; batch++) {
-      if (this.filling) await this.filling;
+      if (this.filling) {
+        // A background request is optional: its failure must not discard
+        // candidates already buffered, or cancel a newer foreground request.
+        await this.filling.catch(() => {});
+        signal?.throwIfAborted();
+      }
       let state = await this.load();
       while (state.books.length) {
         signal?.throwIfAborted();
@@ -151,7 +156,7 @@ export class OnlineQueue {
             return { book, offline: true };
           }
         }
-        throw error;
+        throw error instanceof Error ? error : Error('无法连接在线书籍服务，请检查网络后重试');
       }
     }
     throw Error('正在寻找更多未读书籍，请继续推荐或扩大推荐范围');
