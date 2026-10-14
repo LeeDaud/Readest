@@ -70,7 +70,9 @@ function DiscoverContent() {
       await task;
     } catch (err) {
       if (!(err instanceof Error && err.name === 'AbortError'))
-        setError(err instanceof Error ? err.message : '操作失败，请重试');
+        setError(
+          err instanceof Error ? err.message : typeof err === 'string' ? err : '操作失败，请重试',
+        );
     } finally {
       transaction.current = false;
       setBusy(false);
@@ -99,7 +101,7 @@ function DiscoverContent() {
       .catch(() => {
         /* Optional information never blocks browsing. */
       });
-    void queue?.prefetch(controller.signal).catch(() => {});
+    void queue?.prefetch(life.current?.signal).catch(() => {});
     return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [book?.id, queue]);

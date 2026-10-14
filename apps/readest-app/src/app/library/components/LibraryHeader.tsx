@@ -2,8 +2,8 @@ import clsx from 'clsx';
 import Link from 'next/link';
 import React, { useRef } from 'react';
 import { FaChevronDown, FaSearch } from 'react-icons/fa';
-import { MdManageSearch, MdSchedule } from 'react-icons/md';
-import { PiPlus } from 'react-icons/pi';
+import { MdManageSearch } from 'react-icons/md';
+import { PiClock, PiPlus } from 'react-icons/pi';
 import { PiSelectionAll, PiSelectionAllFill } from 'react-icons/pi';
 import { PiDotsThreeCircle } from 'react-icons/pi';
 import { MdOutlineMenu } from 'react-icons/md';
@@ -262,14 +262,14 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
               href='/reading-stats'
               aria-label='阅读时长'
               title='阅读时长'
-              className='exclude-title-bar-mousedown flex min-h-11 min-w-11 items-center justify-center text-lg'
+              className='exclude-title-bar-mousedown text-base-content/70 flex min-h-11 min-w-11 items-center justify-center text-lg'
             >
-              <MdSchedule aria-hidden='true' size={iconSize18} />
+              <PiClock aria-hidden='true' size={iconSize18} />
             </Link>
             <Dropdown
               label={_('View Menu')}
               className='exclude-title-bar-mousedown dropdown-bottom dropdown-end'
-              buttonClassName='btn btn-ghost h-8 min-h-8 w-8 p-0'
+              buttonClassName='btn btn-ghost text-base-content/70 h-8 min-h-8 w-8 p-0'
               toggleButton={<PiDotsThreeCircle role='none' size={iconSize18} />}
             >
               <ViewMenu />
@@ -277,7 +277,7 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
             <Dropdown
               label={_('Settings Menu')}
               className='exclude-title-bar-mousedown dropdown-bottom dropdown-end'
-              buttonClassName='btn btn-ghost h-8 min-h-8 w-8 p-0'
+              buttonClassName='btn btn-ghost text-base-content/70 h-8 min-h-8 w-8 p-0'
               toggleButton={<MdOutlineMenu role='none' size={iconSize18} />}
             >
               <SettingsMenu onPullLibrary={onPullLibrary} />

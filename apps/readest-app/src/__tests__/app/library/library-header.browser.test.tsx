@@ -58,6 +58,17 @@ const renderHeader = () =>
     </DropdownProvider>,
   );
 
+it('uses the same neutral icon color for reading time and both mobile menus', async () => {
+  await page.viewport(390, 844);
+  const { getByRole } = renderHeader();
+  const icons = [
+    getByRole('link', { name: '阅读时长' }),
+    getByRole('button', { name: 'View Menu' }),
+    getByRole('button', { name: 'Settings Menu' }),
+  ].map((element) => getComputedStyle(element.querySelector('svg')!).color);
+  expect(new Set(icons).size).toBe(1);
+});
+
 describe('library search actions', () => {
   for (const width of [768, 1200]) {
     for (const dir of ['ltr', 'rtl']) {

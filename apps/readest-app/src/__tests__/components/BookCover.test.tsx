@@ -64,18 +64,41 @@ const makeBook = (overrides?: Partial<Book>): Book =>
   }) as Book;
 
 describe('BookCover', () => {
-  it('passes loading="lazy" to crop-mode Image', () => {
+  it('starts mounted grid crop covers immediately instead of relying on WebView lazy loading', () => {
     const { container } = render(<BookCover book={makeBook()} coverFit='crop' />);
     const img = container.querySelector('img.cover-image');
     expect(img).toBeTruthy();
-    expect(img?.getAttribute('loading')).toBe('lazy');
+    expect(img?.getAttribute('loading')).toBe('eager');
   });
 
-  it('passes loading="lazy" to fit-mode Image', () => {
+  it('starts mounted grid fit covers even before the image has intrinsic dimensions', () => {
     const { container } = render(<BookCover book={makeBook()} coverFit='fit' />);
     const img = container.querySelector('img.cover-image');
     expect(img).toBeTruthy();
-    expect(img?.getAttribute('loading')).toBe('lazy');
+    expect(img?.getAttribute('loading')).toBe('eager');
+  });
+
+  it('shows a title cover until the image loads and again after a virtualized remount', () => {
+    const book = makeBook();
+    const first = render(<BookCover book={book} coverFit='fit' />);
+    expect(first.container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(
+      false,
+    );
+    fireEvent.load(first.container.querySelector('img')!);
+    expect(first.container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(
+      true,
+    );
+    first.unmount();
+    const second = render(<BookCover book={book} coverFit='fit' />);
+    expect(second.container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(
+      false,
+    );
+  });
+
+  it('keeps list covers lazy and preserves a placeholder while their images are pending', () => {
+    const { container } = render(<BookCover book={makeBook()} mode='list' />);
+    expect(container.querySelector('img')?.getAttribute('loading')).toBe('lazy');
+    expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(false);
   });
 
   it('reports natural aspect ratio via onAspectRatioChange when fit-mode image loads', () => {
@@ -142,6 +165,7 @@ describe('BookCover', () => {
     expect(container.querySelector('img')?.getAttribute('src')).toBe(
       'https://example.com/full-size-cover.jpg',
     );
+    fireEvent.load(container.querySelector('img')!);
     expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(true);
     await waitFor(() => expect(requestCoverThumbnailMock).toHaveBeenCalledWith(book));
   });
@@ -167,6 +191,7 @@ describe('BookCover', () => {
 
     expect(container.querySelector('img')?.getAttribute('src')).toBe('asset://thumbnail.jpg');
     expect(book.coverImageUrl).toBe('https://example.com/full-size-cover.jpg');
+    fireEvent.load(container.querySelector('img')!);
     expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(true);
   });
 
@@ -218,6 +243,8 @@ describe('BookCover', () => {
     expect(container.querySelector('img')?.getAttribute('src')).toBe(
       'https://example.com/full-size-cover.jpg',
     );
+    expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(false);
+    fireEvent.load(container.querySelector('img')!);
     expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(true);
   });
 
@@ -307,6 +334,7 @@ describe('BookCover', () => {
       const { container } = render(<BookCover book={book} coverFit='crop' />);
 
       expect(container.querySelector('img.cover-image')).toBeTruthy();
+      fireEvent.load(container.querySelector('img')!);
       expect(container.querySelector('.fallback-cover')?.classList.contains('invisible')).toBe(
         true,
       );
