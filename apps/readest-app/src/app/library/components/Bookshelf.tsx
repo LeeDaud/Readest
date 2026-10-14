@@ -1,5 +1,6 @@
 import LibraryEmptyState from './LibraryEmptyState';
 import LibraryImportButton from './LibraryImportButton';
+import ReadHistoryButton from './ReadHistoryButton';
 import clsx from 'clsx';
 import { MdManageSearch } from 'react-icons/md';
 import { useRouter, useSearchParams } from 'next/navigation';
@@ -934,11 +935,12 @@ const Bookshelf: React.FC<BookshelfProps> = ({
         </button>
       </div>
     ) : undefined;
-  const importAction = !importTile ? (
-    <div className='flex justify-center px-4 py-4'>
-      <LibraryImportButton onImport={handleImportBooks} />
+  const importAction = (
+    <div className='flex flex-col items-center justify-center gap-3 px-4 py-4'>
+      {!importTile && <LibraryImportButton onImport={handleImportBooks} />}
+      <ReadHistoryButton />
     </div>
-  ) : undefined;
+  );
 
   return (
     <div

@@ -16,6 +16,11 @@ interface BookRow extends DatabaseRow {
 
 type CursorKey = 'push' | 'pull' | 'bookorbit-push';
 
+export interface ReadingSummary {
+  totalSeconds: number;
+  books: { md5: string; title: string; authors: string; seconds: number }[];
+}
+
 // Readest caps one page visit at this, so a longer event spans several pages
 // (a CrossPoint session recorded in whole percents) and says nothing about pace.
 const MAX_PAGE_SECONDS = DEFAULT_STATS_TRACKING_CONFIG.maxEventSeconds;
@@ -201,6 +206,23 @@ export class StatisticsDb {
   async getBookByMd5(md5: string): Promise<BookRow | null> {
     const rows = await this.db.select<BookRow>(`SELECT * FROM book WHERE md5 = ? LIMIT 1`, [md5]);
     return rows[0] ?? null;
+  }
+
+  async getReadingSummary(): Promise<ReadingSummary> {
+    const rows = await this.db.select<
+      DatabaseRow & { md5: string; title: string; authors: string; seconds: number }
+    >(
+      `SELECT b.md5, b.title, b.authors, SUM(p.duration) AS seconds
+       FROM page_stat_data p JOIN book b ON b.id=p.id_book
+       WHERE p.duration > 0 GROUP BY b.id ORDER BY seconds DESC, b.title`,
+    );
+    const books = rows.map((row) => ({
+      md5: row.md5,
+      title: row.title || '未命名书籍',
+      authors: row.authors || '',
+      seconds: Number(row.seconds) || 0,
+    }));
+    return { totalSeconds: books.reduce((sum, book) => sum + book.seconds, 0), books };
   }
 
   /**

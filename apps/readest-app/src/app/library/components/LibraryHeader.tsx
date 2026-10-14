@@ -2,7 +2,7 @@ import clsx from 'clsx';
 import Link from 'next/link';
 import React, { useRef } from 'react';
 import { FaChevronDown, FaSearch } from 'react-icons/fa';
-import { MdManageSearch } from 'react-icons/md';
+import { MdManageSearch, MdSchedule } from 'react-icons/md';
 import { PiPlus } from 'react-icons/pi';
 import { PiSelectionAll, PiSelectionAllFill } from 'react-icons/pi';
 import { PiDotsThreeCircle } from 'react-icons/pi';
@@ -259,12 +259,12 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
         ) : (
           <div className='flex h-full items-center gap-x-2 sm:gap-x-4'>
             <Link
-              href='/discover'
-              aria-label='发现书籍'
-              title='发现书籍'
+              href='/reading-stats'
+              aria-label='阅读时长'
+              title='阅读时长'
               className='exclude-title-bar-mousedown flex min-h-11 min-w-11 items-center justify-center text-lg'
             >
-              ✧
+              <MdSchedule aria-hidden='true' size={iconSize18} />
             </Link>
             <Dropdown
               label={_('View Menu')}

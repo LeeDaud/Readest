@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 const read = (path) => readFileSync(path, 'utf8');
 const base = 'apps/readest-app/';
-for (const path of ['src/app/discover/page.tsx', 'src/hooks/useOpenZLibrary.ts', 'src/hooks/useWebBrowserDownloads.ts', 'src/services/zlibrary/sites.ts', 'src/services/discovery/catalog.ts', 'src/__tests__/helpers/forkUpdatePolicy.test.ts']) {
+for (const path of ['src/app/discover/page.tsx', 'src/app/read-history/page.tsx', 'src/app/reading-stats/page.tsx', 'src/services/discovery/discoveryDb.ts', 'src/services/discovery/onlineQueue.ts', 'src/hooks/useOpenZLibrary.ts', 'src/hooks/useWebBrowserDownloads.ts', 'src/services/zlibrary/sites.ts', 'src/services/discovery/catalog.ts', 'src/__tests__/helpers/forkUpdatePolicy.test.ts']) {
   assert(existsSync(base + path), `Missing fork integration: ${path}`);
 }
 assert.match(read(base + 'src/services/forkUpdatePolicy.ts'), /FORK_UPDATES_DISABLED\s*=\s*true/);

@@ -8,6 +8,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { useAppRouter } from '@/hooks/useAppRouter';
 import { navigateToLogin } from '@/utils/nav';
 import LibraryImportButton from './LibraryImportButton';
+import ReadHistoryButton from './ReadHistoryButton';
 
 interface LibraryEmptyStateProps {
   onImport: (anchor: HTMLElement) => void;
@@ -34,6 +35,7 @@ const LibraryEmptyState: React.FC<LibraryEmptyStateProps> = ({ onImport }) => {
         </p>
         <div className='flex w-full max-w-xs flex-col gap-3'>
           <LibraryImportButton onImport={onImport} primary />
+          <ReadHistoryButton />
           {/* TODO: add a 'Browse free catalogs' secondary action that opens the
               OPDS dialog (handleShowOPDSDialog) once we settle on placement. */}
           {!user && (

@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/context/EnvContext', () => ({ useEnv: () => ({ appService: {} }) }));
 vi.mock('@/context/AuthContext', () => ({ useAuth: () => ({ user: null }) }));
+vi.mock('@/store/settingsStore', () => ({
+  useSettingsStore: { getState: () => ({ settings: { bookorbit: { enabled: false } } }) },
+}));
 vi.mock('@/store/readerProgressStore', () => ({
   useBookProgress: () => mocks.progress,
   getBookProgress: () => mocks.progress,
@@ -119,6 +122,59 @@ describe('ReadingStatsTracker while TTS plays', () => {
     await settle();
 
     expect(mocks.db.insertPageEvent).toHaveBeenCalled();
+  });
+
+  it('resumes on foreground return without a page turn and does not bill hidden time', async () => {
+    let visible: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visible);
+    const { unmount } = mount();
+    await settle(10_000);
+    visible = 'hidden';
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await settle(60_000);
+    visible = 'visible';
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await settle(10_000);
+    unmount();
+    await settle();
+    const events = mocks.db.insertPageEvent.mock.calls.map((call) => call[1]);
+    expect(events.map((event) => event.duration)).toEqual([10, 10]);
+  });
+
+  it('resumes a paused idle page on user activity without requiring a page turn', async () => {
+    const { unmount } = mount();
+    await settle(130_000);
+    await act(async () => {
+      document.dispatchEvent(new Event('reader-activity'));
+    });
+    await settle(10_000);
+    unmount();
+    await settle();
+    expect(
+      mocks.db.insertPageEvent.mock.calls.reduce((sum, call) => sum + call[1].duration, 0),
+    ).toBe(130);
+  });
+
+  it('keeps long active reading on one page instead of truncating it to the per-event cap', async () => {
+    const { unmount } = mount();
+    await settle(90_000);
+    await act(async () => {
+      document.dispatchEvent(new Event('reader-activity'));
+    });
+    await settle(90_000);
+    await act(async () => {
+      document.dispatchEvent(new Event('reader-activity'));
+    });
+    await settle(60_000);
+    unmount();
+    await settle();
+    expect(
+      mocks.db.insertPageEvent.mock.calls.reduce((sum, call) => sum + call[1].duration, 0),
+    ).toBe(240);
   });
 
   it('stops recording page dwell while TTS is playing', async () => {
