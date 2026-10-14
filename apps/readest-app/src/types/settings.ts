@@ -421,6 +421,7 @@ export interface HardwarePageTurnerSettings {
 }
 
 export interface SystemSettings {
+  bookDiscovery?: import('@/services/discovery/types').DiscoveryPreferences;
   /** Ordered Z-Library entry URLs, shared by the settings UI and book import. */
   zlibraryUrls?: string[];
   /** Optional display names keyed by normalized entry URL. */

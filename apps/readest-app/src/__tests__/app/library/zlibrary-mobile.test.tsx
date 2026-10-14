@@ -1,4 +1,5 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react';
+import { useOpenZLibrary } from '@/hooks/useOpenZLibrary';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ZLibraryPage from '@/app/zlibrary/page';
 
@@ -57,6 +58,21 @@ beforeEach(() => {
   );
 });
 afterEach(cleanup);
+
+it('retains the encoded book search and site names on all mobile fallback mirrors', async () => {
+  mocks.urls = ['https://first.example/', 'https://second.example/'];
+  mocks.names = { 'https://first.example/': '首选', 'https://second.example/': '备用' };
+  const { result } = renderHook(() => useOpenZLibrary());
+  await act(() => result.current('1984 奥威尔'));
+  const path = `/s/${encodeURIComponent('1984 奥威尔')}`;
+  expect(mocks.browser).toHaveBeenCalledWith(`https://first.example${path}`, {
+    fallbackUrls: [`https://second.example${path}`],
+    siteNames: {
+      [`https://first.example${path}`]: '首选',
+      [`https://second.example${path}`]: '备用',
+    },
+  });
+});
 
 it('opens the mobile in-app browser and mounts the shared download importer', async () => {
   render(<ZLibraryPage />);

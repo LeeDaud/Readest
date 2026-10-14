@@ -1,4 +1,5 @@
 import clsx from 'clsx';
+import { useRouter } from 'next/navigation';
 import { useOpenZLibrary } from '@/hooks/useOpenZLibrary';
 import { eventDispatcher } from '@/utils/event';
 import { MdLanguage, MdMenuBook, MdRssFeed } from 'react-icons/md';
@@ -31,6 +32,7 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
   onOpenFeeds,
 }) => {
   const _ = useTranslation();
+  const router = useRouter();
   const openZLibrary = useOpenZLibrary();
   const { appService } = useEnv();
 
@@ -72,6 +74,14 @@ const ImportMenu: React.FC<ImportMenuProps> = ({
       )}
       onCancel={() => setIsDropdownOpen?.(false)}
     >
+      <MenuItem
+        label='发现书籍'
+        Icon={<MdMenuBook className='h-5 w-5' />}
+        onClick={() => {
+          setIsDropdownOpen?.(false);
+          router.push('/discover');
+        }}
+      />
       <MenuItem
         label='Z-Library'
         Icon={<MdLanguage className='h-5 w-5' />}

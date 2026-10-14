@@ -3,6 +3,11 @@ import type { SystemSettings } from '@/types/settings';
 export const DEFAULT_ZLIBRARY_URL = 'https://zh.zlibrary.by/';
 export const LEGACY_ZLIBRARY_URL_KEY = 'zreader-zlibrary-url';
 
+/** Encode the entire search term as one path segment on every configured mirror. */
+export function zlibrarySearchUrl(base: string, query?: string): string {
+  return query?.trim() ? new URL(`/s/${encodeURIComponent(query.trim())}`, base).href : base;
+}
+
 export function normalizeZLibraryUrls(entries: string[]): string[] {
   const urls: string[] = [];
   for (const entry of entries) {

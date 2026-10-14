@@ -1,4 +1,5 @@
 import clsx from 'clsx';
+import Link from 'next/link';
 import React, { useRef } from 'react';
 import { FaChevronDown, FaSearch } from 'react-icons/fa';
 import { MdManageSearch } from 'react-icons/md';
@@ -257,6 +258,14 @@ const LibraryHeader: React.FC<LibraryHeaderProps> = ({
           </div>
         ) : (
           <div className='flex h-full items-center gap-x-2 sm:gap-x-4'>
+            <Link
+              href='/discover'
+              aria-label='发现书籍'
+              title='发现书籍'
+              className='exclude-title-bar-mousedown flex min-h-11 min-w-11 items-center justify-center text-lg'
+            >
+              ✧
+            </Link>
             <Dropdown
               label={_('View Menu')}
               className='exclude-title-bar-mousedown dropdown-bottom dropdown-end'
