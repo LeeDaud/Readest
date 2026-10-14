@@ -166,16 +166,18 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       { timeoutMs: 90_000, label: 'native discovery ready for connection failure' },
     );
     await page.evaluate(`
-      window.__discoverySavedInvoke = window.__TAURI_INTERNALS__.invoke;
+      window.__discoverySavedRequest = window.Request;
       window.__discoverySavedFetch = window.fetch;
       window.__discoveryNativeFailed = false;
       window.__discoveryWebFallback = false;
-      window.__TAURI_INTERNALS__.invoke = (command, ...args) => {
-        if (command === 'plugin:http|fetch') {
-          window.__discoveryNativeFailed = true;
-          return Promise.reject('error sending request');
+      // invoke is deliberately non-writable in a real Tauri WebView. Exercise
+      // the real HTTP plugin with a refused loopback connection instead.
+      window.Request = class extends window.__discoverySavedRequest {
+        constructor(url, options) {
+          const refused = String(url).startsWith('https://openlibrary.org/');
+          super(refused ? 'http://127.0.0.1:1/discovery-connection-failure' : url, options);
+          if (refused) window.__discoveryNativeFailed = true;
         }
-        return window.__discoverySavedInvoke(command, ...args);
       };
       window.fetch = (url, ...args) => {
         if (String(url).startsWith('https://openlibrary.org/search.json')) {
@@ -204,9 +206,23 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       expect(await page.evaluate<boolean>("return !!document.querySelector('[role=alert]');")).toBe(
         false,
       );
+    } catch (error) {
+      console.error(
+        'Android discovery recovery diagnostic',
+        await page.evaluate(`
+        return {
+          title: document.querySelector('article h2')?.textContent,
+          alert: document.querySelector('[role=alert]')?.textContent,
+          nativeFailed: window.__discoveryNativeFailed,
+          webFallback: window.__discoveryWebFallback,
+          languageEnabled: document.querySelector('input[type="checkbox"]')?.checked
+        };
+      `),
+      );
+      throw error;
     } finally {
       await page.evaluate(`
-        window.__TAURI_INTERNALS__.invoke = window.__discoverySavedInvoke;
+        window.Request = window.__discoverySavedRequest;
         window.fetch = window.__discoverySavedFetch;
       `);
     }
