@@ -67,7 +67,9 @@ vi.mock('next/image', () => ({
 vi.mock('@/components/SupportLinks', () => ({ default: () => null }));
 vi.mock('@/components/LegalLinks', () => ({ default: () => null }));
 vi.mock('@/components/Link', () => ({
-  default: ({ children }: { children: ReactNode }) => <span>{children}</span>,
+  default: ({ children, href }: { children: ReactNode; href: string }) => (
+    <a href={href}>{children}</a>
+  ),
 }));
 vi.mock('@/components/Dialog', () => ({
   default: ({ children }: { children: ReactNode }) => <div>{children}</div>,
@@ -87,6 +89,12 @@ const openDialog = async () => {
 };
 
 describe('AboutWindow version label', () => {
+  it('links the fork binary to its corresponding source repository', async () => {
+    await openDialog();
+    expect(screen.getByRole('link', { name: 'GitHub' }).getAttribute('href')).toBe(
+      'https://github.com/LeeDaud/Readest',
+    );
+  });
   it('explains fork manual updates and removes the upstream update action', async () => {
     await openDialog();
     expect(screen.getByText(/当前为 Z-Library 集成版/)).toBeTruthy();

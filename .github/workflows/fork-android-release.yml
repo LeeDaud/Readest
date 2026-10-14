@@ -28,6 +28,7 @@ on:
         type: boolean
 permissions:
   contents: read
+  statuses: write
 concurrency:
   group: fork-android-${{ inputs.source_ref }}
   cancel-in-progress: false
@@ -58,6 +59,13 @@ jobs:
           version=$(node -p "require('./apps/readest-app/package.json').version")
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Mark candidate validation pending
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          SOURCE_SHA: ${{ steps.identity.outputs.sha }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({owner:context.repo.owner,repo:context.repo.repo,sha:process.env.SOURCE_SHA,state:'pending',context:'fork/android-validation',target_url:`${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,description:'Native Android build and emulator validation'});
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
@@ -75,6 +83,8 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          cache-on-failure: true
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @readest/readest-app setup-vendors
       - name: Type check and fork regressions
@@ -82,6 +92,7 @@ jobs:
           pnpm --filter @readest/readest-app exec tsc --noEmit
           pnpm --filter @readest/readest-app exec biome lint src/services/discovery src/services/forkUpdatePolicy.ts src/helpers/updater.ts src/hooks/useOpenZLibrary.ts src/app/discover
           pnpm --filter @readest/readest-app test --run src/__tests__/helpers/updater.test.ts src/__tests__/helpers/forkUpdatePolicy.test.ts src/__tests__/components/UpdaterWindow.test.tsx src/__tests__/components/AboutWindow.test.tsx src/__tests__/app/discover.test.tsx src/__tests__/services/discovery.test.ts src/__tests__/app/library/zlibrary-mobile.test.tsx src/__tests__/services/zlibrarySites.test.ts src/__tests__/services/zlibraryDownloads.test.ts src/__tests__/services/webBrowser/webBrowser.test.ts src/__tests__/hooks/useWebBrowserDownloads.test.tsx src/__tests__/components/settings/ZLibraryForm.test.tsx
+          pnpm --filter @readest/readest-app test --run src/__tests__/services/ingest-service.test.ts src/__tests__/pages/api/sync-page-count-merge.test.ts src/__tests__/utils/library-utils.test.ts src/__tests__/app/library/library-utils-extended.test.ts
       - name: Generate Android scaffolding and restore tracked customizations
         working-directory: apps/readest-app
         run: |
@@ -94,9 +105,12 @@ jobs:
           KEY_PASSWORD: ${{ secrets.FORK_ANDROID_KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.FORK_ANDROID_KEY_ALIAS }}
         run: |
+          umask 077
           test -n "$KEYSTORE" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
           printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/fork-signing.jks"
           printf 'keyAlias=%s\npassword=%s\nstoreFile=%s\n' "$KEY_ALIAS" "$KEY_PASSWORD" "$RUNNER_TEMP/fork-signing.jks" > apps/readest-app/src-tauri/gen/android/keystore.properties
+          keytool -exportcert -alias "$KEY_ALIAS" -keystore "$RUNNER_TEMP/fork-signing.jks" -storepass:env KEY_PASSWORD -file "$RUNNER_TEMP/fork-certificate.der"
+          echo "FORK_CERT_SHA256=$(sha256sum "$RUNNER_TEMP/fork-certificate.der" | cut -d' ' -f1)" >> "$GITHUB_ENV"
       - name: Build and verify ARM64 package
         working-directory: apps/readest-app
         env:
@@ -104,15 +118,22 @@ jobs:
           VERSION: ${{ steps.identity.outputs.version }}
         run: |
           pnpm tauri android build --apk --debug --target aarch64 --ci
-          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-debug src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/libreadestlib.so
+          native=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/libreadestlib.so
+          cp -L "$native" "$RUNNER_TEMP/fork-readest.so"
+          "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-debug "$RUNNER_TEMP/fork-readest.so"
+          cp --remove-destination "$RUNNER_TEMP/fork-readest.so" "$native"
           find src-tauri/gen/android/app/build/outputs/apk -name '*debug.apk' -delete
           (cd src-tauri/gen/android && ./gradlew assembleArm64Debug -x rustBuildArm64Debug --no-daemon)
           mkdir -p ../../.fork-ci
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -name '*debug.apk' | head -n 1)
           test -n "$apk"
           "$ANDROID_HOME/build-tools/36.1.0/apksigner" verify "$apk"
+          "$ANDROID_HOME/build-tools/36.1.0/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/fork-apk-certs.txt"
+          actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/fork-apk-certs.txt")
+          test "$actual" = "$FORK_CERT_SHA256"
           "$ANDROID_HOME/build-tools/36.1.0/zipalign" -c -P 16 4 "$apk"
           "$ANDROID_HOME/build-tools/36.1.0/aapt" dump badging "$apk" | grep "package: name='com.bilingify.readest.zreader'"
+          "$ANDROID_HOME/build-tools/36.1.0/aapt" dump badging "$apk" | grep "native-code: 'arm64-v8a'"
           cp "$apk" "../../.fork-ci/Readest-$VERSION-zlibrary-arm64-debug.apk"
           cd ../../.fork-ci && sha256sum *.apk > SHA256SUMS
       - name: Build native emulator package
@@ -139,6 +160,7 @@ jobs:
           script: |
             adb install -r "$EMULATOR_APK"
             adb shell pm path com.bilingify.readest.zreader
+            adb shell settings put secure long_press_timeout 400
             cd apps/readest-app && pnpm test:android --reporter=default --reporter=json --outputFile=../../.fork-ci/android-tests.json
       - name: Reject silently skipped device tests
         run: |
@@ -148,9 +170,29 @@ jobs:
           name: fork-android-package
           path: .fork-ci/
           if-no-files-found: error
+          include-hidden-files: true
       - name: Clean signing material
         if: always()
         run: rm -f "$RUNNER_TEMP/fork-signing.jks" apps/readest-app/src-tauri/gen/android/keystore.properties
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fork-android-diagnostics
+          path: |
+            .fork-ci/diagnostics/
+            .fork-ci/android-tests.json
+          include-hidden-files: true
+          if-no-files-found: ignore
+      - name: Record candidate validation result
+        if: always() && steps.identity.outputs.sha != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          SOURCE_SHA: ${{ steps.identity.outputs.sha }}
+          RESULT: ${{ job.status }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({owner:context.repo.owner,repo:context.repo.repo,sha:process.env.SOURCE_SHA,state:process.env.RESULT==='success'?'success':'failure',context:'fork/android-validation',target_url:`${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,description:'Native Android build and emulator validation'});
   stage-release:
     needs: validate
     runs-on: ubuntu-latest
@@ -163,7 +205,7 @@ jobs:
           ref: ${{ needs.validate.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: fork-android-package
           path: .fork-ci
@@ -176,7 +218,8 @@ jobs:
           PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-          tag="fork-v$VERSION-r1"
+          (cd .fork-ci && sha256sum -c SHA256SUMS)
+          tag="fork-v$VERSION-${SOURCE_SHA:0:12}"
           if [[ "$PUBLISH" == true ]]; then
             if [[ -n "$PULL_REQUEST" ]]; then
               [[ "$PULL_REQUEST" =~ ^[0-9]+$ ]]
@@ -189,6 +232,9 @@ jobs:
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --target "$SOURCE_SHA" --draft --prerelease --title "Readest $VERSION · Z-Library Fork" --notes-file .fork-ci/release-notes.md
           fi
-          test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+          if [[ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != true ]]; then
+            echo 'This exact source revision was already published; leaving it unchanged.'
+            exit 0
+          fi
           gh release upload "$tag" .fork-ci/*.apk .fork-ci/SHA256SUMS .fork-ci/android-tests.json --clobber
           if [[ "$PUBLISH" == true ]]; then gh release edit "$tag" --draft=false; fi

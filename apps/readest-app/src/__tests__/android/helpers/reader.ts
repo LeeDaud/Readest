@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import {
   adbShell,
   hasAdb,
@@ -56,6 +58,55 @@ export const waitFor = async <T>(
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Some system images cache the immersive confirmation setting before the
+// harness sets it. Dismiss only the known Android system prompt, never app dialogs.
+const dismissImmersiveConfirmation = async () => {
+  try {
+    const xml = await adbShell(
+      'uiautomator dump /sdcard/readest-window.xml >/dev/null && cat /sdcard/readest-window.xml',
+    );
+    if (!/Viewing full screen|全屏显示|全屏查看/i.test(xml)) return;
+    const node = (xml.match(/<node\b[^>]*>/g) ?? []).find(
+      (item) =>
+        /package="(?:android|com\.android\.systemui)"/.test(item) &&
+        /text="(?:Got it|GOT IT|知道了|确定)"/.test(item),
+    );
+    const bounds = node?.match(/bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
+    if (!bounds) return;
+    await tap(
+      (Number(bounds[1]) + Number(bounds[3])) / 2,
+      (Number(bounds[2]) + Number(bounds[4])) / 2,
+    );
+    console.log('[test:android] dismissed Android immersive confirmation');
+    await sleep(300);
+  } catch {
+    /* Devices without a system prompt need no action. */
+  }
+};
+
+export const captureAndroidFailure = async (label: string) => {
+  if (!process.env['CI']) return;
+  try {
+    const dir = path.resolve(process.cwd(), '../../.fork-ci/diagnostics');
+    mkdirSync(dir, { recursive: true });
+    const name = `${label}-${Date.now()}`;
+    writeFileSync(
+      path.join(dir, `${name}.png`),
+      execFileSync('adb', ['exec-out', 'screencap', '-p']),
+    );
+    const xml = await adbShell(
+      'uiautomator dump /sdcard/readest-window.xml >/dev/null && cat /sdcard/readest-window.xml',
+    );
+    writeFileSync(path.join(dir, `${name}.xml`), xml);
+    writeFileSync(
+      path.join(dir, `${name}.txt`),
+      await adbShell('settings get secure long_press_timeout'),
+    );
+  } catch {
+    /* Preserve the original test failure when diagnostics are unavailable. */
+  }
+};
 
 /**
  * Patch `globalViewSettings` in the app's persisted settings.json and return
@@ -156,6 +207,7 @@ export const openFixtureBook = async (fixtureFile: string): Promise<CdpPage> => 
       `),
     { timeoutMs: 30_000, intervalMs: 500, label: 'book content rendered' },
   );
+  await dismissImmersiveConfirmation();
   return page;
 };
 
@@ -510,13 +562,19 @@ export const longPressWord = async (
   });
   if (!target.onScreen) throw new Error(`word "${ref.word}" is off-screen`);
   await longPress(target.deviceX, target.deviceY);
-  await waitFor(
-    async () => {
-      const sel = await getSelectionState(page);
-      return sel.exists && !sel.collapsed && sel.text.includes(ref.word) ? sel : null;
-    },
-    { label: `selection of "${ref.word}"` },
-  );
+  try {
+    await waitFor(
+      async () => {
+        const sel = await getSelectionState(page);
+        return sel.exists && !sel.collapsed && sel.text.includes(ref.word) ? sel : null;
+      },
+      { label: `selection of "${ref.word}"` },
+    );
+  } catch (error) {
+    await captureAndroidFailure('selection');
+    console.error('[test:android] long-press target', target);
+    throw error;
+  }
   return target;
 };
 

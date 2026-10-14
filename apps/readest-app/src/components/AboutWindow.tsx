@@ -1,5 +1,9 @@
 import { useEffect, useState } from 'react';
-import { FORK_UPDATES_DISABLED, FORK_UPDATE_MESSAGE } from '@/services/forkUpdatePolicy';
+import {
+  FORK_UPDATES_DISABLED,
+  FORK_UPDATE_MESSAGE,
+  FORK_SOURCE_REPOSITORY,
+} from '@/services/forkUpdatePolicy';
 import Image from 'next/image';
 import { invoke } from '@tauri-apps/api/core';
 import { useEnv } from '@/context/EnvContext';
@@ -196,7 +200,7 @@ export const AboutWindow = () => {
             </p>
             <p className='text-neutral-content text-xs'>
               Source code is available at{' '}
-              <Link href='https://github.com/readest/readest' className='text-blue-500 underline'>
+              <Link href={FORK_SOURCE_REPOSITORY} className='text-blue-500 underline'>
                 GitHub
               </Link>
               .

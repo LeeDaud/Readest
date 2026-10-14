@@ -335,6 +335,9 @@ const getColorStyles = (
 ) => {
   const { bg, fg, primary, isDarkMode } = themeCode;
   const hasBackgroundTexture = !!backgroundTextureId && backgroundTextureId !== 'none';
+  // Over a background texture, Override Book Color still forces the text
+  // colors but fills backgrounds with transparent so the texture shows (#6712).
+  const overrideBg = hasBackgroundTexture ? 'transparent' : bg;
   const colorStyles = `
     html {
       --bg-texture-id: ${backgroundTextureId};
@@ -360,12 +363,12 @@ const getColorStyles = (
     }
     section, aside, blockquote, article, nav, header, footer, main, figure,
     div, p, font, h1, h2, h3, h4, h5, h6, li, span {
-      ${overrideColor && !hasBackgroundTexture ? `background-color: ${bg} !important;` : ''}
-      ${overrideColor && !hasBackgroundTexture ? `color: ${fg} !important;` : ''}
-      ${overrideColor && !hasBackgroundTexture ? `border-color: ${fg} !important;` : ''}
+      ${overrideColor ? `background-color: ${overrideBg} !important;` : ''}
+      ${overrideColor ? `color: ${fg} !important;` : ''}
+      ${overrideColor ? `border-color: ${fg} !important;` : ''}
     }
     pre, span { /* inline code blocks */
-      ${overrideColor ? `background-color: ${bg} !important;` : ''}
+      ${overrideColor ? `background-color: ${overrideBg} !important;` : ''}
     }
     a:any-link {
       ${overrideColor ? `color: ${primary} !important;` : isDarkMode ? `color: lightblue;` : ''}
@@ -667,6 +670,8 @@ const getPageLayoutStyles = (
 // Paragraph-scoped CSS controlled by the Paragraph section of the Layout
 // panel. Gated by BookStyle.useBookLayout: when true, this chunk is skipped
 // and the book's own paragraph formatting takes over.
+const CJK_LANGS = ['zh', 'ja', 'ko'];
+const CJK_LANG_SELECTOR = CJK_LANGS.map((lang) => `:lang(${lang})`).join(', ');
 const getParagraphLayoutStyles = (
   overrideLayout: boolean,
   paragraphMargin: number,
@@ -765,7 +770,10 @@ const getParagraphLayoutStyles = (
   li p, ol p, ul p, td p {
     text-indent: initial !important;
   }
-  p {
+  /* Some converted books use an inline-only <blockquote> for every paragraph
+     (#6656); under override it is spaced like a <p>, while a quote wrapping
+     block content keeps its indent. */
+  p${overrideLayout ? `, blockquote:not(:has(*:not(${INLINE_FORMATTING_SELECTOR})))` : ''} {
     ${vertical ? `margin-left: ${paragraphMargin}em ${overrideLayout ? '!important' : ''};` : ''}
     ${vertical ? `margin-right: ${paragraphMargin}em ${overrideLayout ? '!important' : ''};` : ''}
     ${vertical ? `margin-top: unset ${overrideLayout ? '!important' : ''};` : ''}
@@ -785,7 +793,7 @@ const getParagraphLayoutStyles = (
     display: flow-root; 
   }
 
-  :lang(zh), :lang(ja), :lang(ko) {
+  ${CJK_LANG_SELECTOR} {
     widows: 1;
     orphans: 1;
   }
@@ -806,6 +814,23 @@ const getParagraphLayoutStyles = (
 
   .nonindent, .noindent {
     text-indent: unset !important;
+  }
+`;
+
+// Zero-specificity fallback for the paragraph chunk's CJK widow/orphan lift
+// above. Use Book Layout skips that chunk wholesale, taking the lift with it,
+// so a CJK book wearing the placeholder `en` its conversion tool stamped
+// (#6672) falls back to the UA default of 2 and the page-bottom gap the lift
+// closes comes back. It is scoped to the section root on purpose: a direct
+// declaration beats an inherited value at any specificity, so an element-wide
+// fallback would stomp widows/orphans the book declares on html or body and
+// expects its paragraphs to inherit. From the root the 1s flow to every
+// paragraph the book says nothing about, while a declaration at any ancestor
+// — or on the paragraph itself — still wins.
+const getCJKLineFlowStyles = () => `
+  :where(${CJK_LANGS.map((lang) => `html:lang(${lang})`).join(', ')}) {
+    widows: 1;
+    orphans: 1;
   }
 `;
 
@@ -1146,6 +1171,7 @@ export const getStyles = (
   const translationStyles = getTranslationStyles(viewSettings);
   const warichuStyles = getWarichuStyles();
   const rubyStyles = getRubyStyles(viewSettings);
+  const cjkLineFlowStyles = getCJKLineFlowStyles();
   const dialogueStyles = isDialogueHighlightActive(viewSettings)
     ? getDialogueHighlightStyles(viewSettings, themeCode)
     : '';
@@ -1156,7 +1182,7 @@ export const getStyles = (
   // the footnote aside's border show as a stray horizontal line (#4438). Keep it
   // ahead of the inlined custom `@font-face` rules.
   const epubNamespace = `@namespace epub "http://www.idpf.org/2007/ops";`;
-  return `${epubNamespace}\n${customFontFaces}\n${pageLayoutStyles}\n${paragraphLayoutStyles}\n${fontStyles}\n${colorStyles}\n${dialogueStyles}\n${translationStyles}\n${warichuStyles}\n${rubyStyles}\n${userStylesheet}`;
+  return `${epubNamespace}\n${customFontFaces}\n${pageLayoutStyles}\n${paragraphLayoutStyles}\n${cjkLineFlowStyles}\n${fontStyles}\n${colorStyles}\n${dialogueStyles}\n${translationStyles}\n${warichuStyles}\n${rubyStyles}\n${userStylesheet}`;
 };
 
 // Build a CSS chunk of `@font-face` rules for the given user custom
@@ -1212,8 +1238,11 @@ export const transformStylesheet = (
     const hasTextAlignCenter = /text-align\s*:\s*center\s*[;$]/.test(block);
     const hasTextIndentZero = /text-indent\s*:\s*0(?:\.0+)?(?:px|em|rem|%)?\s*[;$]/.test(block);
 
+    // Only the zero indent is pinned, so centered text isn't pushed off center
+    // by the Paragraph Indent override. The centering itself is kept by
+    // keepTextAlignment; making it !important here would beat a more specific
+    // author rule that left-aligns the element (#6723).
     if (hasTextAlignCenter && hasTextIndentZero) {
-      block = block.replace(/(text-align\s*:\s*center)(\s*;|\s*$)/g, '$1 !important$2');
       block = block.replace(
         /(text-indent\s*:\s*0(?:\.0+)?(?:px|em|rem|%)?)(\s*;|\s*$)/g,
         '$1 !important$2',

@@ -15,6 +15,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      statuses: write
     outputs:
       changed: ${{ steps.merge.outputs.changed }}
       branch: ${{ steps.merge.outputs.branch }}
@@ -41,6 +42,7 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          base=$(git rev-parse HEAD)
           git fetch --no-tags https://github.com/readest/readest.git "refs/tags/$UPSTREAM_TAG"
           upstream=$(git rev-parse 'FETCH_HEAD^{commit}')
           if git merge-base --is-ancestor "$upstream" HEAD; then
@@ -52,6 +54,11 @@ jobs:
             git fetch origin "$branch"
             git switch --detach FETCH_HEAD
             git merge-base --is-ancestor "$upstream" HEAD
+            if ! git merge-base --is-ancestor "$base" HEAD; then
+              git merge --no-edit "$base"
+              node scripts/verify-fork.mjs
+              git push origin "HEAD:refs/heads/$branch"
+            fi
           else
             git switch -c "$branch"
             git merge --no-edit "$upstream"
@@ -80,6 +87,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      statuses: write
     with:
       source_ref: ${{ needs.synchronize.outputs.branch }}
       pull_request: ${{ needs.synchronize.outputs.pr }}
