@@ -2096,9 +2096,10 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                 event.error?.let { payload.put("error", it) }
                 emitOrQueue("web-browser-download", payload)
             },
-            completion = { hash, page ->
+            completion = { hash, page, openSettings ->
                 activeWebBrowser = null
                 val ret = JSObject()
+                if (openSettings) ret.put("openSettings", true)
                 if (hash != null) ret.put("openBookHash", hash)
                 if (page != null) {
                     val captured = JSObject()

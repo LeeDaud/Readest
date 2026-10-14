@@ -24,13 +24,14 @@ export interface WebBrowserDownload {
 }
 
 export interface WebBrowserStatus {
-  state: 'importing' | 'added' | 'failed' | 'unsupported';
+  state: 'importing' | 'added' | 'failed' | 'downloadFailed' | 'importFailed' | 'unsupported';
   filename: string;
   /** The chrome's [Open] button hands this back through `openWebBrowser`. */
   bookHash?: string;
 }
 
 export interface WebBrowserResult {
+  openSettings?: boolean;
   openBookHash?: string;
   /** Rendered page at the moment the user chooses Clip Page. */
   page?: WebBrowserPage;

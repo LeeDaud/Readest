@@ -447,6 +447,8 @@ pub struct WebBrowserRequest {
     pub url: String,
     #[serde(default)]
     pub fallback_urls: Option<Vec<String>>,
+    #[serde(default)]
+    pub site_names: HashMap<String, String>,
     pub download_dir: String,
     pub capture_script: String,
     #[serde(default)]
@@ -462,6 +464,8 @@ pub struct WebBrowserRequest {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebBrowserResponse {
+    #[serde(default)]
+    pub open_settings: bool,
     /// Set when the user tapped [Open] on an imported book in the chrome.
     #[serde(default)]
     pub open_book_hash: Option<String>,

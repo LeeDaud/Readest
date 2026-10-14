@@ -27,11 +27,20 @@ export type WebBrowserLabelKey =
   | 'failed'
   | 'unsupported'
   | 'open'
-  | 'sitesUnavailable';
+  | 'sitesUnavailable'
+  | 'tryingSite'
+  | 'connectingSite'
+  | 'websiteSettings'
+  | 'retry'
+  | 'readNow'
+  | 'dismiss'
+  | 'downloadFailed'
+  | 'importFailed';
 
 export interface WebBrowserOptions {
   /** Initial entry failover only; not used for later browsing or downloads. */
   fallbackUrls?: string[];
+  siteNames?: Record<string, string>;
   /** `#rrggbb` — theme base-100. */
   background: string;
   /** `#rrggbb` — theme base-content. */
@@ -65,6 +74,14 @@ export function getWebBrowserOptions(_: Translate, isEink: boolean): WebBrowserO
       unsupported: _('Not a supported book format'),
       open: _('Open'),
       sitesUnavailable: '所有配置的网站均连接失败，请在设置中检查网站列表',
+      tryingSite: '连接失败，正在尝试网站',
+      connectingSite: '正在连接网站',
+      websiteSettings: '网站设置',
+      retry: _('Retry'),
+      readNow: '立即阅读',
+      dismiss: _('Dismiss'),
+      downloadFailed: _('Download failed'),
+      importFailed: _('Import failed'),
     },
   };
 }

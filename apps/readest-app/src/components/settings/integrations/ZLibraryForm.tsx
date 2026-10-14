@@ -1,34 +1,56 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { MdArrowDownward, MdArrowUpward, MdClose } from 'react-icons/md';
 import { useEnv } from '@/context/EnvContext';
 import { useSettingsStore } from '@/store/settingsStore';
 import { getZLibraryUrls, normalizeZLibraryUrls } from '@/services/zlibrary/sites';
 import { BoxedList, Tips } from '../primitives';
 
+type SiteDraft = { id: number; url: string; name: string };
+
 export default function ZLibraryForm() {
   const { envConfig } = useEnv();
-  const [draft, setDraft] = useState(() => {
+  const [sites, setSites] = useState<SiteDraft[]>(() => {
+    const { settings } = useSettingsStore.getState();
+    let urls: string[];
     try {
-      return getZLibraryUrls(useSettingsStore.getState().settings).join('\n');
+      urls = getZLibraryUrls(settings);
     } catch {
-      return useSettingsStore.getState().settings.zlibraryUrls?.join('\n') || '';
+      urls = settings.zlibraryUrls || [];
     }
+    return urls.map((url, id) => ({ id, url, name: settings.zlibrarySiteNames?.[url] || '' }));
   });
+  const nextId = useRef(sites.length);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
+  const change = (rows: SiteDraft[]) => {
+    setSites(rows);
+    setMessage('');
+    setError('');
+  };
+  const move = (index: number, offset: number) => {
+    const rows = [...sites];
+    [rows[index], rows[index + offset]] = [rows[index + offset]!, rows[index]!];
+    change(rows);
+  };
   const save = async () => {
     setError('');
     setMessage('');
     setSaving(true);
     try {
-      const urls = normalizeZLibraryUrls(draft.split('\n'));
+      const urls = normalizeZLibraryUrls(sites.map((site) => site.url));
+      const names: Record<string, string> = {};
+      for (const site of sites) {
+        if (!site.url.trim()) continue;
+        const url = normalizeZLibraryUrls([site.url])[0]!;
+        if (!names[url] && site.name.trim()) names[url] = site.name.trim().slice(0, 32);
+      }
       const store = useSettingsStore.getState();
-      const next = { ...store.settings, zlibraryUrls: urls };
-      await store.saveSettings(envConfig, next);
-      // Preserve concurrent in-memory changes to unrelated settings.
-      store.setSettings({ ...useSettingsStore.getState().settings, zlibraryUrls: urls });
-      setDraft(urls.join('\n'));
-      setMessage('已保存');
+      const patch = { zlibraryUrls: urls, zlibrarySiteNames: names };
+      await store.saveSettings(envConfig, { ...store.settings, ...patch });
+      store.setSettings({ ...useSettingsStore.getState().settings, ...patch });
+      setSites(urls.map((url) => ({ id: nextId.current++, url, name: names[url] || '' })));
+      setMessage('已保存，下次进入 Z-Library 时生效');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -38,45 +60,114 @@ export default function ZLibraryForm() {
   return (
     <div className='flex w-full flex-col gap-4'>
       <BoxedList title='Z-Library 网站' innerClassName='ps-0!'>
-        <div className='flex flex-col gap-3 p-4'>
-          <label htmlFor='zlibrary-sites'>网站列表（每行一个，按顺序尝试）</label>
-          <textarea
-            id='zlibrary-sites'
-            className='textarea eink-bordered border-base-300 w-full'
-            rows={6}
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              setMessage('');
-              setError('');
-            }}
-            disabled={saving}
-            autoCapitalize='none'
-            autoCorrect='off'
-            spellCheck={false}
-            placeholder='https://zh.zlibrary.by'
-          />
+        <ol className='divide-base-200 divide-y'>
+          {sites.map((site, index) => (
+            <li key={site.id} className='flex flex-col gap-3 p-4'>
+              <div className='flex items-center justify-between gap-2'>
+                <span className='text-base-content/70 text-sm'>
+                  {index === 0 ? '优先入口' : `备用入口 ${index}`}
+                </span>
+                <div className='flex gap-1'>
+                  <button
+                    type='button'
+                    className='btn btn-ghost btn-square min-h-11 min-w-11'
+                    aria-label={`上移网站 ${index + 1}`}
+                    disabled={saving || index === 0}
+                    onClick={() => move(index, -1)}
+                  >
+                    <MdArrowUpward />
+                  </button>
+                  <button
+                    type='button'
+                    className='btn btn-ghost btn-square min-h-11 min-w-11'
+                    aria-label={`下移网站 ${index + 1}`}
+                    disabled={saving || index === sites.length - 1}
+                    onClick={() => move(index, 1)}
+                  >
+                    <MdArrowDownward />
+                  </button>
+                  <button
+                    type='button'
+                    className='btn btn-ghost btn-square min-h-11 min-w-11'
+                    aria-label={`删除网站 ${index + 1}`}
+                    disabled={saving}
+                    onClick={() => change(sites.filter((row) => row.id !== site.id))}
+                  >
+                    <MdClose />
+                  </button>
+                </div>
+              </div>
+              <label className='flex flex-col gap-1 text-sm'>
+                网站名称（可选）
+                <input
+                  aria-label={`网站 ${index + 1} 名称`}
+                  className='input eink-bordered border-base-300 w-full'
+                  value={site.name}
+                  disabled={saving}
+                  maxLength={32}
+                  placeholder='例如：常用入口'
+                  onChange={(event) =>
+                    change(
+                      sites.map((row) =>
+                        row.id === site.id ? { ...row, name: event.target.value } : row,
+                      ),
+                    )
+                  }
+                />
+              </label>
+              <label className='flex flex-col gap-1 text-sm'>
+                网站地址
+                <input
+                  aria-label={`网站 ${index + 1} 地址`}
+                  className='input eink-bordered border-base-300 w-full'
+                  value={site.url}
+                  disabled={saving}
+                  autoCapitalize='none'
+                  autoCorrect='off'
+                  spellCheck={false}
+                  inputMode='url'
+                  placeholder='https://zh.zlibrary.by'
+                  onChange={(event) =>
+                    change(
+                      sites.map((row) =>
+                        row.id === site.id ? { ...row, url: event.target.value } : row,
+                      ),
+                    )
+                  }
+                />
+              </label>
+            </li>
+          ))}
+        </ol>
+        <div className='flex flex-wrap justify-between gap-3 p-4'>
           <button
             type='button'
-            className='btn btn-contrast self-end'
-            disabled={saving}
-            onClick={save}
+            className='btn btn-ghost eink-bordered'
+            disabled={saving || sites.length >= 10}
+            onClick={() => change([...sites, { id: nextId.current++, url: '', name: '' }])}
           >
+            添加网站
+          </button>
+          <button type='button' className='btn btn-contrast' disabled={saving} onClick={save}>
             {saving ? '保存中…' : '保存网站'}
           </button>
-          {error && (
-            <p role='alert' className='text-error'>
-              {error}
-            </p>
-          )}
-          {message && <p role='status'>{message}</p>}
         </div>
+        {error && (
+          <p role='alert' className='text-error px-4 pb-4'>
+            {error}
+          </p>
+        )}
+        {message && (
+          <p role='status' className='px-4 pb-4'>
+            {message}
+          </p>
+        )}
       </BoxedList>
       <Tips>
-        <li>最多配置 10 个 HTTPS 网址。调整行的顺序即可调整优先级；空行和重复网址会自动忽略。</li>
+        <li>第一个网站优先访问，连接失败后依次尝试备用入口。使用上下箭头调整顺序。</li>
         <li>
-          从书架添加 Z-Library
-          书籍时直接访问第一个网站，连接失败会尝试下一个。登录验证页面会保留，下载完成后自动加入书架。
+          最多保存 10 个 HTTPS
+          入口，空地址和重复网址会自动忽略。名称仅用于显示，登录验证页面会保留。
         </li>
       </Tips>
     </div>

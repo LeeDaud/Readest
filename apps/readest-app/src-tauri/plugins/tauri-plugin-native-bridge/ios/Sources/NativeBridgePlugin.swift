@@ -1861,9 +1861,10 @@ class NativeBridgePlugin: Plugin {
         if let error = event.error { data["error"] = error }
         self?.trigger("web-browser-download", data: data)
       }
-      controller.onFinish = { [weak self] hash, page in
+      controller.onFinish = { [weak self] hash, page, openSettings in
         self?.activeWebBrowser = nil
         var ret = JSObject()
+        if openSettings { ret["openSettings"] = true }
         if let hash = hash { ret["openBookHash"] = hash }
         if let page = page { ret["page"] = ["url": page.url, "html": page.html] }
         invoke.resolve(ret)

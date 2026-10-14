@@ -6,6 +6,7 @@ import WebKit
 final class WebBrowserArgs: Decodable {
   let url: String
   let fallbackUrls: [String]?
+  let siteNames: [String: String]?
   let downloadDir: String
   let captureScript: String
   let background: String?
@@ -65,6 +66,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   private let banner = UIView()
   private let bannerLabel = UILabel()
   private let bannerOpen = UIButton(type: .system)
+  private let bannerSettings = UIButton(type: .system)
   private var bannerHeight: NSLayoutConstraint!
   private var bannerHideWork: DispatchWorkItem?
   private var observations: [NSKeyValueObservation] = []
@@ -72,6 +74,10 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   private var openBookHash: String?
   private var finished = false
   private var capturing = false
+  private var bannerState = ""
+  private var bannerFilename = ""
+  private var downloadedEvents: [String: WebBrowserDownloadEvent] = [:]
+  private var failedDownloadUrls: [String: URL] = [:]
   private var entryIndex = 0
   private var entryPending = false
   private var entryNavigation: WKNavigation?
@@ -88,6 +94,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     entryNavigation = webView.load(URLRequest(url: url))
     entryTimeout?.cancel()
     if entryPending {
+      setStatus(state: "connecting", filename: "\(entryIndex + 1)/\(entryUrls.count) · \(entryName())", bookHash: nil)
       let work = DispatchWorkItem { [weak self] in self?.failEntry() }
       entryTimeout = work
       DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
@@ -111,7 +118,13 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   }
 
   var onDownload: ((WebBrowserDownloadEvent) -> Void)?
-  var onFinish: ((String?, WebBrowserPage?) -> Void)?
+  var onFinish: ((String?, WebBrowserPage?, Bool) -> Void)?
+
+  private func entryName() -> String {
+    let entry = entryUrls.indices.contains(entryIndex) ? entryUrls[entryIndex] : URL(string: args.url)
+    return entry.flatMap { args.siteNames?[$0.absoluteString] }.flatMap { $0.isEmpty ? nil : $0 }
+      ?? entry?.host ?? "Z-Library"
+  }
 
   init(args: WebBrowserArgs) {
     self.args = args
@@ -180,6 +193,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     closeButton = close
     backButton = back
     reloadButton = reload
+    reload.isHidden = args.fallbackUrls != nil
     menuButton = menu
 
     titleLabel.textColor = fg
@@ -225,7 +239,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
       stack.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
       stack.centerYAnchor.constraint(equalTo: close.centerYAnchor),
       stack.leadingAnchor.constraint(greaterThanOrEqualTo: back.trailingAnchor, constant: 4),
-      stack.trailingAnchor.constraint(lessThanOrEqualTo: reload.leadingAnchor, constant: -4),
+      stack.trailingAnchor.constraint(lessThanOrEqualTo: args.fallbackUrls == nil ? reload.leadingAnchor : menu.leadingAnchor, constant: -4),
 
       hairline.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
       hairline.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
@@ -252,6 +266,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     bannerLabel.textColor = fg
     bannerLabel.font = UIFont.systemFont(ofSize: 13)
     bannerLabel.lineBreakMode = .byTruncatingMiddle
+    bannerLabel.numberOfLines = 2
     bannerLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     bannerLabel.translatesAutoresizingMaskIntoConstraints = false
     banner.addSubview(bannerLabel)
@@ -265,20 +280,31 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     bannerOpen.addTarget(self, action: #selector(openTapped), for: .touchUpInside)
     bannerOpen.isHidden = true
     bannerOpen.translatesAutoresizingMaskIntoConstraints = false
-    banner.addSubview(bannerOpen)
+    bannerOpen.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+    bannerSettings.setTitle(args.label("websiteSettings", "Website settings"), for: .normal)
+    bannerSettings.setTitleColor(fg, for: .normal)
+    bannerSettings.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+    bannerSettings.addTarget(self, action: #selector(settingsTapped), for: .touchUpInside)
+    bannerSettings.isHidden = true
+    let dismiss = iconButton("xmark", "dismiss", "Dismiss", #selector(dismissBannerTapped))
+    let actions = UIStackView(arrangedSubviews: [bannerOpen, bannerSettings, dismiss])
+    actions.spacing = 8
+    actions.alignment = .center
+    actions.translatesAutoresizingMaskIntoConstraints = false
+    banner.addSubview(actions)
 
     bannerHeight = banner.heightAnchor.constraint(equalToConstant: 0)
     NSLayoutConstraint.activate([
-      banner.topAnchor.constraint(equalTo: bar.bottomAnchor),
+      banner.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
       banner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       banner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       bannerHeight,
       bannerLabel.leadingAnchor.constraint(equalTo: banner.leadingAnchor, constant: 16),
       bannerLabel.centerYAnchor.constraint(equalTo: banner.centerYAnchor),
-      bannerOpen.leadingAnchor.constraint(
+      actions.leadingAnchor.constraint(
         greaterThanOrEqualTo: bannerLabel.trailingAnchor, constant: 12),
-      bannerOpen.trailingAnchor.constraint(equalTo: banner.trailingAnchor, constant: -12),
-      bannerOpen.centerYAnchor.constraint(equalTo: banner.centerYAnchor),
+      actions.trailingAnchor.constraint(equalTo: banner.trailingAnchor, constant: -8),
+      actions.centerYAnchor.constraint(equalTo: banner.centerYAnchor),
     ])
   }
 
@@ -296,10 +322,10 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     wv.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(wv)
     NSLayoutConstraint.activate([
-      wv.topAnchor.constraint(equalTo: banner.bottomAnchor),
+      wv.topAnchor.constraint(equalTo: bar.bottomAnchor),
       wv.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       wv.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      wv.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      wv.bottomAnchor.constraint(equalTo: banner.topAnchor),
     ])
     webView = wv
   }
@@ -321,7 +347,8 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
         self?.setLoading(wv.isLoading)
       },
       webView.observe(\.title, options: [.new]) { [weak self] wv, _ in
-        self?.titleLabel.text = wv.title?.isEmpty == false ? wv.title : wv.url?.host
+        guard let self = self else { return }
+        self.titleLabel.text = self.args.fallbackUrls != nil ? self.entryName() : (wv.title?.isEmpty == false ? wv.title : wv.url?.host)
       },
       webView.observe(\.url, options: [.initial, .new]) { [weak self] wv, _ in
         self?.setHost(wv.url)
@@ -331,6 +358,10 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
 
   private func buildMenu() -> UIMenu {
     var actions: [UIAction] = []
+    if args.fallbackUrls != nil {
+      actions.append(UIAction(title: args.label(webView?.isLoading == true ? "stop" : "reload", "Reload"), image: UIImage(systemName: "arrow.clockwise")) { [weak self] _ in self?.reloadTapped() })
+      actions.append(UIAction(title: args.label("websiteSettings", "Website settings"), image: UIImage(systemName: "gearshape")) { [weak self] _ in self?.settingsTapped() })
+    }
     actions.append(
       UIAction(title: args.label("clipPage", "Clip Page"), image: UIImage(systemName: "doc.badge.plus")) {
         [weak self] _ in self?.capturePage()
@@ -390,20 +421,27 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
   /// locally when a download starts.
   func setStatus(state: String, filename: String, bookHash: String?) {
     bannerHideWork?.cancel()
+    bannerState = state
+    bannerFilename = filename
     let fallback: [String: String] = [
       "downloading": "Downloading", "importing": "Importing", "added": "Added to library",
       "failed": "Import failed", "unsupported": "Not a supported book format",
+      "downloadFailed": "Download failed", "importFailed": "Import failed",
     ]
-    bannerLabel.text = state == "unavailable" ? filename : "\(args.label(state, fallback[state] ?? state)) \u{00B7} \(filename)"
+    let statusLabel = state == "connecting" ? args.label(entryIndex == 0 ? "connectingSite" : "tryingSite", "Connecting") : args.label(state, fallback[state] ?? state)
+    bannerLabel.text = state == "unavailable" ? filename : "\(statusLabel)\n\(filename)"
     openBookHash = state == "added" ? bookHash : nil
-    bannerOpen.isHidden = openBookHash == nil
-    bannerHeight.constant = 44
+    let canRetry = state == "unavailable" || (state == "downloadFailed" && failedDownloadUrls[filename] != nil) || ((state == "importFailed" || state == "failed") && downloadedEvents[filename] != nil)
+    bannerOpen.setTitle(args.label(state == "added" ? "readNow" : "retry", state == "added" ? "Read now" : "Retry"), for: .normal)
+    bannerOpen.isHidden = openBookHash == nil && !canRetry
+    bannerSettings.isHidden = state != "unavailable"
+    bannerHeight.constant = 72
     if eink {
       view.layoutIfNeeded()
     } else {
       UIView.animate(withDuration: 0.2) { self.view.layoutIfNeeded() }
     }
-    if state != "downloading" && state != "importing" && state != "unavailable" {
+    if args.fallbackUrls == nil && state != "downloading" && state != "importing" && state != "unavailable" && state != "connecting" {
       let work = DispatchWorkItem { [weak self] in self?.hideBanner() }
       bannerHideWork = work
       DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
@@ -431,7 +469,17 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
       webView.stopLoading()
     } else { webView.reload() }
   }
-  @objc private func openTapped() { finish(openBookHash) }
+  @objc private func openTapped() {
+    switch bannerState {
+    case "added": finish(openBookHash)
+    case "unavailable": entryIndex = 0; if let url = entryUrls.first { loadEntry(url) }
+    case "downloadFailed": if let url = failedDownloadUrls[bannerFilename] { webView.load(URLRequest(url: url)) }
+    case "importFailed", "failed": if let event = downloadedEvents[bannerFilename] { setStatus(state: "importing", filename: event.filename, bookHash: nil); onDownload?(event) }
+    default: break
+    }
+  }
+  @objc private func settingsTapped() { finish(nil, openSettings: true) }
+  @objc private func dismissBannerTapped() { bannerHideWork?.cancel(); hideBanner() }
 
   private func capturePage() {
     guard !finished, !capturing else { return }
@@ -465,7 +513,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     }
   }
 
-  private func finish(_ hash: String?, page: WebBrowserPage? = nil) {
+  private func finish(_ hash: String?, page: WebBrowserPage? = nil, openSettings: Bool = false) {
     entryTimeout?.cancel()
     if finished { return }
     finished = true
@@ -473,7 +521,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     webView.stopLoading()
     webView.navigationDelegate = nil
     webView.uiDelegate = nil
-    dismiss(animated: true) { [onFinish] in onFinish?(hash, page) }
+    dismiss(animated: true) { [onFinish] in onFinish?(hash, page, openSettings) }
   }
 
   // MARK: - WKNavigationDelegate
@@ -482,6 +530,7 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
     if navigation === entryNavigation {
       entryPending = false
       entryTimeout?.cancel()
+      if bannerState == "connecting" { hideBanner() }
     }
   }
 
@@ -586,17 +635,19 @@ final class WebBrowserController: UIViewController, WKNavigationDelegate, WKUIDe
 
   func downloadDidFinish(_ download: WKDownload) {
     guard let entry = downloadPaths.removeValue(forKey: ObjectIdentifier(download)) else { return }
-    onDownload?(
-      WebBrowserDownloadEvent(
+    let event = WebBrowserDownloadEvent(
         url: entry.url.absoluteString, path: entry.path.path,
-        filename: entry.path.lastPathComponent, success: true, error: nil))
+        filename: entry.path.lastPathComponent, success: true, error: nil)
+    downloadedEvents[event.filename] = event
+    onDownload?(event)
   }
 
   func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
     guard let entry = downloadPaths.removeValue(forKey: ObjectIdentifier(download)) else { return }
     // Drop the partial file so it does not linger in the cache.
     try? FileManager.default.removeItem(at: entry.path)
-    setStatus(state: "failed", filename: entry.path.lastPathComponent, bookHash: nil)
+    failedDownloadUrls[entry.path.lastPathComponent] = entry.url
+    setStatus(state: "downloadFailed", filename: entry.path.lastPathComponent, bookHash: nil)
     onDownload?(
       WebBrowserDownloadEvent(
         url: entry.url.absoluteString, path: entry.path.path,

@@ -41,4 +41,6 @@ node scripts/prepare-android-branding.mjs
 
 恢复品牌后的产物：`artifacts/android/Readest-0.12.12-zlibrary-arm64-debug.apk`，209,107,671 字节，SHA256 为 `686443C1608E720134CCB7C9BA8E32F31549FA0FA96FEFA49AE201F13D27A080`。aapt 核验名称为 Readest，包名、版本与 ABI 不变；APK v2 签名和 16 KB ZIP 对齐检查通过。Android 图标从上游已提交资源复制；此次离线 Gradle 组装通过（20 秒）。再次安装时设备列表为空，未完成新资源包的模拟器安装显示验证。前次完整流程验证记录仍保留，不等同于本次新包实测。
 
-最新多网址配置产物：`artifacts/android/Readest-0.12.12-zlibrary-sites-arm64-debug.apk`，208,107,613 字节，SHA256 为 `2B3192D97E60EAA630FF92FD20B792FE377074F48A594EE5092DE7D39319E28D`。名称、包名、版本和上游图标延续；签名与对齐检查通过。设置中保存网站列表，书架菜单直接进入并按顺序尝试备用站点。见 [多网址验证记录](validation-zlibrary-sites-2026-10-14.md)；本次无连接设备，尚未实测新包的自动换站流程。
+上一版多网址配置产物：`artifacts/android/Readest-0.12.12-zlibrary-sites-arm64-debug.apk`，208,107,613 字节，SHA256 为 `2B3192D97E60EAA630FF92FD20B792FE377074F48A594EE5092DE7D39319E28D`。名称、包名、版本和上游图标延续；签名与对齐检查通过。设置中保存网站列表，书架菜单直接进入并按顺序尝试备用站点。见 [多网址验证记录](validation-zlibrary-sites-2026-10-14.md)；本次无连接设备，尚未实测新包的自动换站流程。
+
+最新访问 UI 产物：artifacts/android/Readest-0.12.12-zlibrary-ui-arm64-debug.apk，208,205,917 字节，SHA256 为 E99B65AE7733C14FFEEB9C30F4019B8C66231A298DF9BE0BCF798F2121A37DBA。签名与对齐检查通过。新增网站列表、名称、换站反馈、底部下载状态和分别重试功能。参见 [访问 UI 验证记录](validation-zlibrary-ui-2026-10-14.md)；原生 UI 尚需手机验收。

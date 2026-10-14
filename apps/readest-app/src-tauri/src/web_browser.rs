@@ -17,6 +17,7 @@ const CAPTURE_JS: &str = include_str!("web_browser_capture.js");
 #[serde(rename_all = "camelCase", default)]
 pub struct WebBrowserOptions {
     pub fallback_urls: Option<Vec<String>>,
+    pub site_names: HashMap<String, String>,
     pub background: Option<String>,
     pub foreground: Option<String>,
     pub is_eink: Option<bool>,
@@ -46,6 +47,8 @@ pub struct WebBrowserStatus {
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct WebBrowserResult {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub open_settings: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_book_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +546,7 @@ pub async fn open_web_browser(
         }),
         download_dir: download_dir.to_string_lossy().into_owned(),
         capture_script: CAPTURE_JS.to_string(),
+        site_names: options.site_names,
         background: options.background,
         foreground: options.foreground,
         is_eink: options.is_eink,
@@ -556,6 +560,7 @@ pub async fn open_web_browser(
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
     Ok(WebBrowserResult {
+        open_settings: response.open_settings,
         open_book_hash: response.open_book_hash,
         page: response.page,
     })

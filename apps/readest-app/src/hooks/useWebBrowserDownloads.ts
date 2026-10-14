@@ -33,7 +33,7 @@ export function useWebBrowserDownloads() {
       if (!appService) return;
       const { filename } = download;
       if (!download.success) {
-        await setWebBrowserStatus({ state: 'failed', filename });
+        await setWebBrowserStatus({ state: 'downloadFailed', filename });
         eventDispatcher.dispatch('toast', {
           type: 'error',
           message: download.error || _('Download failed'),
@@ -71,7 +71,7 @@ export function useWebBrowserDownloads() {
           });
         }
       } catch (err) {
-        await setWebBrowserStatus({ state: 'failed', filename });
+        await setWebBrowserStatus({ state: 'importFailed', filename });
         eventDispatcher.dispatch('toast', {
           type: 'error',
           message: err instanceof Error ? err.message : _('Import failed'),

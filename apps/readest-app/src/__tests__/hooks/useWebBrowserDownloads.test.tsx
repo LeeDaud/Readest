@@ -169,14 +169,17 @@ describe('useWebBrowserDownloads', () => {
       error: 'boom',
     });
     await waitFor(() =>
-      expect(setStatusMock).toHaveBeenCalledWith({ state: 'failed', filename: 'dune.epub' }),
+      expect(setStatusMock).toHaveBeenCalledWith({
+        state: 'downloadFailed',
+        filename: 'dune.epub',
+      }),
     );
     expect(dispatchMock).toHaveBeenCalledWith('toast', expect.objectContaining({ type: 'error' }));
 
     ingestMock.mockRejectedValue(new Error('bad epub'));
     handler({ url: 'u2', path: '/cache/bad.epub', filename: 'bad.epub', success: true });
     await waitFor(() =>
-      expect(setStatusMock).toHaveBeenCalledWith({ state: 'failed', filename: 'bad.epub' }),
+      expect(setStatusMock).toHaveBeenCalledWith({ state: 'importFailed', filename: 'bad.epub' }),
     );
   });
 });

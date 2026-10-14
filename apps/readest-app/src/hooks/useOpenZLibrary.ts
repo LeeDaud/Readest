@@ -30,7 +30,15 @@ export function useOpenZLibrary() {
         const result = await openWebBrowser(urls[0]!, {
           ...getWebBrowserOptions(_, !!settings.globalViewSettings.isEink),
           fallbackUrls: urls.slice(1),
+          ...(settings.zlibrarySiteNames ? { siteNames: settings.zlibrarySiteNames } : {}),
         });
+        if (result.openSettings) {
+          const store = useSettingsStore.getState();
+          store.setRequestedPanel('Integrations');
+          store.setRequestedSubPage('zlibrary');
+          store.setSettingsDialogOpen(true);
+          router.push('/library');
+        }
         if (result.openBookHash) navigateToReader(router, [result.openBookHash]);
         return result.openBookHash;
       } else {

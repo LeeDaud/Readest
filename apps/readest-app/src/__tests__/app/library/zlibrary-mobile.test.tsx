@@ -11,6 +11,10 @@ const mocks = vi.hoisted(() => ({
   navigate: vi.fn(),
   urls: undefined as string[] | undefined,
   appReady: true,
+  names: undefined as Record<string, string> | undefined,
+  panel: vi.fn(),
+  subPage: vi.fn(),
+  settingsOpen: vi.fn(),
 }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }));
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn(), replace: vi.fn() }) }));
@@ -25,7 +29,14 @@ vi.mock('@/services/webBrowser/webBrowserOptions', () => ({ getWebBrowserOptions
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: {
     getState: () => ({
-      settings: { zlibraryUrls: mocks.urls, globalViewSettings: { isEink: false } },
+      settings: {
+        zlibraryUrls: mocks.urls,
+        zlibrarySiteNames: mocks.names,
+        globalViewSettings: { isEink: false },
+      },
+      setRequestedPanel: mocks.panel,
+      setRequestedSubPage: mocks.subPage,
+      setSettingsDialogOpen: mocks.settingsOpen,
     }),
   },
 }));
@@ -39,6 +50,7 @@ beforeEach(() => {
   mocks.tauri = true;
   mocks.urls = undefined;
   mocks.appReady = true;
+  mocks.names = undefined;
   mocks.browser.mockResolvedValue({});
   mocks.invoke.mockImplementation((command: string) =>
     Promise.resolve(command === 'resolve_zlibrary_entry' ? 'https://zh.zlibrary.by/' : undefined),
@@ -99,6 +111,22 @@ it('passes configured backup entries to the native browser in saved order', asyn
       fallbackUrls: ['https://second.example/', 'https://third.example/'],
     }),
   );
+});
+
+it('passes site names and returns directly to the website settings when requested by native UI', async () => {
+  mocks.names = { 'https://zh.zlibrary.by/': '常用入口' };
+  mocks.browser.mockResolvedValue({ openSettings: true });
+  render(<ZLibraryPage />);
+  await waitFor(() =>
+    expect(mocks.browser).toHaveBeenCalledWith('https://zh.zlibrary.by/', {
+      fallbackUrls: [],
+      siteNames: mocks.names,
+    }),
+  );
+  await waitFor(() => expect(mocks.subPage).toHaveBeenCalledWith('zlibrary'));
+  expect(mocks.panel).toHaveBeenCalledWith('Integrations');
+  expect(mocks.settingsOpen).toHaveBeenCalledWith(true);
+  expect(mocks.navigate).not.toHaveBeenCalled();
 });
 
 it('waits for app initialization and unlock before automatically opening an old link', async () => {

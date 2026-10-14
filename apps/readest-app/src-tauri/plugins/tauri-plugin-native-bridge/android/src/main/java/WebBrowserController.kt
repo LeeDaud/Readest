@@ -51,6 +51,7 @@ import org.json.JSONObject
 class WebBrowserArgs {
     var url: String? = null
     var fallbackUrls: List<String>? = null
+    var siteNames: Map<String, String>? = null
     var downloadDir: String? = null
     var captureScript: String? = null
     var background: String? = null
@@ -87,7 +88,7 @@ class WebBrowserController(
     activity: Activity,
     private val args: WebBrowserArgs,
     private val onDownload: (WebBrowserDownloadEvent) -> Unit,
-    private val completion: (String?, WebBrowserPage?) -> Unit,
+    private val completion: (String?, WebBrowserPage?, Boolean) -> Unit,
 ) {
     companion object {
         private const val TAG = "WebBrowser"
@@ -98,6 +99,8 @@ class WebBrowserController(
         private const val MENU_COPY_LINK = 3
         private const val MENU_SIGN_OUT = 4
         private const val MENU_CLIP_PAGE = 5
+        private const val MENU_RELOAD = 6
+        private const val MENU_SETTINGS = 7
     }
 
     private val activityRef = WeakReference(activity)
@@ -118,6 +121,14 @@ class WebBrowserController(
     private var banner: LinearLayout? = null
     private var bannerText: TextView? = null
     private var bannerOpen: TextView? = null
+    private var connectionPanel: LinearLayout? = null
+    private var connectionText: TextView? = null
+    private var connectionActions: LinearLayout? = null
+    private var bannerFilename = ""
+    private var bannerState = ""
+    private data class DownloadRequest(val url: String, val userAgent: String?, val disposition: String?, val mimeType: String?)
+    private val downloadRequests = mutableMapOf<String, DownloadRequest>()
+    private val downloadEvents = mutableMapOf<String, WebBrowserDownloadEvent>()
     private var openBookHash: String? = null
     private var loading = false
     private var finished = false
@@ -130,13 +141,33 @@ class WebBrowserController(
         .filter { it.startsWith("https://") || it.startsWith("http://") }.distinct().take(10)
     private val entryTimeout = Runnable { failEntry() }
 
+    private fun entryName(): String = entryUrls.getOrNull(entryIndex)?.let { args.siteNames?.get(it) }?.takeIf { it.isNotBlank() }
+        ?: entryUrls.getOrNull(entryIndex)?.let { Uri.parse(it).host } ?: "Z-Library"
+
+    private fun connectionStatus(failed: Boolean = false) {
+        connectionPanel?.visibility = View.VISIBLE
+        connectionActions?.visibility = if (failed) View.VISIBLE else View.GONE
+        connectionText?.text = if (failed) label("sitesUnavailable", "All websites unavailable") else
+            "${label(if (entryIndex == 0) "connectingSite" else "tryingSite", "Connecting")} ${entryIndex + 1}/${entryUrls.size} · ${entryName()}"
+    }
+
+    private fun retryEntries() {
+        entryIndex = 0
+        entryPending = true
+        entryNavigation = entryUrls.firstOrNull() ?: return
+        connectionStatus()
+        mainHandler.removeCallbacks(entryTimeout)
+        mainHandler.postDelayed(entryTimeout, 20_000L)
+        webView?.loadUrl(entryNavigation!!)
+    }
+
     private fun failEntry() {
         if (!entryPending || finished) return
         entryPending = false
         mainHandler.removeCallbacks(entryTimeout)
         if (entryIndex + 1 >= entryUrls.size) {
             webView?.stopLoading()
-            setStatus("unavailable", label("sitesUnavailable", "All configured websites failed to load"), null)
+            connectionStatus(true)
             return
         }
         entryIndex += 1
@@ -147,6 +178,7 @@ class WebBrowserController(
             webView?.stopLoading()
             entryNavigation = entryUrls[entryIndex]
             entryPending = true
+            connectionStatus()
             mainHandler.postDelayed(entryTimeout, 20_000L)
             webView?.loadUrl(entryUrls[entryIndex])
         }
@@ -158,12 +190,12 @@ class WebBrowserController(
     fun show() {
         val urlStr = args.url
         if (urlStr.isNullOrBlank() || !(urlStr.startsWith("http://") || urlStr.startsWith("https://"))) {
-            completion(null, null)
+            completion(null, null, false)
             return
         }
         val act = activityRef.get()
         if (act == null || act.isFinishing || act.isDestroyed) {
-            completion(null, null)
+            completion(null, null, false)
             return
         }
         mainHandler.post { present(act, urlStr) }
@@ -199,17 +231,54 @@ class WebBrowserController(
 
         root.addView(buildBar(act), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(act, BAR_HEIGHT_DP)))
         root.addView(buildProgress(act), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(act, 2)))
-        root.addView(buildBanner(act), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(act, 44)))
+        val connection = LinearLayout(act).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(act, 16), dp(act, 8), dp(act, 16), dp(act, 8))
+            visibility = View.GONE
+        }
+        connectionText = TextView(act).apply { setTextColor(fg); textSize = 13f }
+        connection.addView(connectionText)
+        connectionActions = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            visibility = View.GONE
+            addView(android.widget.Button(act).apply {
+                text = label("retry", "Retry")
+                setTextColor(bg)
+                background = GradientDrawable().apply { setColor(fg); cornerRadius = dp(act, 8).toFloat() }
+                elevation = 0f
+                stateListAnimator = null
+                minHeight = dp(act, 48)
+                minWidth = 0
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(act, 8) }
+                setOnClickListener { retryEntries() }
+            })
+            addView(android.widget.Button(act).apply {
+                text = label("websiteSettings", "Website settings")
+                setTextColor(fg)
+                background = GradientDrawable().apply { setColor(bg); setStroke(dp(act, 1), fg); cornerRadius = dp(act, 8).toFloat() }
+                elevation = 0f
+                stateListAnimator = null
+                minHeight = dp(act, 48)
+                minWidth = 0
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener { finish(null, openSettings = true) }
+            })
+        }
+        connection.addView(connectionActions)
+        connectionPanel = connection
+        root.addView(connection)
 
         val wv = WebView(act)
         configureWebView(act, wv)
         root.addView(wv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(buildBanner(act), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(act, 72)))
         webView = wv
 
         dlg.setContentView(root)
         dialog = dlg
         dlg.show()
         entryNavigation = urlStr
+        if (entryPending) connectionStatus()
         if (entryPending) mainHandler.postDelayed(entryTimeout, 20_000L)
         wv.loadUrl(urlStr)
     }
@@ -273,11 +342,12 @@ class WebBrowserController(
                 if (loading) {
                     entryPending = false
                     mainHandler.removeCallbacks(entryTimeout)
+                    connectionPanel?.visibility = View.GONE
                     it.stopLoading()
                 } else it.reload()
             }
         }
-        bar.addView(reloadButton)
+        if (args.fallbackUrls == null) bar.addView(reloadButton)
         menuButton = iconButton(act, R.drawable.ic_browser_more, label("menu", "More")) { showMenu(act) }
         bar.addView(menuButton)
         return bar
@@ -309,8 +379,8 @@ class WebBrowserController(
         bannerText = TextView(act).apply {
             setTextColor(fg)
             textSize = 13f
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.MIDDLE
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         row.addView(bannerText)
@@ -326,9 +396,24 @@ class WebBrowserController(
             pill.cornerRadius = dp(act, 16).toFloat()
             this.background = pill
             visibility = View.GONE
-            setOnClickListener { finish(openBookHash) }
+            minHeight = dp(act, 48)
+            gravity = Gravity.CENTER
+            setOnClickListener {
+                when (bannerState) {
+                    "added" -> finish(openBookHash)
+                    "downloadFailed" -> downloadRequests[bannerFilename]?.let { startDownload(it.url, it.userAgent, it.disposition, it.mimeType) }
+                    "importFailed", "failed" -> downloadEvents[bannerFilename]?.takeIf { it.success }?.let {
+                        setStatus("importing", it.filename, null)
+                        onDownload(it)
+                    }
+                }
+            }
         }
         row.addView(bannerOpen)
+        row.addView(iconButton(act, R.drawable.ic_browser_close, label("dismiss", "Dismiss")) {
+            mainHandler.removeCallbacks(hideBannerRunnable)
+            row.visibility = View.GONE
+        })
         banner = row
         return row
     }
@@ -337,6 +422,10 @@ class WebBrowserController(
         val anchor = menuButton ?: return
         val wv = webView ?: return
         val popup = PopupMenu(act, anchor)
+        if (args.fallbackUrls != null) {
+            popup.menu.add(0, MENU_RELOAD, 0, label(if (loading) "stop" else "reload", "Reload"))
+            popup.menu.add(0, MENU_SETTINGS, 0, label("websiteSettings", "Website settings"))
+        }
         popup.menu.add(0, MENU_CLIP_PAGE, 0, label("clipPage", "Clip Page"))
         popup.menu.add(0, MENU_FORWARD, 0, label("forward", "Forward")).isEnabled = wv.canGoForward()
         popup.menu.add(0, MENU_OPEN_EXTERNAL, 1, label("openInBrowser", "Open in Browser"))
@@ -344,6 +433,8 @@ class WebBrowserController(
         popup.menu.add(0, MENU_SIGN_OUT, 3, label("signOut", "Sign out of this site"))
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
+                MENU_RELOAD -> reloadButton?.performClick()
+                MENU_SETTINGS -> finish(null, openSettings = true)
                 MENU_CLIP_PAGE -> capturePage(wv)
                 MENU_FORWARD -> wv.goForward()
                 MENU_OPEN_EXTERNAL -> wv.url?.let { openExternal(act, it) }
@@ -425,19 +516,26 @@ class WebBrowserController(
         }
         hostView?.text = if (uri.scheme == "https") "🔒 $host" else "${label("notSecure", "Not secure")} · $host"
         if (titleView?.text.isNullOrEmpty()) titleView?.text = host
+        if (args.fallbackUrls != null) titleView?.text = entryName()
     }
 
     fun setStatus(state: String, filename: String, bookHash: String?) {
         mainHandler.removeCallbacks(hideBannerRunnable)
+        bannerState = state
+        bannerFilename = filename
         val fallback = mapOf(
             "downloading" to "Downloading", "importing" to "Importing", "added" to "Added to library",
             "failed" to "Import failed", "unsupported" to "Not a supported book format",
+            "downloadFailed" to "Download failed", "importFailed" to "Import failed",
         )
-        bannerText?.text = if (state == "unavailable") filename else "${label(state, fallback[state] ?: state)} · $filename"
+        bannerText?.text = if (state == "unavailable") filename else "${label(state, fallback[state] ?: state)}\n$filename"
         openBookHash = if (state == "added") bookHash else null
-        bannerOpen?.visibility = if (openBookHash != null) View.VISIBLE else View.GONE
+        val canRetry = (state == "downloadFailed" && downloadRequests.containsKey(filename)) ||
+            ((state == "importFailed" || state == "failed") && downloadEvents[filename]?.success == true)
+        bannerOpen?.text = label(if (state == "added") "readNow" else "retry", if (state == "added") "Read now" else "Retry")
+        bannerOpen?.visibility = if (openBookHash != null || canRetry) View.VISIBLE else View.GONE
         banner?.visibility = View.VISIBLE
-        if (state != "downloading" && state != "importing" && state != "unavailable") {
+        if (args.fallbackUrls == null && state != "downloading" && state != "importing" && state != "unavailable") {
             mainHandler.postDelayed(hideBannerRunnable, BANNER_HIDE_MS)
         }
     }
@@ -495,6 +593,11 @@ class WebBrowserController(
                 if (entryPending && url == entryNavigation) {
                     entryPending = false
                     mainHandler.removeCallbacks(entryTimeout)
+                    connectionPanel?.visibility = View.GONE
+                    if (entryIndex > 0) {
+                        view.clearHistory()
+                        backButton?.visibility = View.INVISIBLE
+                    }
                 }
             }
 
@@ -522,7 +625,7 @@ class WebBrowserController(
             }
 
             override fun onReceivedTitle(view: WebView, title: String?) {
-                titleView?.text = if (title.isNullOrBlank()) view.url?.let { Uri.parse(it).host } else title
+                titleView?.text = if (args.fallbackUrls != null) entryName() else if (title.isNullOrBlank()) view.url?.let { Uri.parse(it).host } else title
             }
 
             // target=_blank / window.open: load the target in this WebView.
@@ -553,13 +656,14 @@ class WebBrowserController(
         val filename = sanitizeFilename(URLUtil.guessFileName(url, contentDisposition, mimeType))
         val dirPath = args.downloadDir
         if (dirPath.isNullOrBlank() || url.startsWith("blob:") || url.startsWith("data:")) {
-            setStatus("failed", filename, null)
+            setStatus("downloadFailed", filename, null)
             onDownload(WebBrowserDownloadEvent(url, "", filename, false, "Unsupported download URL"))
             return
         }
         val dir = File(dirPath)
         dir.mkdirs()
         val dest = uniqueFile(dir, filename)
+        downloadRequests[dest.name] = DownloadRequest(url, userAgent, contentDisposition, mimeType)
         setStatus("downloading", dest.name, null)
         val cookie = CookieManager.getInstance().getCookie(url)
         Thread {
@@ -573,7 +677,27 @@ class WebBrowserController(
                 if (!cookie.isNullOrEmpty()) conn.setRequestProperty("Cookie", cookie)
                 val code = conn.responseCode
                 if (code !in 200..299) throw IOException("HTTP $code")
-                conn.inputStream.use { input -> FileOutputStream(dest).use { output -> input.copyTo(output) } }
+                val total = conn.contentLengthLong
+                var received = 0L
+                var lastUpdate = 0L
+                conn.inputStream.use { input -> FileOutputStream(dest).use { output ->
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        received += count
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (total > 0 && now - lastUpdate >= 250) {
+                            lastUpdate = now
+                            val percent = (received * 100 / total).coerceIn(0, 100)
+                            mainHandler.post {
+                                if (!finished && bannerState == "downloading" && bannerFilename == dest.name && banner?.visibility == View.VISIBLE)
+                                    bannerText?.text = "${label("downloading", "Downloading")} $percent%\n${dest.name}"
+                            }
+                        }
+                    }
+                } }
             } catch (e: Exception) {
                 Log.w(TAG, "download failed: $url", e)
                 dest.delete()
@@ -581,8 +705,10 @@ class WebBrowserController(
             }
             val success = error == null
             mainHandler.post {
-                if (!success) setStatus("failed", dest.name, null)
-                onDownload(WebBrowserDownloadEvent(url, dest.absolutePath, dest.name, success, error))
+                if (!success) setStatus("downloadFailed", dest.name, null)
+                val event = WebBrowserDownloadEvent(url, dest.absolutePath, dest.name, success, error)
+                downloadEvents[dest.name] = event
+                onDownload(event)
             }
         }.start()
     }
@@ -615,7 +741,7 @@ class WebBrowserController(
 
     // MARK: lifecycle
 
-    private fun finish(hash: String?, page: WebBrowserPage? = null) {
+    private fun finish(hash: String?, page: WebBrowserPage? = null, openSettings: Boolean = false) {
         mainHandler.removeCallbacks(entryTimeout)
         if (finished) return
         finished = true
@@ -638,7 +764,7 @@ class WebBrowserController(
         }
         dialog = null
         webView = null
-        completion(hash, page)
+        completion(hash, page, openSettings)
     }
 
     private fun isLight(color: Int): Boolean =
