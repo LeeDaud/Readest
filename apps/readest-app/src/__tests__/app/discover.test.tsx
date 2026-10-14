@@ -136,6 +136,26 @@ it('preserves the visible card when history cannot be saved', async () => {
   expect(screen.getByRole('heading', { level: 2 }).textContent).toBe(title);
   expect(mocks.records).toHaveLength(0);
 });
+
+it('requests external covers with CORS for isolated WebViews and removes failed images', async () => {
+  mocks.next.mockResolvedValueOnce({
+    book: {
+      ...DISCOVERY_CATALOG[0]!,
+      metadata: {
+        source: 'Open Library',
+        url: 'https://openlibrary.org/works/OL123W',
+        coverUrl: 'https://covers.openlibrary.org/b/id/123-M.jpg?default=false',
+      },
+    },
+    offline: false,
+  });
+  await start();
+  const image = screen.getByRole('img');
+  expect(image.getAttribute('crossorigin')).toBe('anonymous');
+  fireEvent.error(image);
+  expect(screen.queryByRole('img')).toBeNull();
+  expect(screen.getByRole('heading', { level: 2 }).textContent).toBe(DISCOVERY_CATALOG[0]!.title);
+});
 it('does not record a failed browser launch or expose unlocked content before unlocking', async () => {
   await start();
   mocks.open.mockRejectedValueOnce(Error('无法打开网站'));

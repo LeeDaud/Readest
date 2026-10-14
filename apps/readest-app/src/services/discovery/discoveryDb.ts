@@ -9,7 +9,9 @@ import {
 } from './recommendations';
 import type { DiscoveryBook, DiscoveryRecord, DiscoveryStatus } from './types';
 
-const stores = new WeakMap<AppService, Promise<DiscoveryDb>>();
+// OPFS allows only one access handle per file in this window. AppService
+// wrappers can change during startup, so object identity cannot key this cache.
+let sharedStore: Promise<DiscoveryDb> | null = null;
 type RecordRow = DatabaseRow & { payload: string };
 
 function identities(
@@ -24,15 +26,14 @@ function identities(
   ];
 }
 
-/** Unbounded history lives outside settings; one shared connection per app service. */
+/** Unbounded history lives outside settings; one shared connection per window. */
 export class DiscoveryDb {
   private migration: Promise<void> | null = null;
   private constructor(private readonly db: DatabaseService) {}
 
   static open(service: AppService): Promise<DiscoveryDb> {
-    let opening = stores.get(service);
-    if (!opening) {
-      opening = service
+    if (!sharedStore) {
+      sharedStore = service
         .openDatabase('book-discovery', 'book-discovery.db', 'Data')
         .then(DiscoveryDb.from)
         .then((store) => {
@@ -43,10 +44,11 @@ export class DiscoveryDb {
             });
           return store;
         });
-      stores.set(service, opening);
-      void opening.catch(() => stores.delete(service));
+      void sharedStore.catch(() => {
+        sharedStore = null;
+      });
     }
-    return opening;
+    return sharedStore;
   }
 
   static async from(db: DatabaseService): Promise<DiscoveryDb> {

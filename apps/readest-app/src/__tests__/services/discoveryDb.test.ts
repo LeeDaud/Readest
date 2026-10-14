@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { NodeDatabaseService } from '@/services/database/nodeDatabaseService';
 import { DiscoveryDb } from '@/services/discovery/discoveryDb';
 import { DISCOVERY_CATALOG } from '@/services/discovery/catalog';
 import type { DatabaseService } from '@/types/database';
+import type { AppService } from '@/types/system';
 
 let database: DatabaseService;
 let store: DiscoveryDb;
@@ -74,4 +75,14 @@ it('supports more than the old catalogue and persists queue state independently 
   expect(await store.listRead('', 100)).toHaveLength(5);
   await store.setValue('queue', { offset: 20, books: [DISCOVERY_CATALOG[0]] });
   expect(await store.getValue('queue')).toMatchObject({ offset: 20 });
+});
+
+it('shares one connection even when startup replaces the app-service wrapper', async () => {
+  const openDatabase = vi.fn(async () => database);
+  const firstService = { openDatabase } as unknown as AppService;
+  const nextService = { openDatabase } as unknown as AppService;
+  const first = await DiscoveryDb.open(firstService);
+  const second = await DiscoveryDb.open(nextService);
+  expect(second).toBe(first);
+  expect(openDatabase).toHaveBeenCalledTimes(1);
 });

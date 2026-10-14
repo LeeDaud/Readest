@@ -236,6 +236,7 @@ function DiscoverContent() {
             <div className='flex items-start gap-5'>
               {book.metadata?.coverUrl && failedCover !== book.metadata.coverUrl && (
                 <img
+                  crossOrigin='anonymous'
                   src={book.metadata.coverUrl}
                   alt={`${book.title}封面`}
                   className='h-32 w-20 shrink-0 rounded-md object-contain'

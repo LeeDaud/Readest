@@ -87,11 +87,13 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
         ),
       { label: 'independent read history loaded from native database' },
     );
-    await page.evaluate('setTimeout(() => location.reload(), 20);');
+    await page.evaluate(
+      'window.__readHistoryReloadPending = true; setTimeout(() => location.reload(), 20);',
+    );
     await waitFor(
       () =>
         page.evaluate<boolean>(
-          `return [...document.querySelectorAll('h2')].some(heading => heading.textContent === ${JSON.stringify(second)});`,
+          `return !window.__readHistoryReloadPending && [...document.querySelectorAll('h2')].some(heading => heading.textContent === ${JSON.stringify(second)});`,
         ),
       { label: 'read record retained after native reload' },
     );
@@ -106,8 +108,19 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
   });
 
   it('edits a completed record and persists the edit on the separate native page', async () => {
+    await waitFor(
+      () =>
+        page.evaluate<boolean>(
+          "return !window.__readHistoryReloadPending && [...document.querySelectorAll('button')].some(b => b.getAttribute('aria-label')?.startsWith('编辑 '));",
+        ),
+      { label: 'native history edit control ready' },
+    );
     await page.evaluate(
       "[...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label')?.startsWith('编辑 ')).click();",
+    );
+    await waitFor(
+      () => page.evaluate<boolean>("return !!document.querySelector('form input[required]');"),
+      { label: 'native history edit form rendered' },
     );
     await page.evaluate(
       `const input=document.querySelector('input[required]'); const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; setter.call(input,'Android 已读编辑验证'); input.dispatchEvent(new Event('input',{bubbles:true}));`,
@@ -120,11 +133,13 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
         ),
       { label: 'native completed-book edit saved' },
     );
-    await page.evaluate('setTimeout(() => location.reload(), 20);');
+    await page.evaluate(
+      'window.__readHistoryReloadPending = true; setTimeout(() => location.reload(), 20);',
+    );
     await waitFor(
       () =>
         page.evaluate<boolean>(
-          "return [...document.querySelectorAll('h2')].some(h => h.textContent === 'Android 已读编辑验证');",
+          "return !window.__readHistoryReloadPending && [...document.querySelectorAll('h2')].some(h => h.textContent === 'Android 已读编辑验证');",
         ),
       { label: 'native completed-book edit survived reload' },
     );
