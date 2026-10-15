@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import DiscoverPage from '@/app/discover/page';
 import ReadHistoryPage from '@/app/read-history/page';
@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   save: vi.fn(),
   remove: vi.fn(),
+  details: vi.fn(),
 }));
 vi.mock('@/hooks/useDiscoveryDb', () => {
   const db = {
@@ -33,7 +34,7 @@ vi.mock('@/services/discovery/onlineQueue', () => ({
   },
 }));
 vi.mock('@/services/discovery/metadata', () => ({
-  loadBookDetails: async (book: unknown) => book,
+  loadBookDetails: mocks.details,
   doubanSearchUrl: () => 'https://douban.com/search',
 }));
 vi.mock('@/store/libraryStore', () => ({
@@ -64,6 +65,7 @@ beforeEach(() => {
     offline: false,
   }));
   mocks.open.mockResolvedValue(undefined);
+  mocks.details.mockImplementation(async (book: unknown) => book);
   mocks.record.mockImplementation(async (book, status) => {
     mocks.records.push({ ...book, status, updatedAt: 1 });
   });
@@ -105,6 +107,29 @@ it('keeps one card and distinguishes vertical reading from an intentional left s
   expect(screen.getAllByRole('article')).toHaveLength(1);
   expect(screen.queryByText('阅读与推荐记录')).toBeNull();
   expect(screen.queryByRole('button', { name: '获取封面与评分' })).toBeNull();
+});
+
+it('loads details only for the settled card when the reader quickly swaps recommendations', async () => {
+  vi.useFakeTimers();
+  try {
+    render(<DiscoverPage />);
+    await act(async () => {});
+    for (let index = 0; index < 2; index++) {
+      fireEvent.click(screen.getByRole('button', { name: '换一本' }));
+      await act(async () => {});
+    }
+    expect(mocks.details).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(mocks.details).toHaveBeenCalledTimes(1);
+    expect(mocks.details.mock.calls[0]![0].title).toBe(
+      screen.getByRole('heading', { level: 2 }).textContent,
+    );
+  } finally {
+    cleanup();
+    vi.useRealTimers();
+  }
 });
 it('records a completed read separately from swapping and passes search terms to Z-Library', async () => {
   const title = await start();

@@ -3,6 +3,41 @@ import type { DiscoveryBook, DiscoveryCategory, DiscoveryMetadata } from './type
 
 let requestTail: Promise<unknown> = Promise.resolve();
 let lastRequest = 0;
+type Transport = 'native' | 'web';
+const TRANSPORT_CACHE_KEY = 'readest-discovery-transport-v1';
+let preferred: Transport | null = null;
+
+function preferredTransport(): Transport {
+  if (preferred) return preferred;
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(TRANSPORT_CACHE_KEY) ?? 'null');
+    if (
+      saved &&
+      typeof saved === 'object' &&
+      'transport' in saved &&
+      (saved.transport === 'web' || saved.transport === 'native') &&
+      'expiresAt' in saved &&
+      typeof saved.expiresAt === 'number' &&
+      saved.expiresAt > Date.now()
+    )
+      return (preferred = saved.transport);
+  } catch {
+    /* Connection preferences are optional. */
+  }
+  return (preferred = 'native');
+}
+
+function rememberTransport(transport: Transport) {
+  preferred = transport;
+  try {
+    localStorage.setItem(
+      TRANSPORT_CACHE_KEY,
+      JSON.stringify({ transport, expiresAt: Date.now() + 86400000 }),
+    );
+  } catch {
+    /* Keep the successful connection for this session if storage is unavailable. */
+  }
+}
 interface OpenLibraryDoc {
   key?: unknown;
   cover_i?: unknown;
@@ -66,15 +101,27 @@ export async function openLibraryJson(url: string, signal?: AbortSignal): Promis
       };
       await waitForSlot();
       if (!isTauriAppPlatform()) return read(globalThis.fetch);
+      const send = async (transport: Transport) =>
+        read(
+          transport === 'native'
+            ? (await import('@tauri-apps/plugin-http')).fetch
+            : globalThis.fetch,
+        );
+      const first = preferredTransport();
       try {
-        return await read((await import('@tauri-apps/plugin-http')).fetch);
+        const data = await send(first);
+        rememberTransport(first);
+        return data;
       } catch (error) {
         signal?.throwIfAborted();
         if (!(error instanceof ConnectionError)) throw error;
-        // Recover connection and body-stream failures through Android's
-        // WebView network stack; cancellation and HTTP errors never retry.
+        // Reuse the last working network stack; if the network changes,
+        // recover through the other one. Cancellation and HTTP errors never retry.
         await waitForSlot();
-        return read(globalThis.fetch);
+        const second = first === 'native' ? 'web' : 'native';
+        const data = await send(second);
+        rememberTransport(second);
+        return data;
       }
     });
   requestTail = task;

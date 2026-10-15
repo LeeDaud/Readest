@@ -9,6 +9,7 @@ beforeEach(() => {
   mocks.native.mockReset();
   mocks.web.mockReset();
   vi.stubGlobal('fetch', mocks.web);
+  localStorage.clear();
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -62,5 +63,45 @@ it('keeps rate-limit responses on the native transport', async () => {
   await expect(openLibraryJson('https://openlibrary.org/search.json')).rejects.toThrow(
     '书籍服务繁忙',
   );
+  expect(mocks.web).not.toHaveBeenCalled();
+});
+
+it('reuses a successful WebView connection for later searches and after a module reload', async () => {
+  mocks.native.mockRejectedValue('native network unavailable');
+  mocks.web.mockImplementation(async () => new Response(JSON.stringify({ docs: [] })));
+  let { openLibraryJson } = await import('@/services/discovery/openLibrary');
+  await openLibraryJson('https://openlibrary.org/search.json?q=first');
+  await openLibraryJson('https://openlibrary.org/search.json?q=second');
+  expect(mocks.native).toHaveBeenCalledTimes(1);
+  vi.resetModules();
+  ({ openLibraryJson } = await import('@/services/discovery/openLibrary'));
+  await openLibraryJson('https://openlibrary.org/search.json?q=third');
+  expect(mocks.native).toHaveBeenCalledTimes(1);
+  expect(mocks.web).toHaveBeenCalledTimes(3);
+});
+
+it('switches back to native once when the previously working WebView connection stops working', async () => {
+  localStorage.setItem(
+    'readest-discovery-transport-v1',
+    JSON.stringify({ transport: 'web', expiresAt: Date.now() + 60000 }),
+  );
+  mocks.web.mockRejectedValue(new TypeError('Network changed'));
+  mocks.native.mockImplementation(async () => new Response(JSON.stringify({ docs: [] })));
+  const { openLibraryJson } = await import('@/services/discovery/openLibrary');
+  await openLibraryJson('https://openlibrary.org/search.json?q=first');
+  await openLibraryJson('https://openlibrary.org/search.json?q=second');
+  expect(mocks.web).toHaveBeenCalledTimes(1);
+  expect(mocks.native).toHaveBeenCalledTimes(2);
+});
+
+it('expires the persisted connection preference so an old network choice is not permanent', async () => {
+  localStorage.setItem(
+    'readest-discovery-transport-v1',
+    JSON.stringify({ transport: 'web', expiresAt: Date.now() - 1 }),
+  );
+  mocks.native.mockResolvedValue(new Response(JSON.stringify({ docs: [] })));
+  const { openLibraryJson } = await import('@/services/discovery/openLibrary');
+  await openLibraryJson('https://openlibrary.org/search.json');
+  expect(mocks.native).toHaveBeenCalledOnce();
   expect(mocks.web).not.toHaveBeenCalled();
 });
