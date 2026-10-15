@@ -592,11 +592,11 @@ class WebBrowserController(
                 setLoading(false)
                 setProgress(100)
                 val search = bookSearch ?: return
-                if (!search.pending || url == null || view.url != url) return
+                if (!search.pending || url == null || view.url != url || (entryPending && entryNavigation != url)) return
                 // Only a usable search homepage resumes the intent. Login and
                 // verification pages stay interactive and are never submitted.
                 view.evaluateJavascript("Boolean(document.querySelector('#searchField, form[action*=\"/s/\"] input[name=\"q\"], form[role=\"search\"] input[type=\"search\"], input[type=\"search\"][name=\"q\"]'))") { ready ->
-                    if (finished || bookSearch !== search || webView !== view || view.url != url) return@evaluateJavascript
+                    if (finished || bookSearch !== search || webView !== view || view.url != url || (entryPending && entryNavigation != url)) return@evaluateJavascript
                     val target = search.onPageFinished(url, ready == "true") ?: return@evaluateJavascript
                     entryPending = true
                     entryNavigation = target
