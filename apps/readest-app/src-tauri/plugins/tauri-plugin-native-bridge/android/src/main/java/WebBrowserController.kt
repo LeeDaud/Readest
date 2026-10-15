@@ -597,7 +597,7 @@ class WebBrowserController(
                 // verification pages stay interactive and are never submitted.
                 view.evaluateJavascript("Boolean(document.querySelector('#searchField, form[action*=\"/s/\"] input[name=\"q\"], form[role=\"search\"] input[type=\"search\"], input[type=\"search\"][name=\"q\"]'))") { ready ->
                     if (finished || bookSearch !== search || webView !== view || view.url != url || (entryPending && entryNavigation != url)) return@evaluateJavascript
-                    val target = search.onPageFinished(url, ready == "true") ?: return@evaluateJavascript
+                    val target = search.onPageReady(url, ready == "true") ?: return@evaluateJavascript
                     entryPending = true
                     entryNavigation = target
                     connectionStatus()
@@ -608,6 +608,11 @@ class WebBrowserController(
             }
 
             override fun onPageCommitVisible(view: WebView, url: String?) {
+                // Complete a visible search before waiting for its images, so
+                // the reader can choose resources and navigate home immediately.
+                if (url == view.url && (!entryPending || url == entryNavigation)) {
+                    bookSearch?.onPageReady(url, false)
+                }
                 if (entryPending && url == entryNavigation) {
                     entryPending = false
                     mainHandler.removeCallbacks(entryTimeout)

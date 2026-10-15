@@ -10,7 +10,10 @@ const env = await detectAndroidEnv();
 const cdpPort = Number(process.env['READEST_CDP_PORT'] ?? 9333);
 
 describe.runIf(env)('Android Z-Library search navigation', () => {
-  it('keeps a book search through failover and a homepage redirect, leaving resources to the reader', async () => {
+  it.each([
+    false,
+    true,
+  ])('keeps a book search through failover (homepage redirect: %s), leaving resources to the reader', async (redirect) => {
     const query = '三体 刘慈欣 / &';
     const searchPath = `/s/${encodeURIComponent(query)}`;
     let canonicalSearches = 0;
@@ -28,7 +31,13 @@ describe.runIf(env)('Android Z-Library search navigation', () => {
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
       if (url.pathname.startsWith('/s/')) {
         canonicalSearches++;
-        response.end('<h1>搜索结果</h1><input id="searchField"><a href="/book/1">选择资源版本</a>');
+        response.end(
+          '<h1>搜索结果</h1><input id="searchField"><a href="/book/1">选择资源版本</a><img src="/slow-image" alt="封面仍在加载">',
+        );
+      } else if (url.pathname === '/slow-image') {
+        // Keep onPageFinished pending while the reader uses visible results.
+        response.setHeader('Content-Type', 'image/png');
+        response.flushHeaders();
       } else if (url.pathname === '/book/1') {
         response.end(
           '<h1>资源详情</h1><a href="/download/book.epub">下载所选版本</a><a href="/">返回首页</a>',
@@ -54,7 +63,7 @@ describe.runIf(env)('Android Z-Library search navigation', () => {
         window.__bookSearchBrowserClosed = false;
         void window.__TAURI_INTERNALS__.invoke('open_web_browser', {
           url: ${JSON.stringify(`http://127.0.0.1:1${searchPath}`)},
-          options: { fallbackUrls: [${JSON.stringify(`http://127.0.0.1:${port}${searchPath}`)}] }
+          options: { fallbackUrls: [${JSON.stringify(`http://${redirect ? '127.0.0.1' : 'localhost'}:${port}${searchPath}`)}] }
         }).then(() => { window.__bookSearchBrowserClosed = true; }).catch(error => {
           window.__bookSearchBrowserError = String(error);
           window.__bookSearchBrowserClosed = true;
@@ -78,6 +87,8 @@ describe.runIf(env)('Android Z-Library search navigation', () => {
       );
       expect(canonicalSearches).toBe(1);
       expect(downloads).toBe(0);
+      expect(await source.evaluate("return document.readyState !== 'complete';")).toBe(true);
+      await adbShell('uiautomator dump /sdcard/readest-search-results.xml >/dev/null');
       await source.evaluate('document.querySelector(\'a[href="/book/1"]\').click();');
       await waitFor(
         () =>
@@ -100,6 +111,8 @@ describe.runIf(env)('Android Z-Library search navigation', () => {
       const xml = await adbShell(
         'uiautomator dump /sdcard/readest-search-window.xml >/dev/null && cat /sdcard/readest-search-window.xml',
       );
+      expect(await source.evaluate('return location.pathname;')).toBe('/');
+      expect(canonicalSearches).toBe(1);
       const close = xml.match(/<node\b[^>]*content-desc="(?:Close|关闭)[^"]*"[^>]*>/)?.[0];
       const bounds = close?.match(/bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
       if (!bounds) throw new Error('Native source browser close button not found');

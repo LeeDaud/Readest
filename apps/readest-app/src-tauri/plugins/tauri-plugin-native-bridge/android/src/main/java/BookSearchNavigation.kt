@@ -9,7 +9,7 @@ internal class BookSearchNavigation(initialUrl: String?) {
     var pending = searchPath != null
         private set
 
-    fun onPageFinished(url: String?, hasSearchForm: Boolean): String? {
+    fun onPageReady(url: String?, hasSearchForm: Boolean): String? {
         if (!pending) return null
         val page = parse(url) ?: return null
         val path = page.rawPath.orEmpty()
