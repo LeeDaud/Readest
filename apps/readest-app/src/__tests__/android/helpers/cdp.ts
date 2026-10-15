@@ -119,6 +119,8 @@ export class CdpPage {
 
   /** Install network fixtures before application code runs after navigation. */
   async addInitScript(source: string): Promise<string> {
+    // Chrome accepts registration without this, but never executes the script.
+    await this.send('Page.enable');
     const response = await this.send('Page.addScriptToEvaluateOnNewDocument', { source });
     const identifier = response.result?.identifier;
     if (!identifier) throw new Error('CDP did not register the initialization script');

@@ -280,8 +280,12 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       window.fetch = (url, ...args) => {
         if (String(url).startsWith('https://openlibrary.org/search.json')) {
           window.__discoveryWebFallback = true;
+          // Initial loading may also refill the Chinese-only queue. Keep the
+          // unrestricted result distinct so history cannot exclude this case.
+          const unrestricted = !new URL(String(url)).searchParams.get('q')?.includes('language:chi');
+          const id = ${fixtureId} + (unrestricted ? 1 : 0);
           return Promise.resolve(new Response(JSON.stringify({ numFound: 1, docs: [{
-            key: '/works/OL${fixtureId}W', title: 'Android 网络回退验证 ${fixtureId}', author_name: ['测试作者']
+            key: '/works/OL' + id + 'W', title: 'Android 网络回退验证 ' + id, author_name: ['测试作者']
           }] }), { headers: { 'Content-Type': 'application/json' } }));
         }
         if (String(url).startsWith('https://openlibrary.org/works/'))
@@ -302,7 +306,7 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       await waitFor(
         () =>
           page.evaluate<boolean>(
-            `return document.querySelector('article h2')?.textContent === 'Android 网络回退验证 ${fixtureId}';`,
+            `return document.querySelector('article h2')?.textContent === 'Android 网络回退验证 ${fixtureId + 1}';`,
           ),
         { timeoutMs: 45_000, label: 'native string failure recovered through WebView' },
       );
