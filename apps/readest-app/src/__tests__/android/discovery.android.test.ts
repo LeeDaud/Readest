@@ -255,7 +255,11 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
   });
 
   it('uses the WebView fallback when the Android HTTP client fails with a string error', async () => {
-    await page.evaluate("setTimeout(() => location.assign('/discover'), 20);");
+    // Start this recovery case without a learned WebView preference from the
+    // preceding latency case, so it exercises the native failure again.
+    await page.evaluate(
+      "localStorage.removeItem('readest-discovery-transport-v1'); setTimeout(() => location.assign('/discover'), 20);",
+    );
     await waitFor(
       () =>
         page.evaluate<boolean>(
