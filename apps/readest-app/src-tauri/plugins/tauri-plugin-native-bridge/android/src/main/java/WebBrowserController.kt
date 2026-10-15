@@ -137,6 +137,7 @@ class WebBrowserController(
     private var entryIndex = 0
     private var entryPending = args.fallbackUrls != null
     private var entryNavigation: String? = null
+    private var bookSearch = args.fallbackUrls?.let { BookSearchNavigation(args.url) }
     private val entryUrls = (listOfNotNull(args.url) + (args.fallbackUrls ?: emptyList()))
         .filter { it.startsWith("https://") || it.startsWith("http://") }.distinct().take(10)
     private val entryTimeout = Runnable { failEntry() }
@@ -155,6 +156,7 @@ class WebBrowserController(
         entryIndex = 0
         entryPending = true
         entryNavigation = entryUrls.firstOrNull() ?: return
+        bookSearch = BookSearchNavigation(entryNavigation)
         connectionStatus()
         mainHandler.removeCallbacks(entryTimeout)
         mainHandler.postDelayed(entryTimeout, 20_000L)
@@ -177,6 +179,7 @@ class WebBrowserController(
             if (finished) return@post
             webView?.stopLoading()
             entryNavigation = entryUrls[entryIndex]
+            bookSearch = BookSearchNavigation(entryNavigation)
             entryPending = true
             connectionStatus()
             mainHandler.postDelayed(entryTimeout, 20_000L)
@@ -340,6 +343,7 @@ class WebBrowserController(
         reloadButton = iconButton(act, R.drawable.ic_browser_refresh, label("reload", "Reload")) {
             webView?.let {
                 if (loading) {
+                    bookSearch = null
                     entryPending = false
                     mainHandler.removeCallbacks(entryTimeout)
                     connectionPanel?.visibility = View.GONE
@@ -587,6 +591,20 @@ class WebBrowserController(
             override fun onPageFinished(view: WebView, url: String?) {
                 setLoading(false)
                 setProgress(100)
+                val search = bookSearch ?: return
+                if (!search.pending || url == null || view.url != url) return
+                // Only a usable search homepage resumes the intent. Login and
+                // verification pages stay interactive and are never submitted.
+                view.evaluateJavascript("Boolean(document.querySelector('#searchField, form[action*=\"/s/\"] input[name=\"q\"], form[role=\"search\"] input[type=\"search\"], input[type=\"search\"][name=\"q\"]'))") { ready ->
+                    if (finished || bookSearch !== search || webView !== view || view.url != url) return@evaluateJavascript
+                    val target = search.onPageFinished(url, ready == "true") ?: return@evaluateJavascript
+                    entryPending = true
+                    entryNavigation = target
+                    connectionStatus()
+                    mainHandler.removeCallbacks(entryTimeout)
+                    mainHandler.postDelayed(entryTimeout, 20_000L)
+                    view.loadUrl(target)
+                }
             }
 
             override fun onPageCommitVisible(view: WebView, url: String?) {
