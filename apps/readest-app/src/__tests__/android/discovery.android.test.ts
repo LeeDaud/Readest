@@ -159,11 +159,13 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
 
   it('swaps cached cards promptly while a background refill is held', async () => {
     const testCategory = latencyAttempt++ === 0 ? 'science' : 'psychology';
-    await page.evaluate("setTimeout(() => location.assign('/discover'), 20);");
+    await page.evaluate(
+      "window.__latencyNavigationPending = true; setTimeout(() => location.assign('/discover'), 20);",
+    );
     await waitFor(
       () =>
         page.evaluate<boolean>(
-          "return !!document.querySelector('article') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
+          "return !window.__latencyNavigationPending && !!document.querySelector('article') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
         ),
       { timeoutMs: 90_000, label: 'discovery ready for cache latency test' },
     );
@@ -255,21 +257,15 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
   });
 
   it('uses the WebView fallback when the Android HTTP client fails with a string error', async () => {
-    // Start this recovery case without a learned WebView preference from the
-    // preceding latency case, so it exercises the native failure again.
-    await page.evaluate(
-      "localStorage.removeItem('readest-discovery-transport-v1'); setTimeout(() => location.assign('/discover'), 20);",
-    );
-    await waitFor(
-      () =>
-        page.evaluate<boolean>(
-          "return !!document.querySelector('article') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
-        ),
-      { timeoutMs: 90_000, label: 'native discovery ready for connection failure' },
-    );
-    await page.evaluate(`
+    const fixtureId = Date.now();
+    // Install before navigation, so a late reload cannot remove the fixture and
+    // initial metadata requests cannot learn a different connection preference.
+    const script = await page.addInitScript(`
       window.__discoverySavedRequest = window.Request;
       window.__discoverySavedFetch = window.fetch;
+      window.__discoverySavedPreference = localStorage.getItem('readest-discovery-transport-v1');
+      localStorage.setItem('readest-discovery-transport-v1', JSON.stringify({ transport: 'native', expiresAt: Date.now() + 60000 }));
+      window.__discoveryFixtureId = ${fixtureId};
       window.__discoveryNativeFailed = false;
       window.__discoveryWebFallback = false;
       // invoke is deliberately non-writable in a real Tauri WebView. Exercise
@@ -285,18 +281,28 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
         if (String(url).startsWith('https://openlibrary.org/search.json')) {
           window.__discoveryWebFallback = true;
           return Promise.resolve(new Response(JSON.stringify({ numFound: 1, docs: [{
-            key: '/works/OL900000001W', title: 'Android 网络回退验证', author_name: ['测试作者']
+            key: '/works/OL${fixtureId}W', title: 'Android 网络回退验证 ${fixtureId}', author_name: ['测试作者']
           }] }), { headers: { 'Content-Type': 'application/json' } }));
         }
+        if (String(url).startsWith('https://openlibrary.org/works/'))
+          return Promise.resolve(new Response(JSON.stringify({ description: '网络回退测试简介' })));
         return window.__discoverySavedFetch(url, ...args);
       };
-      document.querySelector('input[type="checkbox"]').click();
     `);
     try {
+      await page.evaluate("setTimeout(() => location.assign('/discover'), 20);");
+      await waitFor(
+        () =>
+          page.evaluate<boolean>(`
+          return window.__discoveryFixtureId === ${fixtureId} && !!document.querySelector('article') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);
+        `),
+        { timeoutMs: 90_000, label: 'new native page ready with connection failure fixture' },
+      );
+      await page.evaluate('document.querySelector(\'input[type="checkbox"]\').click();');
       await waitFor(
         () =>
           page.evaluate<boolean>(
-            "return document.querySelector('article h2')?.textContent === 'Android 网络回退验证';",
+            `return document.querySelector('article h2')?.textContent === 'Android 网络回退验证 ${fixtureId}';`,
           ),
         { timeoutMs: 45_000, label: 'native string failure recovered through WebView' },
       );
@@ -323,9 +329,12 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
       );
       throw error;
     } finally {
+      await page.removeInitScript(script);
       await page.evaluate(`
-        window.Request = window.__discoverySavedRequest;
-        window.fetch = window.__discoverySavedFetch;
+        if (window.__discoverySavedRequest) window.Request = window.__discoverySavedRequest;
+        if (window.__discoverySavedFetch) window.fetch = window.__discoverySavedFetch;
+        if (window.__discoverySavedPreference === null) localStorage.removeItem('readest-discovery-transport-v1');
+        else if (window.__discoverySavedPreference !== undefined) localStorage.setItem('readest-discovery-transport-v1', window.__discoverySavedPreference);
       `);
     }
   });

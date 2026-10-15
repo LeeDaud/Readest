@@ -51,6 +51,7 @@ interface CdpResponse {
   id?: number;
   error?: { message?: string };
   result?: {
+    identifier?: string;
     result?: { value?: unknown };
     exceptionDetails?: { exception?: { description?: string }; text?: string };
   };
@@ -114,6 +115,18 @@ export class CdpPage {
       );
     }
     return res.result?.result?.value as T;
+  }
+
+  /** Install network fixtures before application code runs after navigation. */
+  async addInitScript(source: string): Promise<string> {
+    const response = await this.send('Page.addScriptToEvaluateOnNewDocument', { source });
+    const identifier = response.result?.identifier;
+    if (!identifier) throw new Error('CDP did not register the initialization script');
+    return identifier;
+  }
+
+  async removeInitScript(identifier: string): Promise<void> {
+    await this.send('Page.removeScriptToEvaluateOnNewDocument', { identifier });
   }
 
   /**
