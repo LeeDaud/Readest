@@ -93,16 +93,23 @@ function DiscoverContent() {
   useEffect(() => {
     if (!book) return;
     const controller = new AbortController();
-    void loadBookDetails(book, controller.signal)
-      .then((result) => {
-        if (!controller.signal.aborted)
-          setBook((current) => (current?.id === result.id ? result : current));
-      })
-      .catch(() => {
-        /* Optional information never blocks browsing. */
-      });
+    // Briefly settle on the card before using a provider request slot for
+    // optional details. Rapid swipes leave those slots for new candidates.
+    const detailsTimer = setTimeout(() => {
+      void loadBookDetails(book, controller.signal)
+        .then((result) => {
+          if (!controller.signal.aborted)
+            setBook((current) => (current?.id === result.id ? result : current));
+        })
+        .catch(() => {
+          /* Optional information never blocks browsing. */
+        });
+    }, 250);
     void queue?.prefetch(life.current?.signal).catch(() => {});
-    return () => controller.abort();
+    return () => {
+      clearTimeout(detailsTimer);
+      controller.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [book?.id, queue]);
 

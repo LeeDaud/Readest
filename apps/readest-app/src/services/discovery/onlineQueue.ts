@@ -23,6 +23,7 @@ type ShelfBook = { title: string; author: string; deletedAt?: number | null };
 export class OnlineQueue {
   private filling: Promise<void> | null = null;
   private state: QueueState | null = null;
+  private updates: Promise<unknown> = Promise.resolve();
   readonly key: string;
   private readonly queries: { category: Exclude<DiscoveryCategory, 'all'>; subject: string }[];
   constructor(
@@ -55,10 +56,18 @@ export class OnlineQueue {
     return this.state;
   }
 
+  // Serialize short database updates, never the network request. Refills and
+  // foreground reservations must not overwrite each other's buffered books.
+  private withState<T>(action: (state: QueueState) => T | Promise<T>): Promise<T> {
+    const task = this.updates.then(async () => action(await this.load()));
+    this.updates = task.catch(() => {});
+    return task;
+  }
+
   async fill(signal?: AbortSignal): Promise<void> {
     if (this.filling) return this.filling;
     const task = (async () => {
-      const state = await this.load();
+      const state = await this.withState((state) => state);
       const query = this.queries[state.topic];
       if (!query) return;
       const offsets = { ...(state.offsets ?? { [query.subject]: state.offset }) };
@@ -100,16 +109,18 @@ export class OnlineQueue {
         }
       }
       // A failed response never advances the cursor; fetched candidates persist across restarts.
-      const next = {
+      const cursor = {
         topic: nextTopic,
         offset:
           nextTopic < this.queries.length ? (offsets[this.queries[nextTopic]!.subject] ?? 0) : 0,
         offsets,
         exhausted,
-        books: [...state.books, ...books],
       };
-      await this.db.setValue(this.key, next);
-      this.state = next;
+      await this.withState(async (current) => {
+        const next = { ...cursor, books: [...current.books, ...books] };
+        await this.db.setValue(this.key, next);
+        this.state = next;
+      });
     })();
     this.filling = task;
     try {
@@ -125,37 +136,43 @@ export class OnlineQueue {
   ): Promise<{ book: DiscoveryBook; offline: boolean } | null> {
     // Yield rather than spin indefinitely when all fetched results are excluded.
     for (let batch = 0; batch < 4; batch++) {
-      if (this.filling) {
-        // A background request is optional: its failure must not discard
-        // candidates already buffered, or cancel a newer foreground request.
-        await this.filling.catch(() => {});
-        signal?.throwIfAborted();
-      }
-      let state = await this.load();
-      while (state.books.length) {
-        signal?.throwIfAborted();
-        const book = state.books[0]!;
-        const excluded = await this.db.isExcluded(book, library);
-        const next = { ...state, books: state.books.slice(1) };
-        await this.db.setValue(this.key, next);
-        this.state = state = next;
-        if (!excluded) {
-          await this.db.markSeen(book);
-          return { book, offline: false };
+      const cached = await this.withState(async (state) => {
+        while (state.books.length) {
+          signal?.throwIfAborted();
+          const book = state.books[0]!;
+          const excluded = await this.db.isExcluded(book, library);
+          signal?.throwIfAborted();
+          const next = { ...state, books: state.books.slice(1) };
+          await this.db.setValue(this.key, next);
+          this.state = state = next;
+          if (!excluded) {
+            await this.db.markSeen(book);
+            return { book, exhausted: false };
+          }
         }
-      }
-      if (!this.queries[state.topic]) return null;
+        return { book: null, exhausted: !this.queries[state.topic] };
+      });
+      if (cached.book) return { book: cached.book, offline: false };
+      if (cached.exhausted) return null;
       try {
         await this.fill(signal);
       } catch (error) {
         signal?.throwIfAborted();
         const allowedCategories = new Set(this.queries.map((query) => query.category));
-        for (const book of DISCOVERY_CATALOG) {
-          if (allowedCategories.has(book.category) && !(await this.db.isExcluded(book, library))) {
-            await this.db.markSeen(book);
-            return { book, offline: true };
+        const offline = await this.withState(async () => {
+          for (const book of DISCOVERY_CATALOG) {
+            signal?.throwIfAborted();
+            if (
+              allowedCategories.has(book.category) &&
+              !(await this.db.isExcluded(book, library))
+            ) {
+              await this.db.markSeen(book);
+              return book;
+            }
           }
-        }
+          return null;
+        });
+        if (offline) return { book: offline, offline: true };
         throw error instanceof Error ? error : Error('无法连接在线书籍服务，请检查网络后重试');
       }
     }
@@ -163,6 +180,6 @@ export class OnlineQueue {
   }
 
   async prefetch(signal?: AbortSignal) {
-    if ((await this.load()).books.length <= 3) await this.fill(signal);
+    if ((await this.withState((state) => state.books.length)) <= 10) await this.fill(signal);
   }
 }

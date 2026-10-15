@@ -9,6 +9,7 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
   let page: CdpPage;
   let previous: unknown;
   let captured = false;
+  let latencyAttempt = 0;
   beforeAll(async () => {
     try {
       const settings = JSON.parse(await readAppFile(APP_PKG, 'settings.json'));
@@ -154,6 +155,103 @@ describe.runIf(env)('Android book discovery and persisted history', () => {
     expect(await page.evaluate<string>('return document.body.innerText;')).toContain(
       '各本书的阅读时长',
     );
+  });
+
+  it('swaps cached cards promptly while a background refill is held', async () => {
+    const testCategory = latencyAttempt++ === 0 ? 'science' : 'psychology';
+    await page.evaluate("setTimeout(() => location.assign('/discover'), 20);");
+    await waitFor(
+      () =>
+        page.evaluate<boolean>(
+          "return !!document.querySelector('article') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
+        ),
+      { timeoutMs: 90_000, label: 'discovery ready for cache latency test' },
+    );
+    await page.evaluate(`
+      window.__latencySavedRequest = window.Request;
+      window.__latencySavedFetch = window.fetch;
+      window.__latencySavedPreference = localStorage.getItem('readest-discovery-transport-v1');
+      window.__latencyHeld = false;
+      window.__latencyReleased = false;
+      window.__latencyBatch = 0;
+      window.__latencyIdBase = Date.now();
+      window.Request = class extends window.__latencySavedRequest {
+        constructor(url, options) {
+          super(String(url).startsWith('https://openlibrary.org/search.json') ? 'http://127.0.0.1:1/discovery-latency-test' : url, options);
+        }
+      };
+      window.fetch = (url, ...args) => {
+        if (String(url).startsWith('https://openlibrary.org/search.json')) {
+          const batch = ++window.__latencyBatch;
+          const response = () => new Response(JSON.stringify({ numFound: 1000, docs: Array.from({length: 20}, (_, i) => ({
+            key: '/works/OL' + (window.__latencyIdBase + batch * 20 + i) + 'W', title: '性能推荐 ' + window.__latencyIdBase + '-' + (batch * 20 + i), author_name: ['测试作者']
+          })) }), { headers: { 'Content-Type': 'application/json' } });
+          if (batch === 1) return Promise.resolve(response());
+          window.__latencyHeld = true;
+          return new Promise(resolve => { window.__latencyRelease = () => { window.__latencyReleased = true; resolve(response()); }; });
+        }
+        if (String(url).startsWith('https://openlibrary.org/works/'))
+          return Promise.resolve(new Response(JSON.stringify({ description: '性能测试简介' })));
+        return window.__latencySavedFetch(url, ...args);
+      };
+      const category = document.querySelector('select[aria-label="想读的方向"]');
+      category.value = ${JSON.stringify(testCategory)};
+      category.dispatchEvent(new Event('change', { bubbles: true }));
+    `);
+    const swap = async () => {
+      const title = await page.evaluate<string>(
+        "return document.querySelector('article h2')?.textContent || ''; ",
+      );
+      await page.evaluate(
+        "[...document.querySelectorAll('button')].find(b => b.textContent.trim() === '换一本').click();",
+      );
+      await waitFor(
+        () =>
+          page.evaluate<boolean>(`
+        return document.querySelector('article h2')?.textContent !== ${JSON.stringify(title)} && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);
+      `),
+        { timeoutMs: 1500, intervalMs: 50, label: 'cached native card changed without network' },
+      );
+    };
+    try {
+      await waitFor(
+        () =>
+          page.evaluate<boolean>(
+            "return document.querySelector('article h2')?.textContent.startsWith('性能推荐 ') && [...document.querySelectorAll('button')].some(b => b.textContent.trim() === '换一本' && !b.disabled);",
+          ),
+        { timeoutMs: 30_000, label: 'controlled candidate batch displayed' },
+      );
+      for (let index = 0; index < 9; index++) await swap();
+      await waitFor(() => page.evaluate<boolean>('return window.__latencyHeld;'), {
+        timeoutMs: 15_000,
+        label: 'early background refill held with ten candidates buffered',
+      });
+      const timings: number[] = [];
+      for (let index = 0; index < 3; index++) {
+        const started = Date.now();
+        await swap();
+        timings.push(Date.now() - started);
+      }
+      expect(await page.evaluate<boolean>('return !window.__latencyReleased;')).toBe(true);
+      console.log('Native cached recommendation latency (ms)', timings);
+    } catch (error) {
+      console.error(
+        'Native latency diagnostic',
+        await page.evaluate(`return {
+        title: document.querySelector('article h2')?.textContent, alert: document.querySelector('[role=alert]')?.textContent,
+        held: window.__latencyHeld, batch: window.__latencyBatch
+      };`),
+      );
+      throw error;
+    } finally {
+      await page.evaluate(`
+        window.__latencyRelease?.();
+        window.Request = window.__latencySavedRequest;
+        window.fetch = window.__latencySavedFetch;
+        if (window.__latencySavedPreference === null) localStorage.removeItem('readest-discovery-transport-v1');
+        else localStorage.setItem('readest-discovery-transport-v1', window.__latencySavedPreference);
+      `);
+    }
   });
 
   it('uses the WebView fallback when the Android HTTP client fails with a string error', async () => {

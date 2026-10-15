@@ -110,3 +110,61 @@ it('gives a useful connection error when native requests fail after offline book
     '无法连接在线书籍服务',
   );
 });
+
+it('serves buffered books while a slow refill is pending and persists every remaining candidate', async () => {
+  const queue = new OnlineQueue(store, 'literature', false);
+  await queue.fill();
+  const response = {
+    numFound: 1000,
+    docs: Array.from({ length: 20 }, (_, index) => ({
+      key: `/works/OL${9000 + index}W`,
+      title: `新候选 ${index}`,
+      author_name: ['作者'],
+    })),
+  };
+  let release!: (value: unknown) => void;
+  mocks.fetch.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  const filling = queue.fill();
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+  const ids = new Set<string>();
+  let served = false;
+  const next = queue.next([]).then((result) => {
+    ids.add(result!.book.id);
+    served = true;
+  });
+  try {
+    await vi.waitFor(() => expect(served).toBe(true), { timeout: 1000 });
+    for (let index = 0; index < 6; index++) ids.add((await queue.next([]))!.book.id);
+  } finally {
+    release(response);
+    await filling;
+    await next;
+  }
+  const reopened = new OnlineQueue(store, 'literature', false);
+  for (let index = 0; index < 33; index++) {
+    const result = await reopened.next([]);
+    expect(ids.has(result!.book.id)).toBe(false);
+    ids.add(result!.book.id);
+  }
+  expect(ids.size).toBe(40);
+  expect(mocks.fetch).toHaveBeenCalledTimes(2);
+});
+
+it('starts a refill with ten candidates remaining rather than waiting until the last three', async () => {
+  const queue = new OnlineQueue(store, 'all', false);
+  for (let index = 0; index < 10; index++) await queue.next([]);
+  await queue.prefetch();
+  expect(mocks.fetch).toHaveBeenCalledTimes(2);
+});
+
+it('does not reserve the same cached candidate twice during concurrent queue updates', async () => {
+  const queue = new OnlineQueue(store, 'all', false);
+  await queue.fill();
+  const results = await Promise.all([queue.next([]), queue.next([])]);
+  expect(results[0]!.book.id).not.toBe(results[1]!.book.id);
+});
